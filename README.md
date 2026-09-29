@@ -67,10 +67,11 @@ sudo ./target/release/flowlightd
 ```
 
 ```text
-flowlightd 0.1.5: watching sock/inet_sock_set_state. Outbound TCP only; inbound connections are not
+flowlightd 0.1.7: watching sock/inet_sock_set_state. Outbound TCP only; inbound connections are not
 attributed.
 storing to /var/lib/flowlight/flowlight.db, keeping individual requests for 7 days, and a daily summary
 for 90 days
+interface at http://127.0.0.1:7890/?token=9f3c1a7e42b8d05c6e1f0a93d7b45cc2
 reading openssl through /usr/lib/x86_64-linux-gnu/libssl.so.3 (SSL_write, SSL_write_ex, SSL_read, SSL_read_ex)
 curl                     pid 18422    → 93.184.216.34:443
 curl                     pid 18422    → GET example.com/
@@ -78,7 +79,10 @@ curl                     pid 18422    ← 200  1256 bytes
 claude                   pid 17903    → POST api.anthropic.com/v1/messages
 ```
 
-Then ask it afterwards:
+**Open the URL it prints.** That is the interface: what is happening now, which process has been talking to
+what, and — the tab worth looking at — what could not be read.
+
+Or ask it from the terminal:
 
 ```sh
 sudo ./target/release/flowlightd history --since 6h
@@ -119,6 +123,8 @@ Useful flags:
 | `--seconds N` | stop after N seconds |
 | `--count N` | stop after N records |
 | `--tracefs PATH` | if tracefs is mounted somewhere unusual |
+| `--ui ADDRESS` | where to serve the interface. Default `127.0.0.1:7890`, loopback only |
+| `--no-ui` | do not serve an interface |
 | `--database PATH` | where to keep what is seen. Default `/var/lib/flowlight/flowlight.db` |
 | `--no-store` | keep nothing; watch the terminal and let it scroll |
 | `--retention-days N` | days of individual requests. Default 7 |
@@ -180,6 +186,23 @@ model name, a UUID, a page number — are left alone.
 ```text
 claude    pid 17903    → PUT productionresultssa17.blob.core.windows.net/…/logs.txt?se=2026-09-29T08%3A31%3A14Z&sig=…&sp=cw
 ```
+
+### The interface
+
+A page on `127.0.0.1`, because a daemon with no window is a daemon nobody looks at. Three tabs — **Live**,
+**Processes**, **Coverage** — and a window selector from fifteen minutes to seven days.
+
+The awkward part, said here rather than left to be discovered: this daemon runs as root, and what it knows is
+every host every process on the machine reached. **Loopback is not a permission boundary** — anything served
+there is available to every local user, not only the one who started it. On a single-user laptop that is
+nothing; on a shared machine it is a disclosure.
+
+So the page is bound to `127.0.0.1` and refuses to start anywhere else, every route is read-only, and it is
+behind a token generated at startup and printed once. The token lives in memory, never touches disk, and dies
+with the process. `--no-ui` turns the whole thing off.
+
+Nothing on the page loads from anywhere: no content delivery network, no fonts, no scripts from outside. A
+root daemon that asks a browser to run somebody else's code has misunderstood its job.
 
 ### Coverage: what was *not* seen
 

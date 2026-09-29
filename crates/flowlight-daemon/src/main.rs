@@ -16,6 +16,7 @@ mod libraries;
 mod payload;
 mod record;
 mod tracefs;
+mod ui;
 
 use anyhow::{Context as _, anyhow, bail};
 use aya::Ebpf;
@@ -34,6 +35,7 @@ use payload::Payloads;
 use record::Record;
 use std::collections::BTreeSet;
 use std::io::Write as _;
+use std::net::SocketAddr;
 use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -56,6 +58,16 @@ const DEFAULT_DATABASE: &str = "/var/lib/flowlight/flowlight.db";
 
 /// How often expired detail is folded into the summary and removed.
 const SWEEP: Duration = Duration::from_secs(3600);
+
+/// How often a partial batch is written even though it is not full.
+///
+/// The interface reads the database rather than sharing memory with the watcher, so an unflushed batch is a
+/// batch the screen cannot see. A second is short enough to read as live and long enough that a busy machine
+/// is not one transaction per request.
+const FLUSH: Duration = Duration::from_secs(1);
+
+/// Where the interface listens unless told otherwise.
+const DEFAULT_UI: &str = "127.0.0.1:7890";
 
 /// Pages per CPU for each perf buffer. A [`TlsChunk`] is four kilobytes, so the two-page default would hold
 /// one and a bit of them and drop the rest of any burst.
@@ -117,6 +129,14 @@ struct Args {
     /// Days to keep the daily summary that expired requests are folded into.
     #[arg(long, value_name = "DAYS", default_value_t = flowlight_store::DEFAULT_SUMMARY_DAYS)]
     summary_days: u32,
+
+    /// Where to serve the interface. Loopback only, and refused otherwise.
+    #[arg(long, value_name = "ADDRESS", default_value = DEFAULT_UI)]
+    ui: SocketAddr,
+
+    /// Do not serve an interface at all.
+    #[arg(long)]
+    no_ui: bool,
 
     /// Ask the database a question instead of watching.
     #[command(subcommand)]
@@ -187,6 +207,18 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(command) = &args.command {
         return history::run(command, &args.database, args.json);
+    }
+
+    // Checked here, before anything is loaded or attached, so that a mistyped address fails in a tenth of a
+    // second rather than after the probes are in the kernel. `serve` checks it too, because a guard that
+    // only exists at the call site is a guard the next caller does not get.
+    if !args.no_ui && !args.ui.ip().is_loopback() {
+        bail!(
+            "the interface may only be served on loopback; {} is not. What this knows is every host every \
+             process on the machine reached, and there is no version of publishing that which is a good \
+             idea. Use --no-ui if you meant to turn it off.",
+            args.ui
+        );
     }
 
     let format_text = tracefs::format_text(args.tracefs.as_deref(), CATEGORY, TRACEPOINT)?;
@@ -266,6 +298,22 @@ fn main() -> anyhow::Result<()> {
         None => eprintln!("storing nothing"),
     }
 
+    if !args.no_ui {
+        if store.is_none() {
+            eprintln!(
+                "not serving an interface: it reads the database, and --no-store means there is not one."
+            );
+        } else {
+            let token = ui::token()?;
+            match ui::serve(args.ui, args.database.clone(), token.clone()) {
+                Ok(bound) => eprintln!("interface at http://{bound}/?token={token}"),
+                // Not fatal. The port being taken is a reason to have no page, not a reason to stop
+                // watching the machine.
+                Err(err) => eprintln!("not serving an interface: {err:#}. Still watching."),
+            }
+        }
+    }
+
     run(&mut ebpf, &receiver, &args, store.as_mut())
 }
 
@@ -317,6 +365,7 @@ fn run(
     let mut probed = BTreeSet::new();
     let mut next_scan = Instant::now();
     let mut next_sweep = Instant::now();
+    let mut next_flush = Instant::now() + FLUSH;
     let mut seen = 0_u64;
     let mut lost = 0_u64;
 
@@ -343,10 +392,19 @@ fn run(
             next_sweep = Instant::now() + SWEEP;
         }
 
+        if let Some(store) = store.as_deref_mut()
+            && Instant::now() >= next_flush
+        {
+            if store.has_pending() {
+                keep(store.flush());
+            }
+            next_flush = Instant::now() + FLUSH;
+        }
+
         let until = match deadline {
             Some(deadline) if deadline <= Instant::now() => break,
-            Some(deadline) => deadline.min(next_scan).min(next_sweep),
-            None => next_scan.min(next_sweep),
+            Some(deadline) => deadline.min(next_scan).min(next_sweep).min(next_flush),
+            None => next_scan.min(next_sweep).min(next_flush),
         };
         let timeout = until.saturating_duration_since(Instant::now());
 

@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flowlight</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfa; --fg: #1a1a18; --dim: #6b6b66; --line: #e2e2dd;
+    --card: #ffffff; --accent: #b8562f; --ok: #3a7d44; --warn: #a8761a;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17171a; --fg: #e8e8e4; --dim: #8f8f88; --line: #2c2c31;
+      --card: #1e1e22; --accent: #e08a5f; --ok: #7bb47f; --warn: #d4a441;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+    padding: 18px 24px; border-bottom: 1px solid var(--line);
+  }
+  h1 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: -0.01em; }
+  h1 span { color: var(--accent); }
+  nav { display: flex; gap: 4px; margin-left: auto; }
+  nav button {
+    font: inherit; font-size: 14px; padding: 5px 12px; border-radius: 6px;
+    border: 1px solid transparent; background: none; color: var(--dim); cursor: pointer;
+  }
+  nav button:hover { color: var(--fg); }
+  nav button[aria-current="true"] { background: var(--card); border-color: var(--line); color: var(--fg); }
+  #window { font: inherit; font-size: 14px; color: var(--dim); background: none;
+            border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+  main { padding: 20px 24px 60px; }
+  .note { color: var(--dim); font-size: 13px; margin: 0 0 16px; max-width: 70ch; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th {
+    text-align: left; font-weight: 500; color: var(--dim); font-size: 12px;
+    text-transform: uppercase; letter-spacing: 0.04em;
+    padding: 0 12px 8px 0; border-bottom: 1px solid var(--line);
+  }
+  td { padding: 7px 12px 7px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:hover td { background: var(--card); }
+  .mono { font-family: var(--mono); font-size: 13px; }
+  .dim { color: var(--dim); }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .method { font-family: var(--mono); font-size: 12px; font-weight: 600; }
+  .target { font-family: var(--mono); font-size: 13px; word-break: break-all; }
+  .tag {
+    font-size: 11px; padding: 1px 6px; border-radius: 4px;
+    border: 1px solid var(--line); color: var(--dim); white-space: nowrap;
+  }
+  .tag.warn { color: var(--warn); border-color: var(--warn); }
+  .status-2 { color: var(--ok); } .status-4, .status-5 { color: var(--accent); }
+  .clickable { cursor: pointer; }
+  .cards { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+  .card .n { font-size: 26px; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+  .card .l { font-size: 12px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.04em; }
+  .card .why { font-size: 12px; color: var(--dim); margin-top: 6px; }
+  .empty { color: var(--dim); padding: 28px 0; }
+  .banner {
+    background: var(--card); border: 1px solid var(--warn); border-left-width: 3px;
+    border-radius: 6px; padding: 12px 14px; margin-bottom: 18px; font-size: 14px;
+  }
+  .banner h3 { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
+  footer { padding: 0 24px 40px; color: var(--dim); font-size: 12px; max-width: 80ch; }
+  @media (max-width: 640px) {
+    header, main, footer { padding-left: 16px; padding-right: 16px; }
+    nav { margin-left: 0; width: 100%; }
+    .hide-narrow { display: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Flow<span>light</span></h1>
+  <select id="window" aria-label="How far back to look">
+    <option value="900">Last 15 minutes</option>
+    <option value="3600" selected>Last hour</option>
+    <option value="21600">Last 6 hours</option>
+    <option value="86400">Last 24 hours</option>
+    <option value="604800">Last 7 days</option>
+  </select>
+  <nav>
+    <button data-tab="live" aria-current="true">Live</button>
+    <button data-tab="agents">Processes</button>
+    <button data-tab="coverage">Coverage</button>
+  </nav>
+</header>
+
+<main>
+  <section id="live"></section>
+  <section id="agents" hidden></section>
+  <section id="coverage" hidden></section>
+</main>
+
+<footer id="footer"></footer>
+
+<script>
+'use strict';
+const token = new URLSearchParams(location.search).get('token') || '';
+const $ = (id) => document.getElementById(id);
+let tab = 'live';
+let since = 3600;
+let openProcess = null;
+
+async function api(path, extra) {
+  const query = new URLSearchParams({ token, since: String(since), ...(extra || {}) });
+  const response = await fetch(path + '?' + query.toString());
+  if (!response.ok) throw new Error(await response.text());
+  return response.json();
+}
+
+const escapeHtml = (value) =>
+  String(value ?? '').replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
+const ago = (at) => {
+  const seconds = Math.max(0, Math.floor(Date.now() / 1000) - at);
+  if (seconds < 60) return seconds + 's';
+  if (seconds < 3600) return Math.floor(seconds / 60) + 'm';
+  if (seconds < 86400) return Math.floor(seconds / 3600) + 'h';
+  return Math.floor(seconds / 86400) + 'd';
+};
+
+const size = (bytes) => {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' kB';
+  return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+};
+
+// `path` means the name came from the executable. Anything else is worth a reader's attention, which is the
+// whole reason the daemon carries it.
+const confidenceTag = (confidence) =>
+  confidence === 'path'
+    ? ''
+    : ` <span class="tag warn" title="${
+        confidence === 'comm'
+          ? 'Named from the kernel&#39;s copy, which it cuts at fifteen characters. A rule keyed on this may be keyed on a truncation.'
+          : 'No name was available. This identity is a process id and does not outlive it.'
+      }">${escapeHtml(confidence)}</span>`;
+
+function renderLive(rows) {
+  if (!rows.length) {
+    return `<p class="empty">Nothing read in this window. That is not the same as nothing happening —
+      <a href="#" data-goto="coverage">Coverage</a> says what could not be read.</p>`;
+  }
+  const body = rows.map((row) => {
+    const what = row.method
+      ? `<span class="method">${escapeHtml(row.method)}</span> <span class="target">${escapeHtml(row.host || '')}${escapeHtml(row.target || '')}</span>`
+      : row.status != null
+        ? `<span class="status-${String(row.status)[0]}">${row.status}</span> <span class="dim">${size(row.bytes)}</span>`
+        : row.unreadable
+          ? `<span class="dim">HTTP/2 — ${escapeHtml(row.unreadable)}</span>`
+          : `<span class="dim">${size(row.bytes)}</span>`;
+    return `<tr>
+      <td class="dim num" style="width:1%">${ago(row.at)}</td>
+      <td style="width:1%">${row.direction === 'out' ? '→' : '←'}</td>
+      <td class="mono" style="width:1%; white-space:nowrap">${escapeHtml(row.process)}${confidenceTag(row.confidence)}</td>
+      <td>${what}${row.truncated ? ' <span class="tag warn" title="The call carried more than four kilobytes; the rest was not captured.">truncated</span>' : ''}</td>
+      <td class="dim num hide-narrow" style="width:1%">${escapeHtml(row.protocol || 'http/1')}</td>
+    </tr>`;
+  }).join('');
+  return `<table><thead><tr><th></th><th></th><th>Process</th><th>Request</th>
+    <th class="hide-narrow num">Protocol</th></tr></thead><tbody>${body}</tbody></table>`;
+}
+
+function renderAgents(rows, hosts) {
+  if (!rows.length) return `<p class="empty">Nothing was read from any process in this window.</p>`;
+  const body = rows.map((row) => {
+    const open = openProcess === row.process;
+    const detail = open
+      ? `<tr><td colspan="6" style="padding-top:0">
+          <table style="margin:4px 0 12px">${(hosts || []).map((host) => `<tr>
+            <td class="target">${escapeHtml(host.host)}</td>
+            <td class="num dim" style="width:1%">${host.requests}</td>
+            <td class="num dim" style="width:1%">${ago(host.last_seen)}</td></tr>`).join('')}
+          </table></td></tr>`
+      : '';
+    return `<tr class="clickable" data-process="${escapeHtml(row.process)}">
+      <td class="mono">${escapeHtml(row.process)}${confidenceTag(row.confidence)}</td>
+      <td class="num">${row.requests}</td>
+      <td class="num">${row.hosts}</td>
+      <td class="num hide-narrow">${size(row.bytes)}</td>
+      <td class="num dim">${ago(row.last_seen)}</td>
+      <td class="dim" style="width:1%">${open ? '▾' : '▸'}</td>
+    </tr>${detail}`;
+  }).join('');
+  return `<p class="note">Click a process to see the hosts it reached.</p>
+    <table><thead><tr><th>Process</th><th class="num">Requests</th><th class="num">Hosts</th>
+    <th class="num hide-narrow">Bytes</th><th class="num">Last</th><th></th></tr></thead>
+    <tbody>${body}</tbody></table>`;
+}
+
+function renderCoverage(c) {
+  const unread = c.unread.length
+    ? `<div class="banner">
+        <h3>${c.unread.length} process${c.unread.length === 1 ? '' : 'es'} opened HTTPS connections that could not be read</h3>
+        <table style="margin-top:8px">${c.unread.map((u) => `<tr>
+          <td class="mono">${escapeHtml(u.process)}</td>
+          <td class="num dim">${u.connections} connection${u.connections === 1 ? '' : 's'}</td></tr>`).join('')}</table>
+        <p class="why" style="margin-bottom:0">A process in this state is using a TLS implementation there is no
+        probe for. Go links its own into the binary, and so does Chrome. Both need symbols resolved per binary
+        rather than per library, which Flowlight does not do yet.</p>
+      </div>`
+    : `<p class="note">Every process that opened an HTTPS connection in this window was read.</p>`;
+
+  const card = (n, label, why) =>
+    `<div class="card"><div class="n">${n}</div><div class="l">${label}</div>${why ? `<div class="why">${why}</div>` : ''}</div>`;
+
+  const unprobed = c.unprobed.length
+    ? `<h3 style="font-size:14px;margin:24px 0 8px">Libraries that could not be probed</h3>
+       <table>${c.unprobed.map((u) => `<tr><td class="target">${escapeHtml(u.path)}</td>
+         <td class="dim">${escapeHtml(u.reason)}</td></tr>`).join('')}</table>`
+    : '';
+
+  return `${unread}
+    <div class="cards">
+      ${card(c.requests, 'Requests read', `from ${c.processes_read} process${c.processes_read === 1 ? '' : 'es'}, over ${c.connections} connections`)}
+      ${card(c.truncated, 'Truncated', 'carried more than four kilobytes; the rest was not captured')}
+      ${card(c.undecodable, 'Undecodable', 'HTTP/2 connections that could not be followed')}
+      ${card(c.named_by_comm, 'Named weakly', 'named from the kernel&#39;s copy, cut at fifteen characters')}
+      ${card(c.named_by_pid, 'Unnamed', 'no name was available; the identity is a process id')}
+      ${card(c.dropped, 'Dropped', 'records the kernel had nowhere to put')}
+    </div>
+    ${unprobed}
+    <p class="note" style="margin-top:24px">Inbound connections are never attributed, and UDP and QUIC are not
+    watched at all. Those are design decisions rather than gaps.</p>`;
+}
+
+async function refresh() {
+  try {
+    if (tab === 'live') {
+      $('live').innerHTML = renderLive(await api('/api/requests', { limit: '300' }));
+    } else if (tab === 'agents') {
+      const rows = await api('/api/processes');
+      const hosts = openProcess ? await api('/api/hosts', { process: openProcess }) : [];
+      $('agents').innerHTML = renderAgents(rows, hosts);
+    } else {
+      $('coverage').innerHTML = renderCoverage(await api('/api/coverage'));
+    }
+    $('footer').textContent =
+      'Flowlight reads plaintext as applications hand it to their TLS library. Nothing is intercepted, ' +
+      'no certificate is installed, and nothing is blocked. Credentials are removed from request targets ' +
+      'before they are recorded.';
+  } catch (err) {
+    $(tab).innerHTML = `<p class="empty">${escapeHtml(err.message || String(err))}</p>`;
+  }
+}
+
+document.querySelector('nav').addEventListener('click', (event) => {
+  const button = event.target.closest('button[data-tab]');
+  if (!button) return;
+  show(button.dataset.tab);
+});
+
+document.addEventListener('click', (event) => {
+  const goto = event.target.closest('[data-goto]');
+  if (goto) { event.preventDefault(); show(goto.dataset.goto); return; }
+  const row = event.target.closest('tr[data-process]');
+  if (row) { openProcess = openProcess === row.dataset.process ? null : row.dataset.process; refresh(); }
+});
+
+function show(next) {
+  tab = next;
+  for (const button of document.querySelectorAll('nav button')) {
+    button.setAttribute('aria-current', String(button.dataset.tab === tab));
+  }
+  for (const id of ['live', 'agents', 'coverage']) $(id).hidden = id !== tab;
+  refresh();
+}
+
+$('window').addEventListener('change', (event) => { since = Number(event.target.value); refresh(); });
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

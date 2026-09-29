@@ -21,12 +21,45 @@ database=$(mktemp -d)/flowlight.db
 trap 'rm -f "$output" "$log" "$stored" "$reported" "$coverage_json"; sudo rm -rf "$(dirname "$database")"' EXIT
 
 echo "Watching for 20 seconds..."
-sudo "$binary" --json --seconds 20 --database "$database" >"$output" 2>"$log" &
+sudo "$binary" --json --seconds 25 --database "$database" --ui 127.0.0.1:0 >"$output" 2>"$log" &
 watcher=$!
 
 # The probes are attached by the time the daemon prints its banner, but the banner goes to stderr and the
 # library scan happens after it. Three seconds is generous and the total cost is three seconds.
 sleep 3
+
+# The interface. An ephemeral port, because a fixed one is a fixed way for this to fail on a machine that
+# happens to be using it.
+url=$(grep -o 'http://127\.0\.0\.1:[0-9]*/?token=[0-9a-f]*' "$log" | head -1)
+if [ -z "$url" ]; then
+    echo "FAIL: the daemon did not report an interface address." >&2
+    cat "$log" >&2
+    exit 1
+fi
+base=${url%%/?token=*}
+token=${url##*token=}
+echo "Interface at $base"
+
+code=$(curl -sS -o /dev/null -w '%{http_code}' "$url")
+[ "$code" = 200 ] || { echo "FAIL: the page answered $code with its token." >&2; exit 1; }
+echo "OK: the page is served to a request carrying the token"
+
+code=$(curl -sS -o /dev/null -w '%{http_code}' "$base/")
+[ "$code" = 404 ] || { echo "FAIL: the page answered $code without a token; it must not." >&2; exit 1; }
+code=$(curl -sS -o /dev/null -w '%{http_code}' "$base/api/coverage?token=wrong")
+[ "$code" = 404 ] || { echo "FAIL: the API answered $code to a wrong token." >&2; exit 1; }
+echo "OK: nothing is served without the right token"
+
+# Loopback is not a permission boundary, so the page must never leave it. Asked of a running daemon rather
+# than trusted to a unit test, because the flag is the thing a person actually types.
+refusal=$(sudo "$binary" --database "$database" --ui 0.0.0.0:0 --seconds 1 2>&1 || true)
+if printf '%s' "$refusal" | grep -q loopback; then
+    echo "OK: the interface refuses to serve on a routable address"
+else
+    echo "FAIL: the interface did not refuse a routable address. It said:" >&2
+    printf '%s\n' "$refusal" >&2
+    exit 1
+fi
 
 echo "Connecting to $target_host over HTTP/1.1..."
 curl -sS --http1.1 --max-time 10 "https://$target_host" -o /dev/null
@@ -60,6 +93,20 @@ if command -v gh >/dev/null && [ -n "${GH_TOKEN:-}" ]; then
     echo "Making a request from gh, which is written in Go..."
     gh api rate_limit >/dev/null 2>&1 || true
 fi
+
+# The interface, while it is still up. The daemon flushes a partial batch once a second, so the page sees
+# what was just read rather than what was read a batch ago.
+sleep 2
+# And the page's own data, read back through the API the browser uses.
+if ! curl -sS "$base/api/coverage?token=$token&since=600" | jq -e '.requests >= 0 and (.unread | type) == "array"' >/dev/null; then
+    echo "FAIL: the coverage API did not answer with a coverage object." >&2
+    exit 1
+fi
+if ! curl -sS "$base/api/requests?token=$token&since=600" | jq -e 'map(select(.process == "curl" and .method == "GET")) | length > 0' >/dev/null; then
+    echo "FAIL: the interface's own API does not show the request that was read." >&2
+    exit 1
+fi
+echo "OK: the interface serves what was read, through the API its page uses"
 
 wait "$watcher"
 
