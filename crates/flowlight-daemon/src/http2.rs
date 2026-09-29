@@ -378,7 +378,7 @@ mod tests {
     fn a_connection_joined_late_is_reported_as_unreadable_rather_than_guessed_at() {
         let mut connections = Connections::new();
         // An indexed reference to a dynamic table entry that, from here, does not exist.
-        let block = vec![0xbe, 0xbf];
+        let block = [0xbe_u8, 0xbf];
         let events = connections.feed(&chunk(
             1,
             &frame(FRAME_HEADERS, FLAG_END_HEADERS, 1, &block),
@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn an_unreadable_connection_says_so_once() {
         let mut connections = Connections::new();
-        let block = vec![0xbe, 0xbf];
+        let block = [0xbe_u8, 0xbf];
         let first = connections.feed(&chunk(
             1,
             &frame(FRAME_HEADERS, FLAG_END_HEADERS, 1, &block),
@@ -448,7 +448,7 @@ mod tests {
     /// read, and it must not panic.
     #[test]
     fn a_header_value_that_is_not_text_is_skipped() {
-        let list = vec![
+        let list = [
             (b":method".to_vec(), vec![0xff, 0xfe]),
             (b":path".to_vec(), b"/ok".to_vec()),
         ];

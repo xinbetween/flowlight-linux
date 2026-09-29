@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn a_payload_too_short_for_its_own_padding_yields_nothing() {
-        let payload = vec![200, 1, 2];
+        let payload = [200_u8, 1, 2];
         let header = FrameHeader::parse(&frame(FRAME_HEADERS, FLAG_PADDED, 1, &payload)).unwrap();
         assert_eq!(header_block(&header, &payload), None);
     }
@@ -513,7 +513,7 @@ mod tests {
         let mut stream = Stream::new();
         let mut first = frame(FRAME_HEADERS, FLAG_END_HEADERS, 1, b"REQUEST");
         // A DATA frame of 5000 bytes, of which only 100 were captured.
-        first.extend(frame(FRAME_DATA, FLAG_END_STREAM, 1, &vec![0; 5000]));
+        first.extend(frame(FRAME_DATA, FLAG_END_STREAM, 1, &[0; 5000]));
         let captured = first.get(..first.len() - 4900).unwrap();
 
         let mut records = stream.feed(captured, 4900);
@@ -544,7 +544,7 @@ mod tests {
     #[test]
     fn a_hole_across_a_frame_boundary_is_reported_rather_than_guessed_at() {
         let mut stream = Stream::new();
-        let mut bytes = frame(FRAME_DATA, 0, 1, &vec![0; 100]);
+        let mut bytes = frame(FRAME_DATA, 0, 1, &[0; 100]);
         bytes.extend(frame(FRAME_HEADERS, FLAG_END_HEADERS, 3, b"LOST"));
         let captured = bytes.get(..50).unwrap();
         let records = stream.feed(captured, bytes.len() - 50);
@@ -558,7 +558,7 @@ mod tests {
     fn a_lost_stream_is_picked_up_again_at_the_next_call() {
         let mut stream = Stream::new();
         stream.feed(
-            &frame(FRAME_DATA, 0, 1, &vec![0; 100])
+            &frame(FRAME_DATA, 0, 1, &[0; 100])
                 .get(..50)
                 .unwrap()
                 .to_vec(),
@@ -581,7 +581,7 @@ mod tests {
     fn recovery_does_not_accept_bytes_that_are_not_a_frame() {
         let mut stream = Stream::new();
         stream.feed(
-            &frame(FRAME_DATA, 0, 1, &vec![0; 100])
+            &frame(FRAME_DATA, 0, 1, &[0; 100])
                 .get(..50)
                 .unwrap()
                 .to_vec(),
@@ -600,7 +600,7 @@ mod tests {
     #[test]
     fn a_header_block_with_a_hole_in_it_is_reported_as_lost_rather_than_decoded() {
         let mut stream = Stream::new();
-        let bytes = frame(FRAME_HEADERS, FLAG_END_HEADERS, 1, &vec![7; 200]);
+        let bytes = frame(FRAME_HEADERS, FLAG_END_HEADERS, 1, &[7; 200]);
         // Sixty bytes captured, the rest of the frame missing, and the hole ends on its boundary.
         let records = stream.feed(bytes.get(..60).unwrap(), bytes.len() - 60);
         assert_eq!(
@@ -632,8 +632,8 @@ mod tests {
     #[test]
     fn frames_that_are_ignored_are_still_stepped_over() {
         let mut stream = Stream::new();
-        let mut bytes = frame(0x4, 0, 0, &vec![0; 18]); // SETTINGS
-        bytes.extend(frame(0x8, 0, 0, &vec![0; 4])); // WINDOW_UPDATE
+        let mut bytes = frame(0x4, 0, 0, &[0; 18]); // SETTINGS
+        bytes.extend(frame(0x8, 0, 0, &[0; 4])); // WINDOW_UPDATE
         bytes.extend(frame(FRAME_HEADERS, FLAG_END_HEADERS, 1, b"AFTER"));
         let records = stream.feed(&bytes, 0);
         assert_eq!(
