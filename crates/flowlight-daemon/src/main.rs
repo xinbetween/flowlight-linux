@@ -25,6 +25,7 @@ use aya::programs::{TracePoint, UProbe};
 use aya::util::online_cpus;
 use clap::Parser;
 use flowlight_common::connection::{ConnectionEvent, Layout};
+use flowlight_common::procmaps::TlsLibrary;
 use flowlight_common::tls::TlsChunk;
 use flowlight_common::tracepoint::Format;
 use payload::Payloads;
@@ -137,7 +138,7 @@ fn main() -> anyhow::Result<()> {
         .with_context(|| format!("attaching to {CATEGORY}/{TRACEPOINT}"))?;
 
     if !args.no_payloads {
-        for (program, _) in PROBES {
+        for program in PROGRAMS {
             let probe: &mut UProbe = ebpf
                 .program_mut(program)
                 .ok_or_else(|| anyhow!("the compiled program has no {program} function"))?
@@ -298,7 +299,7 @@ fn attach_new_libraries(ebpf: &mut Ebpf, probed: &mut BTreeSet<PathBuf>, extra: 
         if !probed.insert(path.clone()) {
             continue;
         }
-        match attach_probes(ebpf, &path) {
+        match attach_probes(ebpf, library, &path) {
             Ok(symbols) => eprintln!(
                 "reading {} through {} ({})",
                 library.as_str(),
@@ -313,20 +314,70 @@ fn attach_new_libraries(ebpf: &mut Ebpf, probed: &mut BTreeSet<PathBuf>, extra: 
     }
 }
 
-/// The probes one OpenSSL needs, and the symbols they go on.
-///
-/// Six rather than three because OpenSSL 1.1.1 added `SSL_write_ex` and `SSL_read_ex` — a `size_t` count and
-/// an out-parameter instead of an `int` and a return value — and modern callers use them. Probing only the
-/// original pair means seeing nothing from a program that took the newer one, and seeing nothing is
-/// indistinguishable from there being nothing to see.
-const PROBES: &[(&str, &str)] = &[
-    ("ssl_write", "SSL_write"),
-    ("ssl_write_ex", "SSL_write_ex"),
-    ("ssl_read", "SSL_read"),
-    ("ssl_read_return", "SSL_read"),
-    ("ssl_read_ex", "SSL_read_ex"),
-    ("ssl_read_ex_return", "SSL_read_ex"),
+/// Every program in the object, each of which is loaded once and then attached wherever it fits.
+const PROGRAMS: &[&str] = &[
+    "write_int",
+    "write_size",
+    "read_enter",
+    "read_ex_enter",
+    "read_return",
+    "read_ex_return",
 ];
+
+/// Which program goes on which symbol, for one library.
+struct Probe {
+    /// The program's name in the compiled object.
+    program: &'static str,
+    /// The function in the library.
+    symbol: &'static str,
+}
+
+/// A probe, written shortly.
+const fn probe(program: &'static str, symbol: &'static str) -> Probe {
+    Probe { program, symbol }
+}
+
+/// OpenSSL. Six rather than three because 1.1.1 added `SSL_write_ex` and `SSL_read_ex` — a `size_t` count
+/// and an out-parameter instead of an `int` and a return value — and modern callers use them.
+const OPENSSL: &[Probe] = &[
+    probe("write_int", "SSL_write"),
+    probe("write_size", "SSL_write_ex"),
+    probe("read_enter", "SSL_read"),
+    probe("read_return", "SSL_read"),
+    probe("read_ex_enter", "SSL_read_ex"),
+    probe("read_ex_return", "SSL_read_ex"),
+];
+
+/// GnuTLS. `gnutls_record_send(session, data, size)` has exactly OpenSSL's shape with a `size_t` length, and
+/// `gnutls_record_recv` reports its count the way `SSL_read` does.
+const GNUTLS: &[Probe] = &[
+    probe("write_size", "gnutls_record_send"),
+    probe("read_enter", "gnutls_record_recv"),
+    probe("read_return", "gnutls_record_recv"),
+];
+
+/// NSS, at its portable-runtime layer.
+///
+/// `libnss3` is where the TLS is, but the plaintext crosses the boundary one layer below it, in NSPR. The
+/// consequence is that these also see Firefox's *non*-TLS socket writes — plain HTTP, mostly — which is more
+/// than was asked for rather than less, and is stated in the README rather than left to be discovered.
+const NSS: &[Probe] = &[
+    probe("write_int", "PR_Write"),
+    probe("write_int", "PR_Send"),
+    probe("read_enter", "PR_Read"),
+    probe("read_return", "PR_Read"),
+    probe("read_enter", "PR_Recv"),
+    probe("read_return", "PR_Recv"),
+];
+
+/// The probes a library needs.
+const fn probes_for(library: TlsLibrary) -> &'static [Probe] {
+    match library {
+        TlsLibrary::OpenSsl => OPENSSL,
+        TlsLibrary::GnuTls => GNUTLS,
+        TlsLibrary::Nss => NSS,
+    }
+}
 
 /// Attaches what this particular library has.
 ///
@@ -334,10 +385,14 @@ const PROBES: &[(&str, &str)] = &[
 /// missing symbol is a fact about that file rather than a reason to stop. What is *not* best effort is the
 /// verdict — a library where nothing attached is reported as unprobed, because a silent failure here looks
 /// exactly like an application that is not making requests.
-fn attach_probes(ebpf: &mut Ebpf, path: &Path) -> anyhow::Result<Vec<&'static str>> {
-    let mut attached = Vec::new();
+fn attach_probes(
+    ebpf: &mut Ebpf,
+    library: TlsLibrary,
+    path: &Path,
+) -> anyhow::Result<Vec<&'static str>> {
+    let mut attached: Vec<&'static str> = Vec::new();
     let mut last_error = None;
-    for (program, symbol) in PROBES {
+    for Probe { program, symbol } in probes_for(library) {
         let probe: &mut UProbe = ebpf
             .program_mut(program)
             .ok_or_else(|| anyhow!("no {program} program"))?
@@ -345,7 +400,7 @@ fn attach_probes(ebpf: &mut Ebpf, path: &Path) -> anyhow::Result<Vec<&'static st
         match probe.attach(*symbol, path, UProbeScope::AllProcesses) {
             Ok(_) => {
                 if !attached.contains(symbol) {
-                    attached.push(*symbol);
+                    attached.push(symbol);
                 }
             }
             Err(err) => last_error = Some(err),
@@ -356,7 +411,10 @@ fn attach_probes(ebpf: &mut Ebpf, path: &Path) -> anyhow::Result<Vec<&'static st
             || "no probe could be attached".to_owned(),
             |err| format!("{err}"),
         );
-        bail!("none of OpenSSL's read or write functions could be found: {detail}");
+        bail!(
+            "none of {}'s read or write functions could be found: {detail}",
+            library.as_str()
+        );
     }
     Ok(attached)
 }

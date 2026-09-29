@@ -1,4 +1,18 @@
-//! Plaintext, taken from OpenSSL before it encrypts anything.
+//! Plaintext, taken from the TLS library before it encrypts anything.
+//!
+//! Nothing in here is specific to OpenSSL, despite where it started. Three libraries matter on Linux and
+//! all three hand a buffer to a function with the same shape: a session handle, a pointer, a length.
+//!
+//! | | Write | Read |
+//! | --- | --- | --- |
+//! | OpenSSL | `SSL_write`, `SSL_write_ex` | `SSL_read`, `SSL_read_ex` |
+//! | GnuTLS | `gnutls_record_send` | `gnutls_record_recv` |
+//! | NSS (Firefox) | `PR_Write`, `PR_Send` | `PR_Read`, `PR_Recv` |
+//!
+//! So the programs here are named for the *shape* they read rather than the library they came from, and the
+//! daemon decides which symbol each one goes on. The only differences that matter are whether the length is
+//! an `int` or a `size_t`, and whether a read reports its count through the return value or an
+//! out-parameter.
 //!
 //! `SSL_write(ssl, buf, num)` is straightforward: on entry the buffer already holds what the application
 //! wants to send, so the plaintext is read and sent up there and then.
@@ -9,7 +23,7 @@
 //! real. That is what [`PENDING_READS`] is for, and it is keyed on the thread rather than the process because
 //! two threads of one program can be inside `SSL_read` at once.
 //!
-//! # Why four functions and not two
+//! # Why six functions and not two
 //!
 //! OpenSSL 1.1.1 added `SSL_write_ex` and `SSL_read_ex`, which take a `size_t` instead of an `int` and report
 //! the count through an out-parameter instead of the return value. Modern callers use them. Probing only the
@@ -66,16 +80,18 @@ struct PendingRead {
     written: u64,
 }
 
-/// `SSL_write(SSL *ssl, const void *buf, int num)` — the plaintext is already there.
+/// A write whose length is an `int`: `SSL_write`, `PR_Write`, `PR_Send`.
+///
+/// The plaintext is already in the buffer on entry, so there is nothing to wait for.
 #[uprobe]
-pub fn ssl_write(ctx: ProbeContext) -> u32 {
+pub fn write_int(ctx: ProbeContext) -> u32 {
     let _ = on_write(&ctx, ctx.arg::<i32>(2).map(i64::from));
     0
 }
 
-/// `SSL_write_ex(SSL *ssl, const void *buf, size_t num, size_t *written)` — the same, with a wider count.
+/// A write whose length is a `size_t`: `SSL_write_ex`, `gnutls_record_send`.
 #[uprobe]
-pub fn ssl_write_ex(ctx: ProbeContext) -> u32 {
+pub fn write_size(ctx: ProbeContext) -> u32 {
     // The count before the call is what the application intends to write. `*written` afterwards could be
     // less, but the bytes we copy are the ones at the front of the buffer either way, and capping the length
     // here rather than waiting for the return means one probe instead of two.
@@ -92,16 +108,17 @@ fn on_write(ctx: &ProbeContext, length: Option<i64>) -> Result<(), i32> {
     capture(ctx, ssl, buffer, length.ok_or(0_i32)?, DIRECTION_OUT)
 }
 
-/// `SSL_read(SSL *ssl, void *buf, int num)` — remember where the answer will go.
+/// A read that reports its count through its return value: `SSL_read`, `gnutls_record_recv`, `PR_Read`,
+/// `PR_Recv`. On entry there is nothing to read yet, so this only remembers where the answer will go.
 #[uprobe]
-pub fn ssl_read(ctx: ProbeContext) -> u32 {
+pub fn read_enter(ctx: ProbeContext) -> u32 {
     remember(&ctx, 0);
     0
 }
 
-/// `SSL_read_ex(SSL *ssl, void *buf, size_t num, size_t *readbytes)` — and where the count will go.
+/// A read that reports its count through an out-parameter: `SSL_read_ex`. Remembers both.
 #[uprobe]
-pub fn ssl_read_ex(ctx: ProbeContext) -> u32 {
+pub fn read_ex_enter(ctx: ProbeContext) -> u32 {
     let written = ctx.arg::<u64>(3).unwrap_or(0);
     remember(&ctx, written);
     0
@@ -120,16 +137,17 @@ fn remember(ctx: &ProbeContext, written: u64) {
     }
 }
 
-/// `SSL_read` on its way out: the return value is how many bytes arrived.
+/// The way out of a read that returns its count. Zero is a clean close and negative is an error or a retry,
+/// and neither is a buffer.
 #[uretprobe]
-pub fn ssl_read_return(ctx: RetProbeContext) -> u32 {
+pub fn read_return(ctx: RetProbeContext) -> u32 {
     let _ = on_read_return(&ctx, |_| Some(i64::from(ctx.ret::<i32>())));
     0
 }
 
-/// `SSL_read_ex` on its way out: the return value is one or zero, and the count is where we were told.
+/// The way out of a read that returns one or zero, with the count where we were told to look.
 #[uretprobe]
-pub fn ssl_read_ex_return(ctx: RetProbeContext) -> u32 {
+pub fn read_ex_return(ctx: RetProbeContext) -> u32 {
     let _ = on_read_return(&ctx, |pending| {
         if ctx.ret::<i32>() != 1 {
             return None;
