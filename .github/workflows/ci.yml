@@ -84,7 +84,8 @@ jobs:
       - name: Build the daemon
         run: cargo build --release --package flowlight-daemon
 
-      # The part that cannot be faked. Loads the program into a real kernel, attaches it, makes a real
-      # connection, and insists on finding it — with the right process name and the right port.
-      - name: Attribute a real connection
+      # The part that cannot be faked. Loads the programs into a real kernel, attaches them, makes real
+      # requests, and insists on finding them: the connection with the right process and port, and the
+      # request itself in the clear.
+      - name: Attribute and read a real request
         run: ./scripts/smoke.sh target/release/flowlightd
