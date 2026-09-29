@@ -1,0 +1,7 @@
+# The restriction lints in the workspace manifest exist because this daemon runs as root on the interception
+# path, where a panic takes the machine's network with it. Tests are the one place a panic is the point: that
+# is what an assertion is.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true

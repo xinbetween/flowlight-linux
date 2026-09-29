@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/flowlight-common"]
+
+# The eBPF programs and the daemon that loads them join this list once there is something to load. They only
+# build on Linux, and adding them before then would mean a workspace that cannot be checked on the machine most
+# of this is being written on — which is how unverified code gets committed.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/xinbetween/flowlight-linux"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# This daemon runs as root and parses data it did not create. A panic is an outage, and on the interception
+# path an outage takes the machine's network with it.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
