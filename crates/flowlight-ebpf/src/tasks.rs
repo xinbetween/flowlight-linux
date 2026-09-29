@@ -39,7 +39,7 @@ static TASK_LAYOUT: Array<TaskLayout> = Array::with_max_entries(1, 0);
 /// an agent-scoped rule failed to bite because the agent was not recognised, or because the propagation
 /// that is supposed to reach its children never ran. Without them the two look identical from outside.
 #[map]
-pub static FORK_COUNTS: Array<u64> = Array::with_max_entries(8, 0);
+pub static FORK_COUNTS: Array<u64> = Array::with_max_entries(11, 0);
 
 /// Index of the count of forks seen.
 pub const FORKS_SEEN: u32 = 0;

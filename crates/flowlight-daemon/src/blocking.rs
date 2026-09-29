@@ -79,6 +79,12 @@ pub struct Propagation {
     pub last_child: u64,
     /// The last marked identifier the exit tracepoint took a mark away from.
     pub last_exit: u64,
+    /// Connections the hook decided about.
+    pub connects: u64,
+    /// Connections whose caller turned out to be marked.
+    pub connects_marked: u64,
+    /// The last thread group the hook looked up.
+    pub last_connect: u64,
 }
 
 /// Keeps the kernel's table matching the rules, and its marks matching the processes.
@@ -160,6 +166,9 @@ impl Blocking {
             last_error: at(5),
             last_child: at(6),
             last_exit: at(7),
+            connects: at(8),
+            connects_marked: at(9),
+            last_connect: at(10),
             held: self.marked(),
         }
     }
