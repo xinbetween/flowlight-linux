@@ -104,6 +104,34 @@ pub struct Unread {
     pub connections: i64,
 }
 
+/// One process, and what it has been doing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessRow {
+    /// What it is called.
+    pub process: String,
+    /// Where that name came from, at its best over the window.
+    pub confidence: String,
+    /// Requests read from it.
+    pub requests: i64,
+    /// Distinct hosts it reached.
+    pub hosts: i64,
+    /// Bytes those requests carried.
+    pub bytes: i64,
+    /// The most recent one, in seconds since the epoch.
+    pub last_seen: i64,
+}
+
+/// One host a process reached, and how often.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRow {
+    /// The host.
+    pub host: String,
+    /// Requests to it.
+    pub requests: i64,
+    /// The most recent one.
+    pub last_seen: i64,
+}
+
 /// Something worth remembering that is not a request: a library that could not be probed, records the
 /// kernel dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,6 +260,25 @@ impl Store {
             .with_context(|| format!("opening the database at {}", path.display()))?;
         restrict(path, 0o600)?;
         Self::from_connection(connection)
+    }
+
+    /// Opens an existing database without being able to write to it.
+    ///
+    /// What the interface uses. It runs in the same process as the watcher and has no business writing, and
+    /// a second connection rather than a shared lock means a slow page cannot hold up the kernel's reader.
+    /// SQLite's write-ahead log is what makes concurrent reading safe here.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        use rusqlite::OpenFlags;
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening {} for reading", path.display()))?;
+        Ok(Self {
+            connection,
+            pending_connections: Vec::new(),
+            pending_requests: Vec::new(),
+        })
     }
 
     /// An in-memory database, for tests.
@@ -616,6 +663,60 @@ impl Store {
         Ok(coverage)
     }
 
+    /// Every process something was read from, busiest first.
+    ///
+    /// The interface's front page. `min(confidence)` rather than `max` because `comm` sorts before `path`
+    /// and the *worst* name a process was given over the window is the one worth showing — a process named
+    /// from its path nine times out of ten and from a truncated `comm` once is a process whose rules might
+    /// not match.
+    pub fn processes(&mut self, since: i64) -> Result<Vec<ProcessRow>> {
+        self.flush()?;
+        let mut statement = self.connection.prepare(
+            "SELECT process, min(confidence), count(*), count(DISTINCT host),
+                    coalesce(sum(bytes), 0), max(at)
+             FROM requests WHERE at >= ?1
+             GROUP BY process
+             ORDER BY count(*) DESC",
+        )?;
+        let rows = statement.query_map(params![since], |row| {
+            Ok(ProcessRow {
+                process: row.get(0)?,
+                confidence: row.get(1)?,
+                requests: row.get(2)?,
+                hosts: row.get(3)?,
+                bytes: row.get(4)?,
+                last_seen: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The hosts one process reached, busiest first.
+    pub fn hosts_for(&mut self, process: &str, since: i64, limit: usize) -> Result<Vec<HostRow>> {
+        self.flush()?;
+        let mut statement = self.connection.prepare(
+            "SELECT host, count(*), max(at) FROM requests
+             WHERE at >= ?1 AND process = ?2 AND host IS NOT NULL
+             GROUP BY host ORDER BY count(*) DESC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![since, process, limit as i64], |row| {
+            Ok(HostRow {
+                host: row.get(0)?,
+                requests: row.get(1)?,
+                last_seen: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Whether anything is waiting to be written.
+    ///
+    /// The interface reads the database rather than sharing memory with the watcher, so a batch still in
+    /// hand is a batch the screen cannot see. The watcher uses this to flush on a timer.
+    pub fn has_pending(&self) -> bool {
+        !self.pending_connections.is_empty() || !self.pending_requests.is_empty()
+    }
+
     /// The oldest request still held, for the interface to be able to say how far back it can see.
     pub fn earliest_request(&mut self) -> Result<Option<i64>> {
         self.flush()?;
@@ -991,6 +1092,105 @@ mod tests {
         assert_eq!(coverage.dropped, 0);
         assert!(coverage.unread.is_empty());
         assert!(coverage.unprobed.is_empty());
+    }
+
+    // The interface's queries
+
+    #[test]
+    fn processes_come_back_busiest_first_with_their_hosts_counted() {
+        let mut store = Store::in_memory().unwrap();
+        for _ in 0..3 {
+            store
+                .record_request(request(1_000, "claude", "api.anthropic.com", 100))
+                .unwrap();
+        }
+        store
+            .record_request(request(1_100, "claude", "statsig.anthropic.com", 50))
+            .unwrap();
+        store
+            .record_request(request(1_050, "curl", "example.com", 10))
+            .unwrap();
+
+        let processes = store.processes(0).unwrap();
+        assert_eq!(processes.len(), 2);
+        assert_eq!(processes[0].process, "claude");
+        assert_eq!(processes[0].requests, 4);
+        assert_eq!(processes[0].hosts, 2);
+        assert_eq!(processes[0].bytes, 350);
+        assert_eq!(processes[0].last_seen, 1_100);
+        assert_eq!(processes[1].process, "curl");
+    }
+
+    /// The worst name a process was given over the window is the one worth showing. A process named from
+    /// its path nine times and from a truncated `comm` once is a process whose rules might not match.
+    #[test]
+    fn a_process_is_shown_at_its_least_certain_name() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .record_request(request(1_000, "claude", "api.anthropic.com", 1))
+            .unwrap();
+        let mut weak = request(1_001, "claude", "api.anthropic.com", 1);
+        weak.confidence = "comm".to_owned();
+        store.record_request(weak).unwrap();
+        assert_eq!(store.processes(0).unwrap()[0].confidence, "comm");
+    }
+
+    #[test]
+    fn the_hosts_one_process_reached_come_back_busiest_first() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .record_request(request(1_000, "claude", "statsig.anthropic.com", 1))
+            .unwrap();
+        for _ in 0..2 {
+            store
+                .record_request(request(1_000, "claude", "api.anthropic.com", 1))
+                .unwrap();
+        }
+        store
+            .record_request(request(1_000, "curl", "example.com", 1))
+            .unwrap();
+
+        let hosts = store.hosts_for("claude", 0, 10).unwrap();
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[0].host, "api.anthropic.com");
+        assert_eq!(hosts[0].requests, 2);
+        // Another process's hosts are another process's.
+        assert!(hosts.iter().all(|host| host.host != "example.com"));
+    }
+
+    /// The interface reads the database rather than sharing memory with the watcher, so a batch still in
+    /// hand is a batch the screen cannot see.
+    #[test]
+    fn pending_writes_are_visible_as_pending() {
+        let mut store = Store::in_memory().unwrap();
+        assert!(!store.has_pending());
+        store
+            .record_request(request(1, "curl", "example.com", 1))
+            .unwrap();
+        assert!(store.has_pending());
+        store.flush().unwrap();
+        assert!(!store.has_pending());
+    }
+
+    /// The interface must not be able to write, and must be able to read what the watcher wrote.
+    #[test]
+    fn a_read_only_handle_reads_and_does_not_write() {
+        let directory = std::env::temp_dir().join("flowlight-store-readonly");
+        let _ = std::fs::remove_dir_all(&directory);
+        let path = directory.join("flowlight.db");
+
+        let mut writer = Store::open(&path).unwrap();
+        writer
+            .record_request(request(1_000, "claude", "api.anthropic.com", 1))
+            .unwrap();
+        writer.flush().unwrap();
+
+        let mut reader = Store::open_read_only(&path).unwrap();
+        assert_eq!(reader.requests_since(0, 10).unwrap().len(), 1);
+        assert!(
+            reader.record_note("unprobed-library", "/x", "y").is_err(),
+            "the interface has no business writing"
+        );
     }
 
     /// This file holds every host every process on the machine reached. On a shared machine that is a list

@@ -27,7 +27,7 @@ release where nobody can tell which one broke something.
 | **0.1.4** | **The other TLS libraries** | GnuTLS and NSS, so wget, Firefox and Thunderbird are covered. Go's static TLS and Chrome's linked-in BoringSSL need symbols resolved per binary rather than per library, and Go a calling convention that is not the C one — each is its own piece of work, and neither is in this. | [released](https://github.com/xinbetween/flowlight-linux/releases/tag/v0.1.4) |
 | **0.1.5** | **Storage and retention** | SQLite, the rollup tiers, and a retention policy that is stated rather than assumed. | [released](https://github.com/xinbetween/flowlight-linux/releases/tag/v0.1.5) |
 | **0.1.6** | **Coverage** | What was not seen, and why: a TLS library with no probe, a container in another namespace, a process that exited before attribution landed. The screen that makes the rest trustworthy. | [released](https://github.com/xinbetween/flowlight-linux/releases/tag/v0.1.6) |
-| **0.1.7** | **The local interface** | A web UI on loopback. Live, agents, and what each one reached. | |
+| **0.1.7** | **The local interface** | A web UI on loopback. Live, processes, and Coverage, behind a token because loopback is not a permission boundary. | [released](https://github.com/xinbetween/flowlight-linux/releases/tag/v0.1.7) |
 | **0.1.8** | **Agent attribution** | Which agent a process works for, MCP servers from their configuration files, tool calls read out of the payloads already being captured. | |
 
 ## 0.2.x — parity with the macOS build
