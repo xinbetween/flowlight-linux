@@ -8,6 +8,7 @@
 
 use flowlight_common::connection::ConnectionEvent;
 use flowlight_common::identity::{Confidence, Identity, executable_was_replaced};
+use flowlight_store::ConnectionRow;
 use serde::Serialize;
 
 /// One attributed connection, in the shape it is printed or serialised in.
@@ -65,6 +66,18 @@ impl Record {
                 .map(str::to_owned),
             destination: event.destination().map(|address| address.to_string()),
             port: event.dport,
+        }
+    }
+
+    /// The same thing, in the shape the database keeps.
+    pub fn stored(&self, at: i64) -> ConnectionRow {
+        ConnectionRow {
+            at,
+            process: self.process.clone(),
+            confidence: self.confidence.to_owned(),
+            pid: self.pid,
+            destination: self.destination.clone(),
+            port: self.port,
         }
     }
 

@@ -14,10 +14,12 @@ target_host=${2:-example.com}
 
 output=$(mktemp)
 log=$(mktemp)
-trap 'rm -f "$output" "$log"' EXIT
+stored=$(mktemp)
+database=$(mktemp -d)/flowlight.db
+trap 'rm -f "$output" "$log" "$stored"; sudo rm -rf "$(dirname "$database")"' EXIT
 
 echo "Watching for 20 seconds..."
-sudo "$binary" --json --seconds 20 >"$output" 2>"$log" &
+sudo "$binary" --json --seconds 20 --database "$database" >"$output" 2>"$log" &
 watcher=$!
 
 # The probes are attached by the time the daemon prints its banner, but the banner goes to stderr and the
@@ -114,3 +116,27 @@ if grep -q "$secret" "$output"; then
     exit 1
 fi
 echo "OK: the credential appears nowhere in the output"
+
+# Storage. The database is the reason a question can be asked an hour later, so the check is not "a file
+# appeared" but "the request that was just read comes back out of it".
+echo "--- what the database remembers:"
+sudo "$binary" --database "$database" history --since 10m --json | tee "$stored"
+
+if ! jq -s -e 'map(select(.process == "curl" and .method == "GET")) | length > 0' "$stored" >/dev/null; then
+    echo "FAIL: the request was read and then not stored." >&2
+    exit 1
+fi
+echo "OK: the request came back out of the database"
+
+if grep -q "$secret" "$stored"; then
+    echo "FAIL: the credential was stored." >&2
+    exit 1
+fi
+echo "OK: the credential was not stored either"
+
+mode=$(sudo stat -c '%a' "$database")
+if [ "$mode" != "600" ]; then
+    echo "FAIL: the database is mode $mode; it holds every host every process reached." >&2
+    exit 1
+fi
+echo "OK: the database is readable only by its owner"

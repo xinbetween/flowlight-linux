@@ -16,6 +16,7 @@ use flowlight_common::http2::{FrameHeader, PREFACE};
 use flowlight_common::identity::Identity;
 use flowlight_common::redact::redact_target;
 use flowlight_common::tls::TlsChunk;
+use flowlight_store::RequestRow;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::time::Instant;
@@ -138,6 +139,28 @@ impl Payload {
             protocol: Some("http/2"),
             unreadable: Some(reason),
             ..Self::bare(chunk, exe)
+        }
+    }
+
+    /// The same thing, in the shape the database keeps.
+    ///
+    /// The target is already redacted — that happens on the way in, in `describe` and `from_http2`, so the
+    /// credential never reaches a record that could be written, printed or exported.
+    pub fn stored(&self, at: i64) -> RequestRow {
+        RequestRow {
+            at,
+            process: self.process.clone(),
+            confidence: self.confidence.to_owned(),
+            pid: self.pid,
+            direction: self.direction.to_owned(),
+            protocol: self.protocol.map(str::to_owned),
+            method: self.method.clone(),
+            target: self.target.clone(),
+            host: self.host.clone(),
+            status: self.status,
+            bytes: self.bytes,
+            truncated: self.truncated,
+            unreadable: self.unreadable.map(str::to_owned),
         }
     }
 

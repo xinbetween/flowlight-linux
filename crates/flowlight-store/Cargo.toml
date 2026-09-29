@@ -1,0 +1,16 @@
+[package]
+name = "flowlight-store"
+description = "What Flowlight keeps, for how long, and what it folds into a summary when the detail expires."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+[lints]
+workspace = true
