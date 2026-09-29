@@ -386,7 +386,7 @@ fn run(
         }
     }
 
-    if let Some(store) = store.as_deref_mut() {
+    if let Some(store) = store {
         store.flush().context("writing the last of what was seen")?;
     }
 
