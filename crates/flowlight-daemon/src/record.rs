@@ -143,8 +143,11 @@ impl Record {
         } else {
             ":"
         };
+        // A different arrow, because a refusal is not a slower connection — it is one that did not happen,
+        // and the application has already been told so.
+        let arrow = if self.blocked { "⊘" } else { "→" };
         format!(
-            "{:<24} pid {:<8} → {destination}{separator}{}{note}",
+            "{:<24} pid {:<8} {arrow} {destination}{separator}{}{note}",
             self.who(),
             self.pid,
             self.port
