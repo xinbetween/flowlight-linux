@@ -12,6 +12,7 @@
 
 use flowlight_common::http::{Summary, summarise};
 use flowlight_common::identity::Identity;
+use flowlight_common::redact::redact_target;
 use flowlight_common::tls::TlsChunk;
 use serde::Serialize;
 
@@ -34,7 +35,7 @@ pub struct Payload {
     /// The request method, for HTTP/1.x.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
-    /// The request target, for HTTP/1.x.
+    /// The request target, for HTTP/1.x, with any credentials in its query string removed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     /// The `Host` header, when it was in the same buffer as the request line.
@@ -77,7 +78,9 @@ impl Payload {
                 host,
             }) => {
                 payload.method = Some(method.to_owned());
-                payload.target = Some(target.to_owned());
+                // Redacted here, on the way in, rather than at each of the places it is eventually shown.
+                // A signed URL is entirely a credential, and CI caught this tool printing one.
+                payload.target = Some(redact_target(target));
                 payload.host = host.map(str::to_owned);
             }
             Some(Summary::Response { status, .. }) => payload.status = Some(status),

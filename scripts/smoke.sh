@@ -30,6 +30,12 @@ curl -sS --http1.1 --max-time 10 "https://$target_host" -o /dev/null
 echo "Connecting to $target_host again, letting it negotiate HTTP/2..."
 curl -sS --max-time 10 "https://$target_host" -o /dev/null
 
+# A signed URL is entirely a credential. The first CI run that read plaintext successfully also printed a
+# live Azure shared-access signature belonging to the runner, which is how this assertion came to exist.
+secret="aVeryLongOpaqueTokenValue1234567890ABCdef"
+echo "Connecting once more, with a credential in the query string..."
+curl -sS --http1.1 --max-time 10 "https://$target_host/?token=$secret" -o /dev/null
+
 wait "$watcher"
 
 echo "--- what the daemon said about itself:"
@@ -69,3 +75,16 @@ check "the response status was read in the clear" \
 # rather than silently producing nothing.
 check "the HTTP/2 connection was recognised as HTTP/2" \
     '.process == "curl" and .protocol == "http/2"'
+
+# Redaction. A signed URL is entirely a credential. The first CI run that read plaintext successfully also
+# printed a live Azure shared-access signature belonging to the runner, which is how this came to exist.
+check "the credential in the query string was redacted" \
+    '.process == "curl" and ((.target // "") | contains("token=…"))'
+
+# The strongest form of the same question, asked of the whole output rather than one record: the secret must
+# appear nowhere in anything this tool produced.
+if grep -q "$secret" "$output"; then
+    echo "FAIL: the credential appeared in the output." >&2
+    exit 1
+fi
+echo "OK: the credential appears nowhere in the output"

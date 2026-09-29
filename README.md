@@ -107,6 +107,21 @@ what processes have actually loaded, wherever that is, and it scans the usual li
 program started in a minute is already covered. Both are repeated every five seconds, because an agent
 started after the daemon is the normal case.
 
+### Credentials do not come back out
+
+A tool that watches traffic in order to make it safer cannot become a new way for credentials to escape. The
+first CI run that read plaintext successfully also read the CI runner's own traffic, and printed a live Azure
+shared-access signature into the build log — a URL that anyone reading the log could have used.
+
+So request targets are redacted before they are printed, by name (`sig`, `token`, `api_key` and relatives,
+including vendor-prefixed forms like `X-Amz-Signature`) and by shape (a long mixed-case value with digits in
+it is not a word, a date or an identifier). The parts of a URL that make it worth reading — the path, the
+model name, a UUID, a page number — are left alone.
+
+```text
+claude    pid 17903    → PUT productionresultssa17.blob.core.windows.net/…/logs.txt?se=2026-09-29T08%3A31%3A14Z&sig=…&sp=cw
+```
+
 ### What it does not see yet
 ### What it does not see yet
 

@@ -24,5 +24,7 @@ pub mod http;
 #[cfg(feature = "alloc")]
 pub mod identity;
 pub mod procmaps;
+#[cfg(feature = "alloc")]
+pub mod redact;
 pub mod tls;
 pub mod tracepoint;
