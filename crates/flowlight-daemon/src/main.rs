@@ -209,6 +209,18 @@ fn main() -> anyhow::Result<()> {
         return history::run(command, &args.database, args.json);
     }
 
+    // Checked here, before anything is loaded or attached, so that a mistyped address fails in a tenth of a
+    // second rather than after the probes are in the kernel. `serve` checks it too, because a guard that
+    // only exists at the call site is a guard the next caller does not get.
+    if !args.no_ui && !args.ui.ip().is_loopback() {
+        bail!(
+            "the interface may only be served on loopback; {} is not. What this knows is every host every \
+             process on the machine reached, and there is no version of publishing that which is a good \
+             idea. Use --no-ui if you meant to turn it off.",
+            args.ui
+        );
+    }
+
     let format_text = tracefs::format_text(args.tracefs.as_deref(), CATEGORY, TRACEPOINT)?;
     let layout = Layout::from_format(&Format::new(&format_text))?;
 
