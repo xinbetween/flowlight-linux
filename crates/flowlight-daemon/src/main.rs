@@ -764,9 +764,15 @@ fn keep(result: anyhow::Result<()>) {
 
 /// Loads the two `connect` hooks and attaches them to the root cgroup.
 ///
-/// `AllowMultiple` rather than replacing what is there: a machine may already have a cgroup program
-/// attached — systemd's own filtering, a container runtime's — and quietly displacing it would turn a
-/// monitoring tool into the reason something else stopped working.
+/// Not displacing what is already there matters: a machine may already have a cgroup program attached —
+/// systemd's own filtering, a container runtime's — and quietly replacing it would turn a monitoring tool
+/// into the reason something else stopped working.
+///
+/// Which flag says that depends on how the kernel is asked. From 5.7 aya attaches through a BPF *link*,
+/// and the kernel refuses `BPF_F_ALLOW_MULTI` there with `EINVAL` — because a link is already multi:
+/// `cgroup_bpf_link_attach` passes that flag itself. Before 5.7 it attaches the old way, where the flag is
+/// the only thing standing between this and evicting somebody else's program. So: ask for no flags, and
+/// fall back to asking for multi, which is exactly one of those two answers on any given kernel.
 fn attach_blocking(ebpf: &mut Ebpf) -> anyhow::Result<BpfHashMap<MapData, BlockKey, u8>> {
     let cgroup = std::fs::File::open(CGROUP_ROOT).with_context(|| {
         format!(
@@ -780,9 +786,16 @@ fn attach_blocking(ebpf: &mut Ebpf) -> anyhow::Result<BpfHashMap<MapData, BlockK
             .ok_or_else(|| anyhow!("the compiled program has no {name} function"))?
             .try_into()?;
         program.load().map_err(explain_load_failure)?;
-        program
-            .attach(&cgroup, CgroupAttachMode::AllowMultiple)
-            .with_context(|| format!("attaching {name} to {CGROUP_ROOT}"))?;
+        if let Err(link_error) = program.attach(&cgroup, CgroupAttachMode::Single) {
+            program
+                .attach(&cgroup, CgroupAttachMode::AllowMultiple)
+                .map_err(|prog_attach_error| {
+                    anyhow!(
+                        "attaching {name} to {CGROUP_ROOT} failed both ways: as a link, {link_error}; \
+                         and as a program attachment, {prog_attach_error}"
+                    )
+                })?;
+        }
     }
     let map = ebpf
         .take_map("BLOCKED")
