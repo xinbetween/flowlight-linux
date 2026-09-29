@@ -498,12 +498,17 @@ fn run(
             // Printed when it moves, not on a timer: the numbers answer a question that only comes up
             // when a rule scoped to an agent does not appear to bite, and the answer has to already be in
             // the log by the time anybody asks.
-            let (forks, copied) = enforcing.propagation();
-            if copied != last_propagation.1 {
+            // Either number moving is worth a line. Reporting only the second hid whether the first was
+            // moving at all, which was the whole question.
+            let propagation = enforcing.propagation();
+            if propagation != last_propagation {
                 eprintln!(
-                    "the kernel has seen {forks} fork(s) and copied {copied} mark(s) to children"
+                    "the kernel has seen {} fork(s), copied {} mark(s) to children, and holds {} mark(s)",
+                    propagation.0,
+                    propagation.1,
+                    enforcing.marked()
                 );
-                last_propagation = (forks, copied);
+                last_propagation = propagation;
             }
             for (pid, agent) in enforcing.mark_all(&agent::running_agents()) {
                 // Which processes are treated as agents decides which rules reach them, and a rule that
