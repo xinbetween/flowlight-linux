@@ -29,7 +29,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "Watching for 20 seconds..."
+# Anything that fails while the daemon is still running needs the daemon's own account of itself, which is
+# on its standard error and has not been printed yet. Discovering that from CI a second time would be a
+# waste of everybody's afternoon.
+fail() {
+    echo "FAIL: $1" >&2
+    echo "--- what the daemon said:" >&2
+    cat "$log" >&2
+    exit 1
+}
+
+echo "Watching..."
 sudo "$binary" --json --seconds 45 --database "$database" --ui 127.0.0.1:0 >"$output" 2>"$log" &
 watcher=$!
 
@@ -41,16 +51,14 @@ sleep 3
 # happens to be using it.
 url=$(grep -o 'http://127\.0\.0\.1:[0-9]*/?token=[0-9a-f]*' "$log" | head -1)
 if [ -z "$url" ]; then
-    echo "FAIL: the daemon did not report an interface address." >&2
-    cat "$log" >&2
-    exit 1
+    fail "the daemon did not report an interface address."
 fi
 base=${url%%/?token=*}
 token=${url##*token=}
 echo "Interface at $base"
 
 code=$(curl -sS -o /dev/null -w '%{http_code}' "$url")
-[ "$code" = 200 ] || { echo "FAIL: the page answered $code with its token." >&2; exit 1; }
+[ "$code" = 200 ] || fail "the page answered $code with its token."
 echo "OK: the page is served to a request carrying the token"
 
 code=$(curl -sS -o /dev/null -w '%{http_code}' "$base/")
@@ -132,8 +140,7 @@ if curl -sS --max-time 8 "https://$blocked_address/" -o /dev/null 2>/dev/null; t
     # and waiting for it is part of what is being tested.
     sleep 4
     if curl -sS --max-time 8 "https://$blocked_address/" -o /dev/null 2>/dev/null; then
-        echo "FAIL: a blocked address was still reachable." >&2
-        exit 1
+        fail "a blocked address was still reachable."
     fi
     echo "OK: the blocked address could not be connected to"
 else
@@ -145,12 +152,10 @@ fi
 sleep 2
 # And the page's own data, read back through the API the browser uses.
 if ! curl -sS "$base/api/coverage?token=$token&since=600" | jq -e '.requests >= 0 and (.unread | type) == "array"' >/dev/null; then
-    echo "FAIL: the coverage API did not answer with a coverage object." >&2
-    exit 1
+    fail "the coverage API did not answer with a coverage object."
 fi
 if ! curl -sS "$base/api/requests?token=$token&since=600" | jq -e 'map(select(.process == "curl" and .method == "GET")) | length > 0' >/dev/null; then
-    echo "FAIL: the interface's own API does not show the request that was read." >&2
-    exit 1
+    fail "the interface's own API does not show the request that was read."
 fi
 echo "OK: the interface serves what was read, through the API its page uses"
 
