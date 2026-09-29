@@ -16,7 +16,6 @@ path = "src/main.rs"
 flowlight-common = { workspace = true, features = ["user"] }
 anyhow.workspace = true
 aya.workspace = true
-bytes = "1"
 clap.workspace = true
 libc = "0.2"
 serde.workspace = true

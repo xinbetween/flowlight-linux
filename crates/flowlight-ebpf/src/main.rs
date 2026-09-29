@@ -13,6 +13,12 @@
 
 #![no_std]
 #![no_main]
+// The `#[tracepoint]` macro generates the `extern "C"` entry point the kernel actually calls, and it has no
+// doc comment to give it. The crate has three items of its own and all three are documented.
+#![allow(
+    missing_docs,
+    reason = "the attribute macro generates an undocumented entry point"
+)]
 
 use aya_ebpf::{
     helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid},

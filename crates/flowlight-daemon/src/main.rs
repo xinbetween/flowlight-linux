@@ -13,11 +13,13 @@ mod record;
 mod tracefs;
 
 use anyhow::{Context as _, anyhow, bail};
-use aya::maps::{Array, PerfEventArray, perf::PerfEventArrayBuffer};
+use aya::maps::{
+    Array, PerfEventArray,
+    perf::{PerfEvent, PerfEventArrayBuffer},
+};
 use aya::programs::TracePoint;
 use aya::util::online_cpus;
 use aya::{Ebpf, maps::MapData};
-use bytes::BytesMut;
 use clap::Parser;
 use flowlight_common::connection::{ConnectionEvent, Layout};
 use flowlight_common::tracepoint::Format;
@@ -191,36 +193,60 @@ fn report(receiver: &Receiver<Message>, args: &Args) -> anyhow::Result<()> {
 
 /// Drains one CPU's perf buffer for as long as anyone is listening.
 fn read_events(mut buffer: PerfEventArrayBuffer<MapData>, sender: &Sender<Message>) {
-    let size = size_of::<ConnectionEvent>();
-    // Sixteen at a time: enough that a burst is drained in one syscall, small enough that the allocation is
-    // irrelevant. The kernel writes one event per slot and tells us how many it filled.
-    let mut slots = vec![BytesMut::with_capacity(size); 16];
-
+    let mut scratch = [0_u8; size_of::<ConnectionEvent>()];
     loop {
         if !wait_until_readable(&buffer) {
             return;
         }
-        let Ok(stats) = buffer.read_events(&mut slots) else {
-            return;
-        };
-        if stats.lost > 0 && sender.send(Message::Lost(stats.lost as u64)).is_err() {
-            return;
-        }
-        for slot in slots.iter().take(stats.read) {
-            // A short read would mean the kernel and this binary disagree about the struct, which the build
-            // makes impossible — but reading past the end on the strength of that reasoning is not a trade
-            // worth making in a process running as root.
-            if slot.len() < size {
-                continue;
-            }
-            // SAFETY: the eBPF program wrote exactly one `ConnectionEvent` into this slot. `read_unaligned`
-            // because the perf buffer makes no alignment promise about where a record starts.
-            let event = unsafe { slot.as_ptr().cast::<ConnectionEvent>().read_unaligned() };
-            if sender.send(Message::Event(Box::new(event))).is_err() {
+        // `for_each` cannot stop early, so a closed channel is noticed rather than returned through.
+        let mut listening = true;
+        buffer.for_each(|event| {
+            if !listening {
                 return;
             }
+            let message = match event {
+                PerfEvent::Lost { count } => Some(Message::Lost(count)),
+                PerfEvent::Sample { head, tail } => {
+                    decode(head, tail, &mut scratch).map(|event| Message::Event(Box::new(event)))
+                }
+            };
+            if let Some(message) = message
+                && sender.send(message).is_err()
+            {
+                listening = false;
+            }
+        });
+        if !listening {
+            return;
         }
     }
+}
+
+/// Reassembles one event out of the ring buffer's bytes.
+///
+/// A sample that reaches the end of the ring is handed over in two pieces, and the second piece is where the
+/// sixty-four bytes of an event can end up split down the middle. It happens once per ring's worth of
+/// traffic, which is rarely enough that a version of this that only handled the contiguous case would look
+/// correct for a long time.
+fn decode(
+    head: &[u8],
+    tail: &[u8],
+    scratch: &mut [u8; size_of::<ConnectionEvent>()],
+) -> Option<ConnectionEvent> {
+    let size = size_of::<ConnectionEvent>();
+    let bytes = if head.len() >= size {
+        head
+    } else {
+        // The split case. Anything shorter than an event even after rejoining is not one, and is dropped
+        // rather than read past — this process runs as root.
+        let (front, back) = scratch.split_at_mut_checked(head.len())?;
+        front.copy_from_slice(head);
+        back.copy_from_slice(tail.get(..size - head.len())?);
+        scratch.as_slice()
+    };
+    // SAFETY: the eBPF program wrote exactly one `ConnectionEvent`, and `bytes` is at least that long.
+    // `read_unaligned` because the ring buffer makes no alignment promise about where a record starts.
+    Some(unsafe { bytes.as_ptr().cast::<ConnectionEvent>().read_unaligned() })
 }
 
 /// Blocks until the buffer has something in it. Returns false if it will never have anything again.
@@ -275,4 +301,74 @@ fn explain_load_failure<E: std::error::Error + Send + Sync + 'static>(err: E) ->
         "The kernel refused the program. `dmesg` usually carries the verifier's reason."
     };
     anyhow!(err).context(hint)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flowlight_common::connection::{AF_INET, ipv4_bytes};
+
+    fn sample() -> ConnectionEvent {
+        ConnectionEvent {
+            tgid: 4711,
+            pid: 4711,
+            family: AF_INET,
+            daddr: ipv4_bytes([93, 184, 216, 34]),
+            dport: 443,
+            comm: *b"curl\0\0\0\0\0\0\0\0\0\0\0\0",
+            ..ConnectionEvent::zeroed()
+        }
+    }
+
+    fn bytes_of(event: &ConnectionEvent) -> &[u8] {
+        // SAFETY: `ConnectionEvent` is `repr(C)` and contains only integers, so every byte of it is
+        // initialised and readable. This is what the kernel hands us, read back the same way.
+        unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::from_ref(event).cast::<u8>(),
+                size_of::<ConnectionEvent>(),
+            )
+        }
+    }
+
+    #[test]
+    fn a_contiguous_sample_is_read_directly() {
+        let event = sample();
+        let mut scratch = [0; size_of::<ConnectionEvent>()];
+        assert_eq!(decode(bytes_of(&event), &[], &mut scratch), Some(event));
+    }
+
+    /// The case that happens once per ring's worth of traffic and would otherwise be found in production.
+    #[test]
+    fn a_sample_split_across_the_ring_boundary_is_rejoined() {
+        let event = sample();
+        let raw = bytes_of(&event);
+        for split in [1, 17, 30, 63] {
+            let (head, tail) = raw.split_at(split);
+            let mut scratch = [0; size_of::<ConnectionEvent>()];
+            assert_eq!(
+                decode(head, tail, &mut scratch),
+                Some(event),
+                "split at {split}"
+            );
+        }
+    }
+
+    /// The kernel may pad a sample. Extra bytes after the event are not part of it and change nothing.
+    #[test]
+    fn trailing_padding_is_ignored() {
+        let event = sample();
+        let mut padded = bytes_of(&event).to_vec();
+        padded.extend_from_slice(&[0; 8]);
+        let mut scratch = [0; size_of::<ConnectionEvent>()];
+        assert_eq!(decode(&padded, &[], &mut scratch), Some(event));
+    }
+
+    #[test]
+    fn a_sample_too_short_to_be_an_event_is_dropped() {
+        let event = sample();
+        let short = bytes_of(&event).get(..20).unwrap();
+        let mut scratch = [0; size_of::<ConnectionEvent>()];
+        assert_eq!(decode(short, &[], &mut scratch), None);
+    }
 }
