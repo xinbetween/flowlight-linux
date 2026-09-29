@@ -24,7 +24,7 @@ use agent::Agents;
 use anyhow::{Context as _, anyhow, bail};
 use aya::Ebpf;
 use aya::maps::perf::{PerfEvent, PerfEventArrayBuffer};
-use aya::maps::{Array, HashMap as BpfHashMap, LruHashMap, MapData, PerfEventArray};
+use aya::maps::{Array, HashMap as BpfHashMap, MapData, PerfEventArray};
 use aya::programs::uprobe::UProbeScope;
 use aya::programs::{CgroupAttachMode, CgroupSockAddr, TracePoint, UProbe};
 use aya::util::online_cpus;
@@ -821,9 +821,13 @@ fn keep(result: anyhow::Result<()>) {
 /// `cgroup_bpf_link_attach` passes that flag itself. Before 5.7 it attaches the old way, where the flag is
 /// the only thing standing between this and evicting somebody else's program. So: ask for no flags, and
 /// fall back to asking for multi, which is exactly one of those two answers on any given kernel.
+/// The two maps enforcement needs: the answers, and who is who.
+///
+/// Both are `HashMap` here even though `PID_AGENT` is a least-recently-used map in the kernel — aya's typed
+/// wrapper covers both, and the eviction is the kernel's business rather than this side's.
 type Enforcement = (
     BpfHashMap<MapData, BlockKey, u8>,
-    LruHashMap<MapData, u32, u32>,
+    BpfHashMap<MapData, u32, u32>,
 );
 
 fn attach_blocking(ebpf: &mut Ebpf, tracefs: Option<&Path>) -> anyhow::Result<Enforcement> {
@@ -884,7 +888,7 @@ fn attach_blocking(ebpf: &mut Ebpf, tracefs: Option<&Path>) -> anyhow::Result<En
         .ok_or_else(|| anyhow!("the compiled program has no PID_AGENT map"))?;
     Ok((
         BpfHashMap::try_from(verdicts)?,
-        LruHashMap::try_from(marks)?,
+        BpfHashMap::try_from(marks)?,
     ))
 }
 

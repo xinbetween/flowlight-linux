@@ -16,7 +16,7 @@
 //! names are re-resolved on a timer; and a block on a shared address is a block on everything at that
 //! address. Neither is solvable at this layer, and pretending otherwise would be worse than saying so.
 
-use aya::maps::{HashMap as BpfHashMap, LruHashMap, MapData};
+use aya::maps::{HashMap as BpfHashMap, MapData};
 use flowlight_common::block::{ANY_PORT, BlockKey, EVERYONE};
 use flowlight_common::connection::{AF_INET, AF_INET6, ipv4_bytes};
 use flowlight_rules::{Action, KeySpec, Rule, Scope, Subject, table};
@@ -61,7 +61,7 @@ impl Report {
 /// Keeps the kernel's table matching the rules, and its marks matching the processes.
 pub struct Blocking {
     verdicts: BpfHashMap<MapData, BlockKey, u8>,
-    marks: LruHashMap<MapData, u32, u32>,
+    marks: BpfHashMap<MapData, u32, u32>,
     installed: BTreeMap<BlockKey, u8>,
     resolved: HashMap<String, (Vec<IpAddr>, Instant)>,
     /// Subjects whose failure to resolve has already been said out loud.
@@ -76,7 +76,7 @@ impl Blocking {
     /// Takes ownership of the two maps.
     pub fn new(
         verdicts: BpfHashMap<MapData, BlockKey, u8>,
-        marks: LruHashMap<MapData, u32, u32>,
+        marks: BpfHashMap<MapData, u32, u32>,
     ) -> Self {
         Self {
             verdicts,
