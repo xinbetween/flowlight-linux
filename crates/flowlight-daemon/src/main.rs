@@ -511,7 +511,7 @@ fn run(
             if propagation != last_propagation {
                 eprintln!(
                     "forks {}, layout ready {}, marks copied {}, last parent {}, last marked parent {}, \
-                     marks held {}, last marking error {}, last child marked {}, last marked exit {}, connects {}, connects marked {}, last connect {}",
+                     marks held {}, last marking error {}, last child marked {}, last marked exit {}, connects {}, connects marked {}, last connect {}, last marked connect {} as agent {}, last scoped hit {}",
                     propagation.forks,
                     propagation.layout_ready,
                     propagation.copied,
@@ -523,7 +523,10 @@ fn run(
                     propagation.last_exit,
                     propagation.connects,
                     propagation.connects_marked,
-                    propagation.last_connect
+                    propagation.last_connect,
+                    propagation.last_marked_connect,
+                    propagation.last_marked_agent,
+                    propagation.last_scoped_hit
                 );
                 last_propagation = propagation;
             }
@@ -552,6 +555,9 @@ fn run(
                                  handshake: the name is resolved and thrown away before connect() is \
                                  called. It is still reported when it is reached."
                             );
+                        }
+                        for key in enforcing.written() {
+                            eprintln!("  table: {key}");
                         }
                         for id in &report.unreadable {
                             eprintln!(

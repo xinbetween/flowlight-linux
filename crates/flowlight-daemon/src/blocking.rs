@@ -85,6 +85,12 @@ pub struct Propagation {
     pub connects_marked: u64,
     /// The last thread group the hook looked up.
     pub last_connect: u64,
+    /// The last thread group whose caller was marked, and the identifier it carried.
+    pub last_marked_connect: u64,
+    /// ditto.
+    pub last_marked_agent: u64,
+    /// The last thread group whose agent-scoped key was found in the table.
+    pub last_scoped_hit: u64,
 }
 
 /// Keeps the kernel's table matching the rules, and its marks matching the processes.
@@ -169,6 +175,9 @@ impl Blocking {
             connects: at(8),
             connects_marked: at(9),
             last_connect: at(10),
+            last_marked_connect: at(11),
+            last_marked_agent: at(12),
+            last_scoped_hit: at(13),
             held: self.marked(),
         }
     }
@@ -179,6 +188,26 @@ impl Blocking {
     /// counting what this side wrote.
     pub fn marked(&self) -> usize {
         self.marks.keys().filter(std::result::Result::is_ok).count()
+    }
+
+    /// Every key currently in the kernel's table, as text.
+    ///
+    /// For comparing what was written against what the hook looks for, which is the one comparison that
+    /// cannot be made from either side alone.
+    pub fn written(&self) -> Vec<String> {
+        self.installed
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "agent {} family {} port {} address {:?} -> {}",
+                    key.agent,
+                    key.family,
+                    key.port,
+                    &key.address[..4],
+                    value
+                )
+            })
+            .collect()
     }
 
     /// Marks every agent currently running.

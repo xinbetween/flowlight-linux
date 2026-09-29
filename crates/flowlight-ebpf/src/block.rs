@@ -62,6 +62,12 @@ pub const CONNECTS_SEEN: u32 = 8;
 pub const CONNECTS_MARKED: u32 = 9;
 /// Index of the last thread group the hook looked up.
 pub const LAST_CONNECT_TGID: u32 = 10;
+/// Index of the last thread group whose caller was marked.
+pub const LAST_MARKED_CONNECT: u32 = 11;
+/// Index of the agent identifier that caller was marked with.
+pub const LAST_MARKED_AGENT: u32 = 12;
+/// Index of the last thread group whose agent-scoped key was found.
+pub const LAST_SCOPED_HIT: u32 = 13;
 
 /// Records what the hook saw, in the same array the fork tracepoint uses.
 fn note(index: u32, value: u64, add: bool) {
@@ -149,6 +155,8 @@ fn decide(ctx: &SockAddrContext, family: u16, address: [u8; 16], port: u16) -> i
     note(LAST_CONNECT_TGID, u64::from(tgid), false);
     if scoped {
         note(CONNECTS_MARKED, 1, true);
+        note(LAST_MARKED_CONNECT, u64::from(tgid), false);
+        note(LAST_MARKED_AGENT, u64::from(agent), false);
     }
 
     let mut matched = EVERYONE;
@@ -160,6 +168,7 @@ fn decide(ctx: &SockAddrContext, family: u16, address: [u8; 16], port: u16) -> i
         verdict = look(&BlockKey::new(agent, family, address, port));
         if verdict.is_some() {
             matched = agent;
+            note(LAST_SCOPED_HIT, u64::from(tgid), false);
         }
     }
     if verdict.is_none() {
