@@ -16,7 +16,7 @@
 //! names are re-resolved on a timer; and a block on a shared address is a block on everything at that
 //! address. Neither is solvable at this layer, and pretending otherwise would be worse than saying so.
 
-use aya::maps::{HashMap as BpfHashMap, MapData};
+use aya::maps::{Array, HashMap as BpfHashMap, MapData};
 use flowlight_common::block::{ANY_PORT, BlockKey, EVERYONE};
 use flowlight_common::connection::{AF_INET, AF_INET6, ipv4_bytes};
 use flowlight_rules::{Action, KeySpec, Rule, Scope, Subject, table};
@@ -62,6 +62,7 @@ impl Report {
 pub struct Blocking {
     verdicts: BpfHashMap<MapData, BlockKey, u8>,
     marks: BpfHashMap<MapData, u32, u32>,
+    counts: Array<MapData, u64>,
     installed: BTreeMap<BlockKey, u8>,
     resolved: HashMap<String, (Vec<IpAddr>, Instant)>,
     /// Subjects whose failure to resolve has already been said out loud.
@@ -77,10 +78,12 @@ impl Blocking {
     pub fn new(
         verdicts: BpfHashMap<MapData, BlockKey, u8>,
         marks: BpfHashMap<MapData, u32, u32>,
+        counts: Array<MapData, u64>,
     ) -> Self {
         Self {
             verdicts,
             marks,
+            counts,
             installed: BTreeMap::new(),
             resolved: HashMap::new(),
             complained: BTreeSet::new(),
@@ -116,6 +119,16 @@ impl Blocking {
             }
             Err(_) => false,
         }
+    }
+
+    /// How many forks the kernel saw, and how many carried a mark to a child.
+    ///
+    /// The only way to tell an agent that was never recognised from a propagation that never ran.
+    pub fn propagation(&self) -> (u64, u64) {
+        (
+            self.counts.get(&0, 0).unwrap_or(0),
+            self.counts.get(&1, 0).unwrap_or(0),
+        )
     }
 
     /// Marks every agent currently running, and forgets the ones that are not.

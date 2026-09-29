@@ -334,7 +334,9 @@ fn main() -> anyhow::Result<()> {
     let mut enforcing = None;
     if !args.no_block {
         match attach_blocking(&mut ebpf, args.tracefs.as_deref()) {
-            Ok((verdicts, marks)) => enforcing = Some(Blocking::new(verdicts, marks)),
+            Ok((verdicts, marks, counts)) => {
+                enforcing = Some(Blocking::new(verdicts, marks, counts));
+            }
             // Not fatal. A kernel or a container that will not take a cgroup hook is a machine that cannot
             // refuse connections, and that is a reason to say so rather than a reason to stop watching.
             Err(err) => eprintln!(
@@ -463,6 +465,7 @@ fn run(
     let mut next_flush = Instant::now() + FLUSH;
     let mut next_rules = Instant::now();
     let mut next_agent_scan = Instant::now();
+    let mut last_propagation = (0_u64, 0_u64);
     let mut seen = 0_u64;
     let mut lost = 0_u64;
 
@@ -492,6 +495,16 @@ fn run(
         if let Some(enforcing) = enforcing.as_deref_mut()
             && Instant::now() >= next_agent_scan
         {
+            // Printed when it moves, not on a timer: the numbers answer a question that only comes up
+            // when a rule scoped to an agent does not appear to bite, and the answer has to already be in
+            // the log by the time anybody asks.
+            let (forks, copied) = enforcing.propagation();
+            if copied != last_propagation.1 {
+                eprintln!(
+                    "the kernel has seen {forks} fork(s) and copied {copied} mark(s) to children"
+                );
+                last_propagation = (forks, copied);
+            }
             for (pid, agent) in enforcing.mark_all(&agent::running_agents()) {
                 // Which processes are treated as agents decides which rules reach them, and a rule that
                 // appears to do nothing is usually a process nobody recognised as the thing it names.
@@ -630,6 +643,13 @@ fn run(
 
     if let Some(store) = store {
         store.flush().context("writing the last of what was seen")?;
+    }
+
+    if let Some(enforcing) = enforcing {
+        let (forks, copied) = enforcing.propagation();
+        eprintln!(
+            "the kernel saw {forks} fork(s) and carried an agent's mark to {copied} child process(es)"
+        );
     }
 
     if lost > 0 {
@@ -834,6 +854,7 @@ fn keep(result: anyhow::Result<()>) {
 type Enforcement = (
     BpfHashMap<MapData, BlockKey, u8>,
     BpfHashMap<MapData, u32, u32>,
+    Array<MapData, u64>,
 );
 
 fn attach_blocking(ebpf: &mut Ebpf, tracefs: Option<&Path>) -> anyhow::Result<Enforcement> {
@@ -892,9 +913,13 @@ fn attach_blocking(ebpf: &mut Ebpf, tracefs: Option<&Path>) -> anyhow::Result<En
     let marks = ebpf
         .take_map("PID_AGENT")
         .ok_or_else(|| anyhow!("the compiled program has no PID_AGENT map"))?;
+    let counts = ebpf
+        .take_map("FORK_COUNTS")
+        .ok_or_else(|| anyhow!("the compiled program has no FORK_COUNTS map"))?;
     Ok((
         BpfHashMap::try_from(verdicts)?,
         BpfHashMap::try_from(marks)?,
+        Array::try_from(counts)?,
     ))
 }
 

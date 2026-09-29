@@ -31,6 +31,28 @@ pub static PID_AGENT: LruHashMap<u32, u32> = LruHashMap::with_max_entries(20480,
 #[map]
 static TASK_LAYOUT: Array<TaskLayout> = Array::with_max_entries(1, 0);
 
+/// How many forks were seen, and how many of them carried a mark.
+///
+/// Two numbers, read by the daemon and shown in Coverage. They answer a question nothing else can: whether
+/// an agent-scoped rule failed to bite because the agent was not recognised, or because the propagation
+/// that is supposed to reach its children never ran. Without them the two look identical from outside.
+#[map]
+pub static FORK_COUNTS: Array<u64> = Array::with_max_entries(2, 0);
+
+/// Index of the count of forks seen.
+pub const FORKS_SEEN: u32 = 0;
+/// Index of the count of marks copied to a child.
+pub const MARKS_COPIED: u32 = 1;
+
+/// Adds one to a counter, as far as the verifier is concerned safely.
+fn bump(index: u32) {
+    if let Some(slot) = FORK_COUNTS.get_ptr_mut(index) {
+        // SAFETY: a plain array value this program alone writes. Not atomic, and does not need to be: it
+        // is a diagnostic, and losing one increment to a race on another CPU changes nothing it is for.
+        unsafe { *slot += 1 };
+    }
+}
+
 /// A process forked. The child inherits whatever the parent was working for.
 ///
 /// The category and name are given to the macro, not just to the attach call, because without them every
@@ -44,6 +66,7 @@ pub fn sched_fork(ctx: TracePointContext) -> u32 {
 }
 
 fn on_fork(ctx: &TracePointContext) -> Result<(), i64> {
+    bump(FORKS_SEEN);
     let layout = TASK_LAYOUT.get(0).ok_or(0_i64)?;
     // SAFETY for both: the offsets come from the kernel's own description of this tracepoint, and the
     // daemon refused to load this program if either field was missing or an unexpected width.
@@ -54,6 +77,7 @@ fn on_fork(ctx: &TracePointContext) -> Result<(), i64> {
     // A full map means this child goes unmarked, which means an agent-scoped rule does not reach it. That
     // is a hole, and 0.2.x's Coverage is where holes are reported rather than papered over.
     let _ = PID_AGENT.insert(&child, &agent, 0);
+    bump(MARKS_COPIED);
     Ok(())
 }
 
