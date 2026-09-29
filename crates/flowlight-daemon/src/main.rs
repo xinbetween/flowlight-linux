@@ -10,6 +10,7 @@
 //!
 //! Needs root, or `CAP_BPF` and `CAP_PERFMON`. There is no version of loading a probe that does not.
 
+mod http2;
 mod libraries;
 mod payload;
 mod record;
@@ -26,7 +27,7 @@ use clap::Parser;
 use flowlight_common::connection::{ConnectionEvent, Layout};
 use flowlight_common::tls::TlsChunk;
 use flowlight_common::tracepoint::Format;
-use payload::Payload;
+use payload::Payloads;
 use record::Record;
 use std::collections::BTreeSet;
 use std::io::Write as _;
@@ -202,6 +203,7 @@ fn run(ebpf: &mut Ebpf, receiver: &Receiver<Message>, args: &Args) -> anyhow::Re
         .seconds
         .map(|seconds| Instant::now() + Duration::from_secs(seconds));
     let mut stdout = std::io::stdout().lock();
+    let mut payloads = Payloads::new();
     let mut probed = BTreeSet::new();
     let mut next_scan = Instant::now();
     let mut seen = 0_u64;
@@ -232,11 +234,20 @@ fn run(ebpf: &mut Ebpf, receiver: &Receiver<Message>, args: &Args) -> anyhow::Re
             }
             Ok(Message::Payload(chunk)) => {
                 let exe = executable_of(chunk.tgid);
-                let payload = Payload::describe(&chunk, exe.as_deref());
-                if !args.all && !payload.is_notable() {
-                    continue;
+                let records = payloads.observe(&chunk, exe.as_deref());
+                if records.is_empty() {
+                    if !args.all {
+                        continue;
+                    }
+                    let plain = Payloads::plain(&chunk, exe.as_deref());
+                    render(&mut stdout, args.json, &plain, &plain.human())?;
+                } else {
+                    for record in &records {
+                        render(&mut stdout, args.json, record, &record.human())?;
+                    }
+                    // One buffer can complete more than one request, and each is a record.
+                    seen += records.len() as u64 - 1;
                 }
-                render(&mut stdout, args.json, &payload, &payload.human())?;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {

@@ -22,6 +22,8 @@ extern crate alloc;
 pub mod connection;
 pub mod http;
 #[cfg(feature = "alloc")]
+pub mod http2;
+#[cfg(feature = "alloc")]
 pub mod identity;
 pub mod procmaps;
 #[cfg(feature = "alloc")]

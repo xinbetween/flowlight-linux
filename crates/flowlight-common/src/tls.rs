@@ -30,6 +30,16 @@ pub const DIRECTION_IN: u8 = 1;
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TlsChunk {
+    /// The `SSL *` this call was made on: the connection, as the application knows it.
+    ///
+    /// The one field here that is a pointer value rather than data, and it earns its place. A process with
+    /// two connections open interleaves their buffers, and HTTP/2 cannot be read out of an interleaved
+    /// stream — its header compression is a table built across one connection in order. Without this, a
+    /// second connection does not degrade the decoding, it destroys it.
+    ///
+    /// Meaningless as an address and never dereferenced. It is an identifier that is unique while the
+    /// connection is open, which is exactly as long as it needs to be.
+    pub ssl: u64,
     /// The process.
     pub tgid: u32,
     /// The thread that made the call.
@@ -52,6 +62,7 @@ impl TlsChunk {
     /// An empty chunk, which is how the eBPF program starts one.
     pub const fn zeroed() -> Self {
         Self {
+            ssl: 0,
             tgid: 0,
             pid: 0,
             comm: [0; crate::connection::TASK_COMM_LEN],
@@ -104,7 +115,7 @@ mod tests {
     /// them reads the other's bytes at the wrong offsets and says nothing about it.
     #[test]
     fn the_wire_struct_is_the_size_both_sides_agree_on() {
-        assert_eq!(size_of::<TlsChunk>(), 4132);
+        assert_eq!(size_of::<TlsChunk>(), 4144);
     }
 
     #[test]

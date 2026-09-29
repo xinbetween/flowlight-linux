@@ -9,7 +9,7 @@ members = ["crates/flowlight-common", "crates/flowlight-daemon", "crates/flowlig
 default-members = ["crates/flowlight-common"]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/xinbetween/flowlight-linux"
@@ -25,6 +25,9 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# HPACK, which is not worth writing: a static table, a dynamic table with its own eviction rules, and a
+# canonical Huffman code. MIT, which composes with GPL-3.0 without friction.
+loona-hpack = "0.4"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
