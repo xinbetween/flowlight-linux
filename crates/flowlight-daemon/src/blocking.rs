@@ -104,13 +104,17 @@ impl Blocking {
     ///
     /// Only the agents themselves are marked here. Everything they start is marked by the fork tracepoint,
     /// in the kernel, because a child can connect before anything in userspace has noticed it exists.
-    pub fn mark(&mut self, pid: u32, agent: &str) {
+    pub fn mark(&mut self, pid: u32, agent: &str) -> bool {
         let identity = self.identity(agent);
         if self.marked.get(&pid) == Some(&identity) {
-            return;
+            return false;
         }
-        if self.marks.insert(pid, identity, 0).is_ok() {
-            self.marked.insert(pid, identity);
+        match self.marks.insert(pid, identity, 0) {
+            Ok(()) => {
+                self.marked.insert(pid, identity);
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -118,10 +122,13 @@ impl Blocking {
     ///
     /// Called on a timer. An agent is a long-lived process, so noticing it a second after it starts is
     /// fine; its children are another matter entirely, and they are marked in the kernel at fork.
-    pub fn mark_all(&mut self, running: &[(u32, String)]) {
+    pub fn mark_all(&mut self, running: &[(u32, String)]) -> Vec<(u32, String)> {
         let present: BTreeSet<u32> = running.iter().map(|(pid, _)| *pid).collect();
+        let mut newly = Vec::new();
         for (pid, agent) in running {
-            self.mark(*pid, agent);
+            if self.mark(*pid, agent) {
+                newly.push((*pid, agent.clone()));
+            }
         }
         let gone: Vec<u32> = self
             .marked
@@ -132,6 +139,7 @@ impl Blocking {
         for pid in gone {
             self.unmark(pid);
         }
+        newly
     }
 
     /// Forgets a process that has gone.

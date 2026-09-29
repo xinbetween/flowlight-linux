@@ -492,7 +492,13 @@ fn run(
         if let Some(enforcing) = enforcing.as_deref_mut()
             && Instant::now() >= next_agent_scan
         {
-            enforcing.mark_all(&agent::running_agents());
+            for (pid, agent) in enforcing.mark_all(&agent::running_agents()) {
+                // Which processes are treated as agents decides which rules reach them, and a rule that
+                // appears to do nothing is usually a process nobody recognised as the thing it names.
+                eprintln!(
+                    "marking {agent} (pid {pid}); rules scoped to it now reach anything it starts"
+                );
+            }
             next_agent_scan = Instant::now() + AGENT_SCAN;
         }
 
