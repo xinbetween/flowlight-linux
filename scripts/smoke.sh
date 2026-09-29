@@ -89,11 +89,11 @@ echo "OK: nothing is served without the right token"
 
 # Loopback is not a permission boundary, so the page must never leave it. Asked of a running daemon rather
 # than trusted to a unit test, because the flag is the thing a person actually types.
-refusal=$(sudo "$binary" --database "$database" --ui 0.0.0.0:0 --seconds 1 2>&1 || true)
+refusal=$(sudo "$binary" --database "$database" --web 0.0.0.0:0 --seconds 1 2>&1 || true)
 if printf '%s' "$refusal" | grep -q loopback; then
-    echo "OK: the interface refuses to serve on a routable address"
+    echo "OK: the web page refuses to be served on a routable address"
 else
-    echo "FAIL: the interface did not refuse a routable address. It said:" >&2
+    echo "FAIL: the web page did not refuse a routable address. It said:" >&2
     printf '%s\n' "$refusal" >&2
     exit 1
 fi
