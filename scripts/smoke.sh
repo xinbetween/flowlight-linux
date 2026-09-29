@@ -166,8 +166,13 @@ if curl -sS --max-time 8 "https://$blocked_address/" -o /dev/null 2>/dev/null; t
 
     # And this one forks, so it asks the other question: whether the mark reached a child that the kernel
     # had to copy it to.
+    # `exit $?` rather than `:` at the end. A trailing `:` stops the shell replacing itself with curl --
+    # which is the point, since this is the forking case -- but it also makes the shell exit successfully
+    # whatever curl did, so this check passed nothing on to be checked. It reported a working block as a
+    # failure for several runs.
     if [ "$agent_tested" = yes ] \
-        && "$fake_agent" -c "sleep 3; curl -sS --max-time 8 https://$blocked_address/ -o /dev/null; :" \
+        && "$fake_agent" -c \
+            "sleep 3; curl -sS --max-time 8 https://$blocked_address/ -o /dev/null; exit \$?" \
             2>/dev/null; then
         fail "a connection from the agent's own child was not refused."
     fi
