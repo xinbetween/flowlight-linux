@@ -25,7 +25,7 @@ use anyhow::{Context as _, Result};
 use flowlight_store::Store;
 use serde::Serialize;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Response, Server};
 
@@ -60,7 +60,7 @@ pub fn serve(address: SocketAddr, database: PathBuf, token: String) -> Result<So
 }
 
 /// Answers requests until the process ends.
-fn run(server: &Server, database: &PathBuf, token: &str) {
+fn run(server: &Server, database: &Path, token: &str) {
     for request in server.incoming_requests() {
         let url = request.url().to_owned();
         let (path, query) = url.split_once('?').unwrap_or((url.as_str(), ""));
@@ -227,7 +227,7 @@ struct UnprobedView {
     reason: String,
 }
 
-fn requests(database: &PathBuf, query: &str) -> Result<String> {
+fn requests(database: &Path, query: &str) -> Result<String> {
     let mut store = Store::open_read_only(database)?;
     let limit = parameter(query, "limit")
         .and_then(|value| value.parse::<usize>().ok())
@@ -255,7 +255,7 @@ fn requests(database: &PathBuf, query: &str) -> Result<String> {
     Ok(serde_json::to_string(&rows)?)
 }
 
-fn processes(database: &PathBuf, query: &str) -> Result<String> {
+fn processes(database: &Path, query: &str) -> Result<String> {
     let mut store = Store::open_read_only(database)?;
     let rows: Vec<ProcessView> = store
         .processes(window(query))?
@@ -272,7 +272,7 @@ fn processes(database: &PathBuf, query: &str) -> Result<String> {
     Ok(serde_json::to_string(&rows)?)
 }
 
-fn hosts(database: &PathBuf, query: &str) -> Result<String> {
+fn hosts(database: &Path, query: &str) -> Result<String> {
     let mut store = Store::open_read_only(database)?;
     let process = parameter(query, "process").unwrap_or_default();
     let rows: Vec<HostView> = store
@@ -287,7 +287,7 @@ fn hosts(database: &PathBuf, query: &str) -> Result<String> {
     Ok(serde_json::to_string(&rows)?)
 }
 
-fn coverage(database: &PathBuf, query: &str) -> Result<String> {
+fn coverage(database: &Path, query: &str) -> Result<String> {
     let mut store = Store::open_read_only(database)?;
     let coverage = store.coverage(window(query))?;
     let view = CoverageView {
