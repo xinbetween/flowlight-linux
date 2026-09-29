@@ -2,9 +2,18 @@
 
 Per-process network visibility and HTTPS inspection for AI agents, on eBPF.
 
-Early. Today it answers one question — **which process opened which connection** — and answers it from the
-kernel rather than by guessing. [docs/DESIGN.md](docs/DESIGN.md) is the design note behind it: what was
-researched, what was measured, and which decisions are still open.
+Early, and already doing the thing the design note argues for: **reading HTTPS in the clear without
+terminating it, installing a certificate, or defeating anything.**
+
+```text
+curl                     pid 18422    → 93.184.216.34:443
+curl                     pid 18422    → GET example.com/
+curl                     pid 18422    ← 200  1256 bytes
+node                     pid 18004    → HTTP/2 — headers are HPACK-compressed and not decoded yet
+```
+
+[docs/DESIGN.md](docs/DESIGN.md) is the design note behind it: what was researched, what was measured, and
+which decisions are still open.
 
 ## The short version
 
@@ -57,37 +66,80 @@ sudo ./target/release/flowlightd
 ```
 
 ```text
+flowlightd 0.1.2: watching sock/inet_sock_set_state. Outbound TCP only; inbound connections are not
+attributed. Nothing is stored.
+reading openssl through /usr/lib/x86_64-linux-gnu/libssl.so.3 (SSL_write, SSL_write_ex, SSL_read, SSL_read_ex)
 curl                     pid 18422    → 93.184.216.34:443
-python3.12               pid 18455    → 104.18.32.47:443
-claude                   pid 17903    → 160.79.104.10:443
-node                     pid 18004    → 140.82.113.4:443  [comm]
+curl                     pid 18422    → GET example.com/
+curl                     pid 18422    ← 200  1256 bytes
 ```
 
-The fourth column, when it appears, is where the name came from. `[comm]` means the process was gone by the
-time Flowlight looked it up, so the name is the one the kernel captured — which it cuts at fifteen characters.
-`[pid]` means there was no name at all. Nothing is stored, nothing is blocked, and no payload is read.
+The name column is what the process is called. When a fourth column appears on a connection line — `[comm]`
+or `[pid]` — it says the name is worth less than usual: `[comm]` means the process was gone by the time
+Flowlight looked it up, so the name is the one the kernel captured, which it cuts at fifteen characters.
+
+Nothing is stored, nothing is blocked, and nothing is modified.
 
 Useful flags:
 
 | | |
 | --- | --- |
 | `--json` | one JSON object per line, for anything that is not a person |
+| `--all` | include buffers that do not begin a request or response — the middles of bodies, mostly |
+| `--no-payloads` | connections only; do not touch the TLS libraries |
+| `--libssl PATH` | probe a TLS library the search did not find. May be repeated |
 | `--seconds N` | stop after N seconds |
-| `--count N` | stop after N connections |
+| `--count N` | stop after N records |
 | `--tracefs PATH` | if tracefs is mounted somewhere unusual |
 
-If it refuses to start, the message says why — an unmounted tracefs, a kernel built without the tracepoint, or
-a policy that forbids loading programs are three different problems and it will not conflate them.
+If it refuses to start, the message says why — an unmounted tracefs, a kernel built without the tracepoint,
+and a policy that forbids loading programs are three different problems and it will not conflate them.
 
+### How the payloads are read
+
+Not by a proxy. A uprobe on `SSL_write` sees the buffer an application hands to OpenSSL, before it is
+encrypted; a uretprobe on `SSL_read` sees the buffer OpenSSL has just filled. There is no certificate to
+install, no trust store to modify, and nothing for certificate pinning to object to — the plaintext is read
+where the application already has it.
+
+Flowlight finds the TLS libraries two ways, because neither is enough alone: it reads `/proc/*/maps` to see
+what processes have actually loaded, wherever that is, and it scans the usual library directories so that a
+program started in a minute is already covered. Both are repeated every five seconds, because an agent
+started after the daemon is the normal case.
+
+### Credentials do not come back out
+
+A tool that watches traffic in order to make it safer cannot become a new way for credentials to escape. The
+first CI run that read plaintext successfully also read the CI runner's own traffic, and printed a live Azure
+shared-access signature into the build log — a URL that anyone reading the log could have used.
+
+So request targets are redacted before they are printed, by name (`sig`, `token`, `api_key` and relatives,
+including vendor-prefixed forms like `X-Amz-Signature`) and by shape (a long mixed-case value with digits in
+it is not a word, a date or an identifier). The parts of a URL that make it worth reading — the path, the
+model name, a UUID, a page number — are left alone.
+
+```text
+claude    pid 17903    → PUT productionresultssa17.blob.core.windows.net/…/logs.txt?se=2026-09-29T08%3A31%3A14Z&sig=…&sp=cw
+```
+
+### What it does not see yet
 ### What it does not see yet
 
 Stated here rather than discovered later:
 
+- **HTTP/2 headers.** Every current agent API speaks HTTP/2, whose headers are HPACK — compressed against a
+  table built across the whole connection, not readable from one buffer. Flowlight recognises the connection
+  and says so rather than showing an empty line, but the method and path of a request to `api.anthropic.com`
+  are not in what it can read today. This is the next release.
+- **TLS libraries other than OpenSSL.** GnuTLS, NSS (Firefox, Chrome) and Go's own implementation each need
+  their own probe.
 - **Inbound connections.** Attribution is taken at `connect()`, in the calling process's own context. An
-  inbound connection is established in a softirq, where the running task is whoever was unlucky — so naming it
-  would mean naming the wrong process.
-- **UDP and QUIC.** TCP only for now.
-- **Payloads.** That is 0.1.2.
+  inbound connection is established in a softirq, where the running task is whoever was unlucky — so naming
+  it would mean naming the wrong process.
+- **UDP and QUIC.** TCP only for now. The payload probes are indifferent to transport, so a QUIC request
+  through OpenSSL is readable; the connection behind it is not yet attributed.
+- **More than four kilobytes of any one call.** Captured buffers are cut there and the line says
+  `[truncated]` when they were.
 
 ## Where it is going
 

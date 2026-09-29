@@ -1,54 +1,82 @@
-//! `flowlightd` — which process opened which connection.
+//! `flowlightd` — what every process on this machine is doing on the network, and what it is saying.
 //!
-//! The first thing this project does that needs a kernel. It loads one tracepoint program, tells it where the
-//! fields are on *this* kernel, and prints every outbound TCP connection with the name of the process that
-//! asked for it.
+//! Two independent probes. A tracepoint on the socket path answers *which process opened which connection*.
+//! uprobes on the TLS library answer *what was actually sent*, by reading the buffer on its way into OpenSSL,
+//! before encryption — which is why there is no certificate to install, no trust store to modify, and nothing
+//! for certificate pinning to reject.
 //!
-//! What it does not do yet is as important: no storage, no payloads, no blocking. Those are 0.1.2 onwards,
-//! and each arrives on its own so that when something breaks there is one candidate.
+//! What it does not do yet is as important: no storage, no blocking, nothing modified. Those are later, and
+//! each arrives on its own so that when something breaks there is one candidate.
 //!
 //! Needs root, or `CAP_BPF` and `CAP_PERFMON`. There is no version of loading a probe that does not.
 
+mod libraries;
+mod payload;
 mod record;
 mod tracefs;
 
 use anyhow::{Context as _, anyhow, bail};
-use aya::maps::{
-    Array, PerfEventArray,
-    perf::{PerfEvent, PerfEventArrayBuffer},
-};
-use aya::programs::TracePoint;
+use aya::Ebpf;
+use aya::maps::perf::{PerfEvent, PerfEventArrayBuffer};
+use aya::maps::{Array, MapData, PerfEventArray};
+use aya::programs::uprobe::UProbeScope;
+use aya::programs::{TracePoint, UProbe};
 use aya::util::online_cpus;
-use aya::{Ebpf, maps::MapData};
 use clap::Parser;
 use flowlight_common::connection::{ConnectionEvent, Layout};
+use flowlight_common::tls::TlsChunk;
 use flowlight_common::tracepoint::Format;
+use payload::Payload;
 use record::Record;
+use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::os::fd::{AsFd as _, AsRawFd as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
-/// The tracepoint everything here hangs off.
+/// The tracepoint attribution hangs off.
 const CATEGORY: &str = "sock";
 /// ditto.
 const TRACEPOINT: &str = "inet_sock_set_state";
 
+/// How often to look for TLS libraries that have appeared since the last look.
+///
+/// An agent started after the daemon is the normal case, not the exception, so a one-shot scan at startup
+/// would miss the thing anybody actually ran this to watch.
+const RESCAN: Duration = Duration::from_secs(5);
+
+/// Pages per CPU for each perf buffer. A [`TlsChunk`] is four kilobytes, so the two-page default would hold
+/// one and a bit of them and drop the rest of any burst.
+const PERF_PAGES: usize = 64;
+
 #[derive(Parser)]
 #[command(
     version,
-    about = "Which process opened which connection, from the kernel.",
-    long_about = "Watches every outbound TCP connection on the machine and names the process that opened \
-                  it. Needs root: loading an eBPF program does.\n\nThis is Flowlight 0.1.x — seeing only. \
-                  Nothing is stored, no payloads are read, and nothing is blocked."
+    about = "What every process on this machine is doing on the network, and what it is saying.",
+    long_about = "Watches outbound TCP connections and reads HTTPS payloads as the application hands them \
+                  to OpenSSL — before encryption, so no certificate is installed anywhere and certificate \
+                  pinning is not involved. Needs root: loading an eBPF program does.\n\nThis is Flowlight \
+                  0.1.x — seeing only. Nothing is stored, and nothing is blocked or modified."
 )]
 struct Args {
     /// One JSON object per line, for anything that is not a person.
     #[arg(long)]
     json: bool,
 
-    /// Stop after this many connections.
+    /// Include buffers that do not begin a request or a response — the middles of bodies, mostly.
+    #[arg(long)]
+    all: bool,
+
+    /// Do not read payloads. Connections only.
+    #[arg(long)]
+    no_payloads: bool,
+
+    /// An extra TLS library to probe, for one the search did not find. May be repeated.
+    #[arg(long, value_name = "PATH")]
+    libssl: Vec<PathBuf>,
+
+    /// Stop after this many records.
     #[arg(long, value_name = "N")]
     count: Option<u64>,
 
@@ -63,13 +91,14 @@ struct Args {
 
 /// What a reader thread sends back.
 enum Message {
-    /// A connection.
-    Event(Box<ConnectionEvent>),
-    /// The kernel had connections to report and nowhere to put them.
+    /// A process opened a connection.
+    Connection(Box<ConnectionEvent>),
+    /// A process wrote or read plaintext.
+    Payload(Box<TlsChunk>),
+    /// The kernel had something to report and nowhere to put it.
     ///
     /// Carried rather than swallowed. A tool whose entire claim is "this is what your machine did" has to be
-    /// able to say when that claim has a hole in it, and this is the first hole 0.1.5 will have to account
-    /// for.
+    /// able to say when that claim has a hole in it, and this is the first hole 0.1.5 will account for.
     Lost(u64),
 }
 
@@ -97,103 +126,242 @@ fn main() -> anyhow::Result<()> {
         .set(0, layout, 0)
         .context("telling the program where this kernel's tracepoint fields are")?;
 
-    let program: &mut TracePoint = ebpf
+    let tracepoint: &mut TracePoint = ebpf
         .program_mut(TRACEPOINT)
         .ok_or_else(|| anyhow!("the compiled program has no {TRACEPOINT} function"))?
         .try_into()?;
-    program.load().map_err(explain_load_failure)?;
-    program
+    tracepoint.load().map_err(explain_load_failure)?;
+    tracepoint
         .attach(CATEGORY, TRACEPOINT)
         .with_context(|| format!("attaching to {CATEGORY}/{TRACEPOINT}"))?;
 
-    let events = ebpf
-        .take_map("EVENTS")
-        .ok_or_else(|| anyhow!("the compiled program has no EVENTS map"))?;
-    let mut perf: PerfEventArray<MapData> = PerfEventArray::try_from(events)?;
+    if !args.no_payloads {
+        for (program, _) in PROBES {
+            let probe: &mut UProbe = ebpf
+                .program_mut(program)
+                .ok_or_else(|| anyhow!("the compiled program has no {program} function"))?
+                .try_into()?;
+            probe.load().map_err(explain_load_failure)?;
+        }
+    }
 
     let (sender, receiver) = channel();
-    let cpus = online_cpus().map_err(|(path, err)| anyhow!("reading {path}: {err}"))?;
-    for cpu in cpus {
-        let buffer = perf
-            .open(cpu, None)
-            .with_context(|| format!("opening the perf buffer for CPU {cpu}"))?;
-        let sender = sender.clone();
-        std::thread::Builder::new()
-            .name(format!("flowlight-cpu{cpu}"))
-            .spawn(move || read_events(buffer, &sender))
-            .with_context(|| format!("starting the reader for CPU {cpu}"))?;
+    spawn_readers(&mut ebpf, "EVENTS", Kind::Connection, &sender)?;
+    if !args.no_payloads {
+        spawn_readers(&mut ebpf, "TLS_EVENTS", Kind::Payload, &sender)?;
     }
     // Every remaining sender lives in a reader thread. Dropping ours means the channel closes if they all
-    // die, rather than leaving the main loop waiting on a thread that is not coming back.
+    // die, rather than leaving the main loop waiting on threads that are not coming back.
     drop(sender);
 
     eprintln!(
-        "flowlightd {}: watching {CATEGORY}/{TRACEPOINT}. Outbound TCP only; \
-         inbound connections are not attributed. Nothing is stored.",
+        "flowlightd {}: watching {CATEGORY}/{TRACEPOINT}. Outbound TCP only; inbound connections are not \
+         attributed. Nothing is stored.",
         env!("CARGO_PKG_VERSION")
     );
 
-    report(&receiver, &args)
+    run(&mut ebpf, &receiver, &args)
 }
 
-/// Prints what the readers send until the limits the caller set are reached.
-fn report(receiver: &Receiver<Message>, args: &Args) -> anyhow::Result<()> {
+/// Which map a reader thread is draining, and therefore what its records are.
+#[derive(Debug, Clone, Copy)]
+enum Kind {
+    /// `EVENTS`, carrying [`ConnectionEvent`].
+    Connection,
+    /// `TLS_EVENTS`, carrying [`TlsChunk`].
+    Payload,
+}
+
+/// Opens one perf buffer per CPU and starts a thread draining each.
+fn spawn_readers(
+    ebpf: &mut Ebpf,
+    map: &str,
+    kind: Kind,
+    sender: &Sender<Message>,
+) -> anyhow::Result<()> {
+    let events = ebpf
+        .take_map(map)
+        .ok_or_else(|| anyhow!("the compiled program has no {map} map"))?;
+    let mut perf: PerfEventArray<MapData> = PerfEventArray::try_from(events)?;
+    for cpu in online_cpus().map_err(|(path, err)| anyhow!("reading {path}: {err}"))? {
+        let buffer = perf
+            .open(cpu, Some(PERF_PAGES))
+            .with_context(|| format!("opening the {map} buffer for CPU {cpu}"))?;
+        let sender = sender.clone();
+        std::thread::Builder::new()
+            .name(format!("flowlight-{map}-{cpu}"))
+            .spawn(move || read_events(buffer, kind, &sender))
+            .with_context(|| format!("starting the {map} reader for CPU {cpu}"))?;
+    }
+    Ok(())
+}
+
+/// Prints what the readers send, and keeps looking for TLS libraries, until the caller's limits are reached.
+fn run(ebpf: &mut Ebpf, receiver: &Receiver<Message>, args: &Args) -> anyhow::Result<()> {
     let deadline = args
         .seconds
         .map(|seconds| Instant::now() + Duration::from_secs(seconds));
     let mut stdout = std::io::stdout().lock();
+    let mut probed = BTreeSet::new();
+    let mut next_scan = Instant::now();
     let mut seen = 0_u64;
     let mut lost = 0_u64;
 
     loop {
-        let timeout = match deadline {
-            Some(deadline) => match deadline.checked_duration_since(Instant::now()) {
-                Some(remaining) => remaining,
-                None => break,
-            },
-            None => Duration::from_secs(3600),
+        if !args.no_payloads && Instant::now() >= next_scan {
+            attach_new_libraries(ebpf, &mut probed, &args.libssl);
+            next_scan = Instant::now() + RESCAN;
+        }
+
+        let until = match deadline {
+            Some(deadline) if deadline <= Instant::now() => break,
+            Some(deadline) => deadline.min(next_scan),
+            None => next_scan,
         };
+        let timeout = until.saturating_duration_since(Instant::now());
 
         match receiver.recv_timeout(timeout) {
-            Ok(Message::Lost(count)) => lost += count,
-            Ok(Message::Event(event)) => {
-                let exe = std::fs::read_link(format!("/proc/{}/exe", event.tgid)).ok();
-                let record = Record::describe(&event, exe.as_deref().and_then(|p| p.to_str()));
-                if args.json {
-                    serde_json::to_writer(&mut stdout, &record)?;
-                    stdout.write_all(b"\n")?;
-                } else {
-                    writeln!(stdout, "{}", record.human())?;
-                }
-                stdout.flush()?;
-                seen += 1;
-                if args.count.is_some_and(|limit| seen >= limit) {
-                    break;
-                }
+            Ok(Message::Lost(count)) => {
+                lost += count;
+                continue;
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if deadline.is_some() {
-                    break;
-                }
+            Ok(Message::Connection(event)) => {
+                let exe = executable_of(event.tgid);
+                let record = Record::describe(&event, exe.as_deref());
+                render(&mut stdout, args.json, &record, &record.human())?;
             }
+            Ok(Message::Payload(chunk)) => {
+                let exe = executable_of(chunk.tgid);
+                let payload = Payload::describe(&chunk, exe.as_deref());
+                if !args.all && !payload.is_notable() {
+                    continue;
+                }
+                render(&mut stdout, args.json, &payload, &payload.human())?;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 bail!("every reader thread stopped; nothing is watching the kernel any more")
             }
+        }
+
+        seen += 1;
+        if args.count.is_some_and(|limit| seen >= limit) {
+            break;
         }
     }
 
     if lost > 0 {
         eprintln!(
-            "{lost} connection(s) were dropped by the kernel before Flowlight read them. \
-             The machine was opening connections faster than this buffer could be drained."
+            "{lost} record(s) were dropped by the kernel before Flowlight read them. The machine was \
+             producing them faster than these buffers could be drained."
         );
     }
     Ok(())
 }
 
+/// Writes one record, as JSON or as a line.
+fn render<T: serde::Serialize>(
+    out: &mut std::io::StdoutLock<'_>,
+    json: bool,
+    record: &T,
+    human: &str,
+) -> anyhow::Result<()> {
+    if json {
+        serde_json::to_writer(&mut *out, record)?;
+    } else {
+        out.write_all(human.as_bytes())?;
+    }
+    out.write_all(b"\n")?;
+    // Flushed per record: this is a live view, and a line that arrives when the buffer happens to fill is
+    // not a live view of anything.
+    out.flush()?;
+    Ok(())
+}
+
+/// Attaches probes to any TLS library that has appeared since the last look.
+///
+/// Failures are reported once and then forgotten about: a library whose symbols are stripped will never
+/// resolve, and saying so every five seconds would be the only thing on the screen.
+fn attach_new_libraries(ebpf: &mut Ebpf, probed: &mut BTreeSet<PathBuf>, extra: &[PathBuf]) {
+    for (path, library) in libraries::discover(extra) {
+        if !probed.insert(path.clone()) {
+            continue;
+        }
+        match attach_probes(ebpf, &path) {
+            Ok(symbols) => eprintln!(
+                "reading {} through {} ({})",
+                library.as_str(),
+                path.display(),
+                symbols.join(", ")
+            ),
+            Err(err) => eprintln!(
+                "not reading {}: {err:#}. Traffic through this library will be invisible.",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// The probes one OpenSSL needs, and the symbols they go on.
+///
+/// Six rather than three because OpenSSL 1.1.1 added `SSL_write_ex` and `SSL_read_ex` — a `size_t` count and
+/// an out-parameter instead of an `int` and a return value — and modern callers use them. Probing only the
+/// original pair means seeing nothing from a program that took the newer one, and seeing nothing is
+/// indistinguishable from there being nothing to see.
+const PROBES: &[(&str, &str)] = &[
+    ("ssl_write", "SSL_write"),
+    ("ssl_write_ex", "SSL_write_ex"),
+    ("ssl_read", "SSL_read"),
+    ("ssl_read_return", "SSL_read"),
+    ("ssl_read_ex", "SSL_read_ex"),
+    ("ssl_read_ex_return", "SSL_read_ex"),
+];
+
+/// Attaches what this particular library has.
+///
+/// Best effort by design: OpenSSL 1.1.0 has no `_ex` functions, a stripped build may export neither, and a
+/// missing symbol is a fact about that file rather than a reason to stop. What is *not* best effort is the
+/// verdict — a library where nothing attached is reported as unprobed, because a silent failure here looks
+/// exactly like an application that is not making requests.
+fn attach_probes(ebpf: &mut Ebpf, path: &Path) -> anyhow::Result<Vec<&'static str>> {
+    let mut attached = Vec::new();
+    let mut last_error = None;
+    for (program, symbol) in PROBES {
+        let probe: &mut UProbe = ebpf
+            .program_mut(program)
+            .ok_or_else(|| anyhow!("no {program} program"))?
+            .try_into()?;
+        match probe.attach(*symbol, path, UProbeScope::AllProcesses) {
+            Ok(_) => {
+                if !attached.contains(symbol) {
+                    attached.push(*symbol);
+                }
+            }
+            Err(err) => last_error = Some(err),
+        }
+    }
+    if attached.is_empty() {
+        let detail = last_error.map_or_else(
+            || "no probe could be attached".to_owned(),
+            |err| format!("{err}"),
+        );
+        bail!("none of OpenSSL's read or write functions could be found: {detail}");
+    }
+    Ok(attached)
+}
+
+/// `/proc/<pid>/exe`, if the process is still there and we may read it.
+fn executable_of(tgid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{tgid}/exe"))
+        .ok()?
+        .to_str()
+        .map(str::to_owned)
+}
+
 /// Drains one CPU's perf buffer for as long as anyone is listening.
-fn read_events(mut buffer: PerfEventArrayBuffer<MapData>, sender: &Sender<Message>) {
-    let mut scratch = [0_u8; size_of::<ConnectionEvent>()];
+fn read_events(mut buffer: PerfEventArrayBuffer<MapData>, kind: Kind, sender: &Sender<Message>) {
+    // One buffer, sized for the larger record, reused for every sample that arrives split.
+    let mut scratch = vec![0_u8; size_of::<TlsChunk>()];
     loop {
         if !wait_until_readable(&buffer) {
             return;
@@ -206,9 +374,12 @@ fn read_events(mut buffer: PerfEventArrayBuffer<MapData>, sender: &Sender<Messag
             }
             let message = match event {
                 PerfEvent::Lost { count } => Some(Message::Lost(count)),
-                PerfEvent::Sample { head, tail } => {
-                    decode(head, tail, &mut scratch).map(|event| Message::Event(Box::new(event)))
-                }
+                PerfEvent::Sample { head, tail } => match kind {
+                    Kind::Connection => decode::<ConnectionEvent>(head, tail, &mut scratch)
+                        .map(|event| Message::Connection(Box::new(event))),
+                    Kind::Payload => decode::<TlsChunk>(head, tail, &mut scratch)
+                        .map(|chunk| Message::Payload(Box::new(chunk))),
+                },
             };
             if let Some(message) = message
                 && sender.send(message).is_err()
@@ -222,37 +393,32 @@ fn read_events(mut buffer: PerfEventArrayBuffer<MapData>, sender: &Sender<Messag
     }
 }
 
-/// Reassembles one event out of the ring buffer's bytes.
+/// Reassembles one record out of the ring buffer's bytes.
 ///
-/// A sample that reaches the end of the ring is handed over in two pieces, and the second piece is where the
-/// sixty-four bytes of an event can end up split down the middle. It happens once per ring's worth of
-/// traffic, which is rarely enough that a version of this that only handled the contiguous case would look
-/// correct for a long time.
-fn decode(
-    head: &[u8],
-    tail: &[u8],
-    scratch: &mut [u8; size_of::<ConnectionEvent>()],
-) -> Option<ConnectionEvent> {
-    let size = size_of::<ConnectionEvent>();
+/// A sample that reaches the end of the ring is handed over in two pieces, and the second piece is where a
+/// record can end up split down the middle. It happens once per ring's worth of traffic, which is rarely
+/// enough that a version of this that only handled the contiguous case would look correct for a long time.
+fn decode<T: Copy>(head: &[u8], tail: &[u8], scratch: &mut [u8]) -> Option<T> {
+    let size = size_of::<T>();
     let bytes = if head.len() >= size {
         head
     } else {
-        // The split case. Anything shorter than an event even after rejoining is not one, and is dropped
+        // The split case. Anything shorter than a record even after rejoining is not one, and is dropped
         // rather than read past — this process runs as root.
-        let (front, back) = scratch.split_at_mut_checked(head.len())?;
+        let (front, back) = scratch.get_mut(..size)?.split_at_mut_checked(head.len())?;
         front.copy_from_slice(head);
         back.copy_from_slice(tail.get(..size - head.len())?);
-        scratch.as_slice()
+        scratch.get(..size)?
     };
-    // SAFETY: the eBPF program wrote exactly one `ConnectionEvent`, and `bytes` is at least that long.
-    // `read_unaligned` because the ring buffer makes no alignment promise about where a record starts.
-    Some(unsafe { bytes.as_ptr().cast::<ConnectionEvent>().read_unaligned() })
+    // SAFETY: the eBPF program wrote exactly one `T`, and `bytes` is at least that long. `read_unaligned`
+    // because the ring buffer makes no alignment promise about where a record starts.
+    Some(unsafe { bytes.as_ptr().cast::<T>().read_unaligned() })
 }
 
 /// Blocks until the buffer has something in it. Returns false if it will never have anything again.
 ///
-/// Without this the reader spins: `read_events` returns immediately with nothing, forever, and a tool for
-/// watching an idle machine burns a core doing it.
+/// Without this the reader spins: draining returns immediately with nothing, forever, and a tool for watching
+/// an idle machine burns a core doing it.
 fn wait_until_readable(buffer: &PerfEventArrayBuffer<MapData>) -> bool {
     let mut poll = libc::pollfd {
         fd: buffer.as_fd().as_raw_fd(),
@@ -287,9 +453,10 @@ fn raise_memlock_limit() {
 /// Turns the kernel's refusal into the sentence that explains it.
 ///
 /// `EPERM` from a BPF syscall means one of three quite different things and the raw error names none of them.
-fn explain_load_failure<E: std::error::Error + Send + Sync + 'static>(err: E) -> anyhow::Error {
+fn explain_load_failure<E: std::fmt::Display>(err: E) -> anyhow::Error {
     let text = err.to_string();
     let hint = if text.contains("Operation not permitted") || text.contains("os error 1") {
+        // SAFETY: `geteuid` reads this process's own credentials and cannot fail.
         if unsafe { libc::geteuid() } != 0 {
             "Flowlight needs root to load an eBPF program. Try again with sudo."
         } else {
@@ -300,7 +467,7 @@ fn explain_load_failure<E: std::error::Error + Send + Sync + 'static>(err: E) ->
     } else {
         "The kernel refused the program. `dmesg` usually carries the verifier's reason."
     };
-    anyhow!(err).context(hint)
+    anyhow!(text).context(hint)
 }
 
 #[cfg(test)]
@@ -334,8 +501,11 @@ mod tests {
     #[test]
     fn a_contiguous_sample_is_read_directly() {
         let event = sample();
-        let mut scratch = [0; size_of::<ConnectionEvent>()];
-        assert_eq!(decode(bytes_of(&event), &[], &mut scratch), Some(event));
+        let mut scratch = vec![0; size_of::<TlsChunk>()];
+        assert_eq!(
+            decode::<ConnectionEvent>(bytes_of(&event), &[], &mut scratch),
+            Some(event)
+        );
     }
 
     /// The case that happens once per ring's worth of traffic and would otherwise be found in production.
@@ -345,30 +515,44 @@ mod tests {
         let raw = bytes_of(&event);
         for split in [1, 17, 30, 63] {
             let (head, tail) = raw.split_at(split);
-            let mut scratch = [0; size_of::<ConnectionEvent>()];
+            let mut scratch = vec![0; size_of::<TlsChunk>()];
             assert_eq!(
-                decode(head, tail, &mut scratch),
+                decode::<ConnectionEvent>(head, tail, &mut scratch),
                 Some(event),
                 "split at {split}"
             );
         }
     }
 
-    /// The kernel may pad a sample. Extra bytes after the event are not part of it and change nothing.
+    /// The kernel may pad a sample. Extra bytes after the record are not part of it and change nothing.
     #[test]
     fn trailing_padding_is_ignored() {
         let event = sample();
         let mut padded = bytes_of(&event).to_vec();
         padded.extend_from_slice(&[0; 8]);
-        let mut scratch = [0; size_of::<ConnectionEvent>()];
-        assert_eq!(decode(&padded, &[], &mut scratch), Some(event));
+        let mut scratch = vec![0; size_of::<TlsChunk>()];
+        assert_eq!(
+            decode::<ConnectionEvent>(&padded, &[], &mut scratch),
+            Some(event)
+        );
     }
 
     #[test]
-    fn a_sample_too_short_to_be_an_event_is_dropped() {
+    fn a_sample_too_short_to_be_a_record_is_dropped() {
         let event = sample();
         let short = bytes_of(&event).get(..20).unwrap();
-        let mut scratch = [0; size_of::<ConnectionEvent>()];
-        assert_eq!(decode(short, &[], &mut scratch), None);
+        let mut scratch = vec![0; size_of::<TlsChunk>()];
+        assert_eq!(decode::<ConnectionEvent>(short, &[], &mut scratch), None);
+    }
+
+    /// The scratch buffer is sized for the largest record. A caller that sized it for a smaller one should
+    /// get nothing rather than a record built out of whatever fitted.
+    #[test]
+    fn a_scratch_buffer_too_small_for_the_record_produces_nothing() {
+        let event = sample();
+        let raw = bytes_of(&event);
+        let (head, tail) = raw.split_at(10);
+        let mut scratch = vec![0; 8];
+        assert_eq!(decode::<ConnectionEvent>(head, tail, &mut scratch), None);
     }
 }

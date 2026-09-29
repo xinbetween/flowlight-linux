@@ -22,12 +22,13 @@ release where nobody can tell which one broke something.
 | --- | --- | --- | --- |
 | **0.1.0** | **Identity** | What to call a process and what to key a rule on. Versioned installs, Nix store hashes, the kernel's fifteen-character `comm` limit, and an honest confidence level attached to every name. Pure logic, no kernel. | [released](https://github.com/xinbetween/flowlight-linux/releases/tag/v0.1.0) |
 | **0.1.1** | **Process and connection attribution** | Which process opened which connection, from eBPF on the socket path. The thing `nettop` does badly on macOS and the kernel does properly here. | [released](https://github.com/xinbetween/flowlight-linux/releases/tag/v0.1.1) |
-| **0.1.2** | **TLS plaintext capture** | uprobes on `SSL_write`/`SSL_read` for OpenSSL. Requests and responses in the clear, with no certificate installed anywhere. | |
-| **0.1.3** | **The other TLS libraries** | GnuTLS, NSS and BoringSSL, so Firefox and Chrome are covered. Go's static TLS, which needs symbol resolution per binary and will be the hardest. | |
-| **0.1.4** | **Storage and retention** | SQLite, the rollup tiers, and a retention policy that is stated rather than assumed. | |
-| **0.1.5** | **Coverage** | What was not seen, and why: a TLS library with no probe, a container in another namespace, a process that exited before attribution landed. The screen that makes the rest trustworthy. | |
-| **0.1.6** | **The local interface** | A web UI on loopback. Live, agents, and what each one reached. | |
-| **0.1.7** | **Agent attribution** | Which agent a process works for, MCP servers from their configuration files, tool calls read out of the payloads already being captured. | |
+| **0.1.2** | **TLS plaintext capture** | uprobes on `SSL_write`/`SSL_read` for OpenSSL. Requests and responses in the clear, with no certificate installed anywhere. | [released](https://github.com/xinbetween/flowlight-linux/releases/tag/v0.1.2) |
+| **0.1.3** | **HTTP/2 and HPACK** | Every current agent API speaks HTTP/2, whose headers are compressed against a table built across the whole connection. Without this, the method and path of a request to `api.anthropic.com` are not readable — which makes it the difference between a demonstration and a tool. Inserted here after 0.1.2 proved the capture works and showed exactly what it cannot say. | |
+| **0.1.4** | **The other TLS libraries** | GnuTLS, NSS and BoringSSL, so Firefox and Chrome are covered. Go's static TLS, which needs symbol resolution per binary and will be the hardest. | |
+| **0.1.5** | **Storage and retention** | SQLite, the rollup tiers, and a retention policy that is stated rather than assumed. | |
+| **0.1.6** | **Coverage** | What was not seen, and why: a TLS library with no probe, a container in another namespace, a process that exited before attribution landed. The screen that makes the rest trustworthy. | |
+| **0.1.7** | **The local interface** | A web UI on loopback. Live, agents, and what each one reached. | |
+| **0.1.8** | **Agent attribution** | Which agent a process works for, MCP servers from their configuration files, tool calls read out of the payloads already being captured. | |
 
 ## 0.2.x — parity with the macOS build
 
