@@ -9,7 +9,8 @@ terminating it, installing a certificate, or defeating anything.**
 curl                     pid 18422    → 93.184.216.34:443
 curl                     pid 18422    → GET example.com/
 curl                     pid 18422    ← 200  1256 bytes
-node                     pid 18004    → HTTP/2 — headers are HPACK-compressed and not decoded yet
+claude                   pid 17903    → POST api.anthropic.com/v1/messages
+claude                   pid 17903    ← 200  8214 bytes
 ```
 
 [docs/DESIGN.md](docs/DESIGN.md) is the design note behind it: what was researched, what was measured, and
@@ -66,12 +67,13 @@ sudo ./target/release/flowlightd
 ```
 
 ```text
-flowlightd 0.1.2: watching sock/inet_sock_set_state. Outbound TCP only; inbound connections are not
+flowlightd 0.1.3: watching sock/inet_sock_set_state. Outbound TCP only; inbound connections are not
 attributed. Nothing is stored.
 reading openssl through /usr/lib/x86_64-linux-gnu/libssl.so.3 (SSL_write, SSL_write_ex, SSL_read, SSL_read_ex)
 curl                     pid 18422    → 93.184.216.34:443
 curl                     pid 18422    → GET example.com/
 curl                     pid 18422    ← 200  1256 bytes
+claude                   pid 17903    → POST api.anthropic.com/v1/messages
 ```
 
 The name column is what the process is called. When a fourth column appears on a connection line — `[comm]`
@@ -107,6 +109,17 @@ what processes have actually loaded, wherever that is, and it scans the usual li
 program started in a minute is already covered. Both are repeated every five seconds, because an agent
 started after the daemon is the normal case.
 
+### How HTTP/2 is read
+
+Every current agent API speaks HTTP/2, and an HTTP/2 request line is not text in the stream. It is HPACK:
+indices into a compression table both ends build as they go, across the whole connection, in order. Reading
+it means following the frames and rebuilding that table.
+
+Which in turn means the per-connection identity matters more than it looks. One process with two connections
+open interleaves their buffers, and two connections through one decoder do not produce slightly worse output
+— they produce confident nonsense. So every captured buffer carries the `SSL *` it was written on, and each
+connection and direction gets its own decoder.
+
 ### Credentials do not come back out
 
 A tool that watches traffic in order to make it safer cannot become a new way for credentials to escape. The
@@ -127,10 +140,20 @@ claude    pid 17903    → PUT productionresultssa17.blob.core.windows.net/…/l
 
 Stated here rather than discovered later:
 
-- **HTTP/2 headers.** Every current agent API speaks HTTP/2, whose headers are HPACK — compressed against a
-  table built across the whole connection, not readable from one buffer. Flowlight recognises the connection
-  and says so rather than showing an empty line, but the method and path of a request to `api.anthropic.com`
-  are not in what it can read today. This is the next release.
+- **A connection that was already open.** HTTP/2 compresses headers against a table both ends build as they
+  go, from the first request onwards. Flowlight cannot rebuild a table it did not watch being built, so a
+  connection that predates the daemon says so rather than showing a request line invented from the wrong
+  table:
+
+  ```text
+  node    pid 18004    → HTTP/2 — this connection's header compression could not be followed…
+  ```
+
+- **The body of a request larger than four kilobytes.** Only the first four kilobytes of any one call are
+  captured. Frames are length-prefixed, so the gap is stepped over exactly and the headers around it are
+  still read — a 60KB prompt costs the prompt and nothing else. A gap that lands inside a *header* block is
+  different: it leaves the compression table behind the sender's, and the connection is reported unreadable
+  from that point rather than decoded into something plausible and wrong.
 - **TLS libraries other than OpenSSL.** GnuTLS, NSS (Firefox, Chrome) and Go's own implementation each need
   their own probe.
 - **Inbound connections.** Attribution is taken at `connect()`, in the calling process's own context. An

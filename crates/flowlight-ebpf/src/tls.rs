@@ -58,6 +58,8 @@ static PENDING_READS: HashMap<u64, PendingRead> = HashMap::with_max_entries(1024
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PendingRead {
+    /// The `SSL *` the read was made on, kept so that the chunk sent on the way out can name its connection.
+    ssl: u64,
     /// The application's buffer.
     buffer: u64,
     /// `SSL_read_ex`'s `size_t *readbytes`, or zero for `SSL_read`, which returns the count instead.
@@ -85,8 +87,9 @@ pub fn ssl_write_ex(ctx: ProbeContext) -> u32 {
 }
 
 fn on_write(ctx: &ProbeContext, length: Option<i64>) -> Result<(), i32> {
+    let ssl: u64 = ctx.arg(0).ok_or(0_i32)?;
     let buffer: *const u8 = ctx.arg(1).ok_or(0_i32)?;
-    capture(ctx, buffer, length.ok_or(0_i32)?, DIRECTION_OUT)
+    capture(ctx, ssl, buffer, length.ok_or(0_i32)?, DIRECTION_OUT)
 }
 
 /// `SSL_read(SSL *ssl, void *buf, int num)` — remember where the answer will go.
@@ -105,8 +108,12 @@ pub fn ssl_read_ex(ctx: ProbeContext) -> u32 {
 }
 
 fn remember(ctx: &ProbeContext, written: u64) {
-    if let Some(buffer) = ctx.arg::<u64>(1) {
-        let pending = PendingRead { buffer, written };
+    if let (Some(ssl), Some(buffer)) = (ctx.arg::<u64>(0), ctx.arg::<u64>(1)) {
+        let pending = PendingRead {
+            ssl,
+            buffer,
+            written,
+        };
         // Failure here means the map is full, so this one read goes unseen. There is nothing better to do
         // about it from in here, and 0.1.5 is where not-seeing becomes something to report.
         let _ = PENDING_READS.insert(&bpf_get_current_pid_tgid(), &pending, 0);
@@ -148,12 +155,19 @@ where
     // guessed at.
     let pending = pending.ok_or(0_i32)?;
     let length = length(&pending).ok_or(0_i32)?;
-    capture(ctx, pending.buffer as *const u8, length, DIRECTION_IN)
+    capture(
+        ctx,
+        pending.ssl,
+        pending.buffer as *const u8,
+        length,
+        DIRECTION_IN,
+    )
 }
 
 /// Copies a buffer out of the application and sends it up.
 fn capture<C: EbpfContext>(
     ctx: &C,
+    ssl: u64,
     buffer: *const u8,
     length: i64,
     direction: u8,
@@ -170,6 +184,7 @@ fn capture<C: EbpfContext>(
     let chunk = unsafe { &mut *chunk };
 
     let thread = bpf_get_current_pid_tgid();
+    chunk.ssl = ssl;
     chunk.tgid = (thread >> 32) as u32;
     chunk.pid = thread as u32;
     chunk.comm = bpf_get_current_comm()?;

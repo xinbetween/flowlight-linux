@@ -71,10 +71,15 @@ check "curl's request was read in the clear, with its Host header" \
 check "the response status was read in the clear" \
     '.process == "curl" and .direction == "in" and .status != null'
 
-# And the honest limit, asserted rather than described: HTTP/2 is recognised and reported as unreadable
-# rather than silently producing nothing.
-check "the HTTP/2 connection was recognised as HTTP/2" \
-    '.process == "curl" and .protocol == "http/2"'
+# The one that decides whether this is a demonstration or a tool. Every current agent API speaks HTTP/2,
+# whose request line is not text in the stream -- it is HPACK, indices into a table built across the whole
+# connection. Getting a method and an authority out of it means the frames were followed and the compression
+# table was rebuilt correctly from the first block onwards.
+check "the HTTP/2 request was decoded out of HPACK" \
+    ".process == \"curl\" and .protocol == \"http/2\" and .method == \"GET\" and .host == \"$target_host\""
+
+check "the HTTP/2 response status was decoded out of HPACK" \
+    '.process == "curl" and .protocol == "http/2" and .direction == "in" and .status != null'
 
 # Redaction. A signed URL is entirely a credential. The first CI run that read plaintext successfully also
 # printed a live Azure shared-access signature belonging to the runner, which is how this came to exist.
