@@ -506,27 +506,12 @@ fn run(
                 );
             }
             // After the marking, not before it. Printed first, this described the state of a moment that
-            // had already passed, which cost a round trip to notice.
+            // had already passed.
             let propagation = enforcing.propagation();
             if propagation != last_propagation {
                 eprintln!(
-                    "forks {}, layout ready {}, marks copied {}, last parent {}, last marked parent {}, \
-                     marks held {}, last marking error {}, last child marked {}, last marked exit {}, connects {}, connects marked {}, last connect {}, last marked connect {} as agent {}, last scoped hit {}",
-                    propagation.forks,
-                    propagation.layout_ready,
-                    propagation.copied,
-                    propagation.last_parent,
-                    propagation.last_parent_found,
-                    propagation.held,
-                    propagation.last_error,
-                    propagation.last_child,
-                    propagation.last_exit,
-                    propagation.connects,
-                    propagation.connects_marked,
-                    propagation.last_connect,
-                    propagation.last_marked_connect,
-                    propagation.last_marked_agent,
-                    propagation.last_scoped_hit
+                    "the kernel has seen {} fork(s) and carried an agent's mark to {} child process(es)",
+                    propagation.forks, propagation.copied
                 );
                 last_propagation = propagation;
             }
@@ -555,9 +540,6 @@ fn run(
                                  handshake: the name is resolved and thrown away before connect() is \
                                  called. It is still reported when it is reached."
                             );
-                        }
-                        for key in enforcing.written() {
-                            eprintln!("  table: {key}");
                         }
                         for id in &report.unreadable {
                             eprintln!(

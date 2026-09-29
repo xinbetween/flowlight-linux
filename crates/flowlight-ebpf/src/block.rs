@@ -25,7 +25,7 @@
 //! So: no references to the context, no branch between the reads, and `read_volatile` to stop the optimiser
 //! rearranging them into something the verifier will not take.
 
-use crate::tasks::{FORK_COUNTS, PID_AGENT};
+use crate::tasks::PID_AGENT;
 use aya_ebpf::{
     helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid},
     macros::{cgroup_sock_addr, map},
@@ -55,34 +55,6 @@ static VERDICTS: HashMap<BlockKey, u8> = HashMap::with_max_entries(65536, 0);
 /// happens to is usually the person who wrote the rule.
 #[map]
 static BLOCK_EVENTS: PerfEventArray<BlockEvent> = PerfEventArray::new(0);
-
-/// Index of the count of connects seen by the hook.
-pub const CONNECTS_SEEN: u32 = 8;
-/// Index of the count of connects whose caller turned out to be marked.
-pub const CONNECTS_MARKED: u32 = 9;
-/// Index of the last thread group the hook looked up.
-pub const LAST_CONNECT_TGID: u32 = 10;
-/// Index of the last thread group whose caller was marked.
-pub const LAST_MARKED_CONNECT: u32 = 11;
-/// Index of the agent identifier that caller was marked with.
-pub const LAST_MARKED_AGENT: u32 = 12;
-/// Index of the last thread group whose agent-scoped key was found.
-pub const LAST_SCOPED_HIT: u32 = 13;
-
-/// Records what the hook saw, in the same array the fork tracepoint uses.
-fn note(index: u32, value: u64, add: bool) {
-    if let Some(slot) = FORK_COUNTS.get_ptr_mut(index) {
-        // SAFETY: a plain array value these programs alone write. Not atomic, and does not need to be:
-        // these are diagnostics, and losing one to a race changes nothing they are for.
-        unsafe {
-            if add {
-                *slot += value;
-            } else {
-                *slot = value;
-            }
-        }
-    }
-}
 
 /// IPv4.
 #[cgroup_sock_addr(connect4)]
@@ -151,13 +123,6 @@ fn decide(ctx: &SockAddrContext, family: u16, address: [u8; 16], port: u16) -> i
     // SAFETY: a `u32` written by userspace or by the fork tracepoint; the reference does not outlive it.
     let agent = unsafe { PID_AGENT.get(&tgid) }.copied().unwrap_or(EVERYONE);
     let scoped = agent != EVERYONE;
-    note(CONNECTS_SEEN, 1, true);
-    note(LAST_CONNECT_TGID, u64::from(tgid), false);
-    if scoped {
-        note(CONNECTS_MARKED, 1, true);
-        note(LAST_MARKED_CONNECT, u64::from(tgid), false);
-        note(LAST_MARKED_AGENT, u64::from(agent), false);
-    }
 
     let mut matched = EVERYONE;
     let mut verdict = None;
@@ -168,7 +133,6 @@ fn decide(ctx: &SockAddrContext, family: u16, address: [u8; 16], port: u16) -> i
         verdict = look(&BlockKey::new(agent, family, address, port));
         if verdict.is_some() {
             matched = agent;
-            note(LAST_SCOPED_HIT, u64::from(tgid), false);
         }
     }
     if verdict.is_none() {

@@ -334,6 +334,7 @@ dependencies = [
  "clap",
  "flowlight-agents",
  "flowlight-common",
+ "flowlight-rules",
  "flowlight-store",
  "libc",
  "loona-hpack",
