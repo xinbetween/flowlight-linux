@@ -163,10 +163,17 @@ impl Blocking {
         self.marks.keys().filter(std::result::Result::is_ok).count()
     }
 
-    /// Marks every agent currently running, and forgets the ones that are not.
+    /// Marks every agent currently running.
     ///
     /// Called on a timer. An agent is a long-lived process, so noticing it a second after it starts is
     /// fine; its children are another matter entirely, and they are marked in the kernel at fork.
+    ///
+    /// Marks are never taken *out* of the kernel here. An earlier version did, for any process a scan did
+    /// not find — and a scan can fail to find a running process for a dozen uninteresting reasons, because
+    /// `/proc` is a directory being read while the machine changes underneath it. One unlucky scan removed
+    /// a live agent's mark, and the next thing it forked was unmarked and reached what a rule said it
+    /// should not. The kernel's own exit tracepoint removes a mark when the process it belongs to ends,
+    /// which is the only event that actually means what removing a mark means.
     pub fn mark_all(&mut self, running: &[(u32, String)]) -> Vec<(u32, String)> {
         let present: BTreeSet<u32> = running.iter().map(|(pid, _)| *pid).collect();
         let mut newly = Vec::new();
@@ -175,26 +182,10 @@ impl Blocking {
                 newly.push((*pid, agent.clone()));
             }
         }
-        let gone: Vec<u32> = self
-            .marked
-            .keys()
-            .filter(|pid| !present.contains(pid))
-            .copied()
-            .collect();
-        for pid in gone {
-            self.unmark(pid);
-        }
+        // Local bookkeeping only: this set exists so the same mark is not written every second, so an entry
+        // for a process that has gone is a reason to write again if its identifier comes back.
+        self.marked.retain(|pid, _| present.contains(pid));
         newly
-    }
-
-    /// Forgets a process that has gone.
-    ///
-    /// The kernel forgets it too, on its own exit tracepoint. This is only so that a restarted process with
-    /// a reused identifier is marked again rather than assumed to be marked already.
-    pub fn unmark(&mut self, pid: u32) {
-        if self.marked.remove(&pid).is_some() {
-            let _ = self.marks.remove(&pid);
-        }
     }
 
     /// Makes the kernel's table say what the rules say.
