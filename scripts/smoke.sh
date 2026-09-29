@@ -36,8 +36,22 @@ secret="aVeryLongOpaqueTokenValue1234567890ABCdef"
 echo "Connecting once more, with a credential in the query string..."
 curl -sS --http1.1 --max-time 10 "https://$target_host/?token=$secret" -o /dev/null
 
+# GnuTLS, through a different pair of functions. `gnutls-cli` rather than wget, because whether wget is built
+# against GnuTLS varies by distribution and an assertion that quietly tests OpenSSL twice is worse than no
+# assertion.
+gnutls_tested=no
+if command -v gnutls-cli >/dev/null; then
+    gnutls_tested=yes
+    echo "Connecting with gnutls-cli, which uses GnuTLS by definition..."
+    printf 'GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$target_host" \
+        | timeout 15 gnutls-cli --no-ca-verification "$target_host:443" >/dev/null 2>&1 || true
+fi
+
 wait "$watcher"
 
+echo "--- what this machine's TLS libraries are:"
+ldd "$(command -v curl)" 2>/dev/null | grep -E "ssl|gnutls|nspr" || true
+ldd "$(command -v gnutls-cli)" 2>/dev/null | grep -E "ssl|gnutls|nspr" || true
 echo "--- what the daemon said about itself:"
 cat "$log"
 echo "--- what the kernel reported:"
@@ -83,6 +97,13 @@ check "the HTTP/2 response status was decoded out of HPACK" \
 
 # Redaction. A signed URL is entirely a credential. The first CI run that read plaintext successfully also
 # printed a live Azure shared-access signature belonging to the runner, which is how this came to exist.
+if [ "$gnutls_tested" = yes ]; then
+    check "gnutls-cli's request was read through GnuTLS" \
+        ".process == \"gnutls-cli\" and .method == \"GET\" and .host == \"$target_host\""
+else
+    echo "SKIP: gnutls-cli is not installed, so GnuTLS was not exercised"
+fi
+
 check "the credential in the query string was redacted" \
     '.process == "curl" and ((.target // "") | contains("token=…"))'
 

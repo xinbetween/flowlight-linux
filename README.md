@@ -99,10 +99,23 @@ and a policy that forbids loading programs are three different problems and it w
 
 ### How the payloads are read
 
-Not by a proxy. A uprobe on `SSL_write` sees the buffer an application hands to OpenSSL, before it is
-encrypted; a uretprobe on `SSL_read` sees the buffer OpenSSL has just filled. There is no certificate to
-install, no trust store to modify, and nothing for certificate pinning to object to — the plaintext is read
-where the application already has it.
+Not by a proxy. A uprobe on the TLS library's write function sees the buffer an application hands it, before
+it is encrypted; a uretprobe on the read function sees the buffer it has just filled. There is no certificate
+to install, no trust store to modify, and nothing for certificate pinning to object to — the plaintext is
+read where the application already has it.
+
+Three libraries, which between them cover nearly everything on a Linux machine:
+
+| | Covers | Read at |
+| --- | --- | --- |
+| **OpenSSL** | curl, Python, Node, Ruby, PHP, most of everything | `SSL_write`, `SSL_write_ex`, `SSL_read`, `SSL_read_ex` |
+| **GnuTLS** | wget, much of GNOME | `gnutls_record_send`, `gnutls_record_recv` |
+| **NSS** | Firefox, Thunderbird | `PR_Write`, `PR_Send`, `PR_Read`, `PR_Recv` |
+
+NSS is read one layer below where its TLS is, in the portable runtime underneath, because that is where the
+plaintext crosses a function boundary. The consequence is that Firefox's *non*-TLS socket traffic is read
+too — plain HTTP, mostly. More than was asked for rather than less, and said here rather than left to be
+discovered.
 
 Flowlight finds the TLS libraries two ways, because neither is enough alone: it reads `/proc/*/maps` to see
 what processes have actually loaded, wherever that is, and it scans the usual library directories so that a
@@ -154,8 +167,9 @@ Stated here rather than discovered later:
   still read — a 60KB prompt costs the prompt and nothing else. A gap that lands inside a *header* block is
   different: it leaves the compression table behind the sender's, and the connection is reported unreadable
   from that point rather than decoded into something plausible and wrong.
-- **TLS libraries other than OpenSSL.** GnuTLS, NSS (Firefox, Chrome) and Go's own implementation each need
-  their own probe.
+- **Go programs, and Chrome.** Go's TLS is written in Go and linked into the binary, and Chrome's BoringSSL
+  is linked into Chrome. Both need symbols resolved per binary rather than per library, and Go additionally
+  uses a calling convention that is not the C one. Each is its own piece of work.
 - **Inbound connections.** Attribution is taken at `connect()`, in the calling process's own context. An
   inbound connection is established in a softirq, where the running task is whoever was unlucky — so naming
   it would mean naming the wrong process.

@@ -44,10 +44,15 @@ pub fn executable_mapping(line: &str) -> Option<&str> {
 }
 
 /// The TLS implementations there are probes for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TlsLibrary {
-    /// OpenSSL, and its API-compatible forks that keep the `libssl` name.
+    /// OpenSSL, and its API-compatible forks that keep the `libssl` name. curl, Python, Node, most of
+    /// everything.
     OpenSsl,
+    /// GnuTLS. wget on most distributions, and a good deal of GNOME.
+    GnuTls,
+    /// NSS, probed at its NSPR layer. Firefox and Thunderbird.
+    Nss,
 }
 
 impl TlsLibrary {
@@ -55,6 +60,8 @@ impl TlsLibrary {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::OpenSsl => "openssl",
+            Self::GnuTls => "gnutls",
+            Self::Nss => "nss",
         }
     }
 }
@@ -66,9 +73,18 @@ impl TlsLibrary {
 /// outcome and a better one than reading every mapped file on the machine to find out.
 pub fn tls_library(path: &str) -> Option<TlsLibrary> {
     let name = path.rsplit('/').next()?;
-    // `libssl.so.3`, `libssl.so.1.1`, and the bare `libssl.so` a development package installs.
+    // In each case: the versioned name, and the bare `.so` a development package installs.
     if name.starts_with("libssl.so") {
         return Some(TlsLibrary::OpenSsl);
+    }
+    if name.starts_with("libgnutls.so") {
+        return Some(TlsLibrary::GnuTls);
+    }
+    // NSS's own library is `libnss3`, but the plaintext passes through the portable runtime underneath it.
+    // `libnss_files.so` is the name-service switch and has nothing to do with any of this, which is why
+    // this matches `libnspr4` rather than anything beginning `libnss`.
+    if name.starts_with("libnspr4.so") {
+        return Some(TlsLibrary::Nss);
     }
     None
 }
@@ -128,12 +144,27 @@ mod tests {
     }
 
     #[test]
+    fn the_other_libraries_are_recognised_too() {
+        assert_eq!(
+            tls_library("/usr/lib/x86_64-linux-gnu/libgnutls.so.30"),
+            Some(TlsLibrary::GnuTls)
+        );
+        assert_eq!(
+            tls_library("/usr/lib/firefox/libnspr4.so"),
+            Some(TlsLibrary::Nss)
+        );
+    }
+
+    #[test]
     fn things_that_are_not_tls_libraries_are_not_claimed() {
         for path in [
             "/usr/bin/curl",
             "/usr/lib/x86_64-linux-gnu/libcrypto.so.3",
             "/usr/lib/x86_64-linux-gnu/libc.so.6",
             "/usr/lib/libsslsomethingelse",
+            // The name-service switch, which shares four letters with NSS and nothing else.
+            "/usr/lib/x86_64-linux-gnu/libnss_files.so.2",
+            "/usr/lib/x86_64-linux-gnu/libnss_systemd.so.2",
         ] {
             assert_eq!(tls_library(path), None, "{path}");
         }
