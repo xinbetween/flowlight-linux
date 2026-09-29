@@ -297,14 +297,14 @@ checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
 name = "flowlight-common"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "aya",
 ]
 
 [[package]]
 name = "flowlight-daemon"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "aya",
@@ -320,7 +320,7 @@ dependencies = [
 
 [[package]]
 name = "flowlight-ebpf"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "aya-ebpf",
  "flowlight-common",
@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "flowlight-store"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "rusqlite",

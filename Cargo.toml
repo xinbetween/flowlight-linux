@@ -14,7 +14,7 @@ members = [
 default-members = ["crates/flowlight-common", "crates/flowlight-store"]
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/xinbetween/flowlight-linux"

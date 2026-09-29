@@ -91,6 +91,60 @@ pub struct RequestRow {
     pub unreadable: Option<String>,
 }
 
+/// A process that opened HTTPS connections and had none of its traffic read.
+///
+/// The single most useful thing Coverage says, because it is the failure that otherwise looks exactly like
+/// success: an empty screen means "this agent made no requests" and "this agent made four hundred requests
+/// Flowlight could not read" equally well, and only one of those is worth knowing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unread {
+    /// The process.
+    pub process: String,
+    /// How many connections it opened that nothing was read from.
+    pub connections: i64,
+}
+
+/// Something worth remembering that is not a request: a library that could not be probed, records the
+/// kernel dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Note {
+    /// When.
+    pub at: i64,
+    /// What sort of thing: `unprobed-library`, `dropped`.
+    pub kind: String,
+    /// What it was about — a path, usually.
+    pub subject: String,
+    /// The explanation, as a sentence.
+    pub detail: String,
+}
+
+/// What was seen, and what was not.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Coverage {
+    /// How far back this covers.
+    pub window: i64,
+    /// Requests read.
+    pub requests: i64,
+    /// Distinct processes something was read from.
+    pub processes_read: i64,
+    /// Connections opened.
+    pub connections: i64,
+    /// Processes that opened HTTPS connections and had nothing read.
+    pub unread: Vec<Unread>,
+    /// Calls that carried more than was captured.
+    pub truncated: i64,
+    /// Connections whose HTTP/2 could not be decoded.
+    pub undecodable: i64,
+    /// Records naming a process by its `comm`, which the kernel cuts at fifteen characters.
+    pub named_by_comm: i64,
+    /// Records naming a process by its pid, which is not a name.
+    pub named_by_pid: i64,
+    /// Records the kernel had nowhere to put.
+    pub dropped: i64,
+    /// Libraries found and not probed.
+    pub unprobed: Vec<Note>,
+}
+
 /// One day's traffic between one process and one host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DailyRow {
@@ -244,6 +298,15 @@ impl Store {
                 bytes    INTEGER NOT NULL,
                 PRIMARY KEY (day, process, host)
             );
+            CREATE TABLE IF NOT EXISTS notes (
+                id      INTEGER PRIMARY KEY,
+                at      INTEGER NOT NULL,
+                kind    TEXT    NOT NULL,
+                subject TEXT    NOT NULL,
+                detail  TEXT    NOT NULL,
+                UNIQUE (kind, subject)
+            );
+            CREATE INDEX IF NOT EXISTS notes_at ON notes(at);
             CREATE TABLE IF NOT EXISTS daily_connections (
                 day         TEXT    NOT NULL,
                 process     TEXT    NOT NULL,
@@ -433,6 +496,124 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Records something that is not a request.
+    ///
+    /// Written immediately rather than batched, and deduplicated on `(kind, subject)`: a library that cannot
+    /// be probed cannot be probed every five seconds for the rest of the week, and a row per rescan would
+    /// bury the one fact in ten thousand copies of it.
+    pub fn record_note(&mut self, kind: &str, subject: &str, detail: &str) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO notes(at, kind, subject, detail) VALUES (unixepoch(), ?1, ?2, ?3)
+             ON CONFLICT(kind, subject) DO UPDATE SET at = excluded.at, detail = excluded.detail",
+            params![kind, subject, detail],
+        )?;
+        Ok(())
+    }
+
+    /// Counts a record the kernel dropped before it could be read.
+    pub fn record_drop(&mut self, count: u64) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO notes(at, kind, subject, detail)
+             VALUES (unixepoch(), 'dropped', 'kernel', ?1)
+             ON CONFLICT(kind, subject) DO UPDATE
+               SET at = excluded.at,
+                   detail = CAST(CAST(detail AS INTEGER) + CAST(excluded.detail AS INTEGER) AS TEXT)",
+            params![count.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// What was seen in a window, and what was not.
+    pub fn coverage(&mut self, since: i64) -> Result<Coverage> {
+        self.flush()?;
+        let mut coverage = Coverage {
+            window: since,
+            ..Coverage::default()
+        };
+
+        coverage.requests = self.connection.query_row(
+            "SELECT count(*) FROM requests WHERE at >= ?1",
+            params![since],
+            |row| row.get(0),
+        )?;
+        coverage.processes_read = self.connection.query_row(
+            "SELECT count(DISTINCT process) FROM requests WHERE at >= ?1",
+            params![since],
+            |row| row.get(0),
+        )?;
+        coverage.connections = self.connection.query_row(
+            "SELECT count(*) FROM connections WHERE at >= ?1",
+            params![since],
+            |row| row.get(0),
+        )?;
+        coverage.truncated = self.connection.query_row(
+            "SELECT count(*) FROM requests WHERE at >= ?1 AND truncated = 1",
+            params![since],
+            |row| row.get(0),
+        )?;
+        coverage.undecodable = self.connection.query_row(
+            "SELECT count(*) FROM requests WHERE at >= ?1 AND unreadable IS NOT NULL",
+            params![since],
+            |row| row.get(0),
+        )?;
+        coverage.named_by_comm = self.connection.query_row(
+            "SELECT count(*) FROM requests WHERE at >= ?1 AND confidence = 'comm'",
+            params![since],
+            |row| row.get(0),
+        )?;
+        coverage.named_by_pid = self.connection.query_row(
+            "SELECT count(*) FROM requests WHERE at >= ?1 AND confidence = 'pid'",
+            params![since],
+            |row| row.get(0),
+        )?;
+        coverage.dropped = self
+            .connection
+            .query_row(
+                "SELECT CAST(detail AS INTEGER) FROM notes WHERE kind = 'dropped'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+
+        // The question the whole screen exists for. A process that opened an HTTPS connection and had
+        // nothing read from it is using a TLS implementation there is no probe for — Go's, or one linked
+        // into its own binary — and from the outside that is indistinguishable from a quiet process.
+        let mut statement = self.connection.prepare(
+            "SELECT c.process, count(*) FROM connections c
+             WHERE c.at >= ?1 AND c.port IN (443, 8443)
+               AND NOT EXISTS (
+                 SELECT 1 FROM requests r WHERE r.process = c.process AND r.at >= ?1
+               )
+             GROUP BY c.process
+             ORDER BY count(*) DESC",
+        )?;
+        coverage.unread = statement
+            .query_map(params![since], |row| {
+                Ok(Unread {
+                    process: row.get(0)?,
+                    connections: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut statement = self.connection.prepare(
+            "SELECT at, kind, subject, detail FROM notes WHERE kind = 'unprobed-library' ORDER BY subject",
+        )?;
+        coverage.unprobed = statement
+            .query_map([], |row| {
+                Ok(Note {
+                    at: row.get(0)?,
+                    kind: row.get(1)?,
+                    subject: row.get(2)?,
+                    detail: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(coverage)
     }
 
     /// The oldest request still held, for the interface to be able to say how far back it can see.
@@ -658,6 +839,158 @@ mod tests {
         }
         .describe();
         assert!(one.contains("1 day,"), "{one}");
+    }
+
+    // Coverage
+
+    /// The failure that otherwise looks exactly like success. An empty screen means "this agent made no
+    /// requests" and "this agent made four hundred requests nothing could read" equally well.
+    #[test]
+    fn a_process_that_connected_and_was_never_read_is_named() {
+        let mut store = Store::in_memory().unwrap();
+        // A Go program: it opened HTTPS connections, and its TLS is linked into its own binary.
+        for _ in 0..3 {
+            store
+                .record_connection(ConnectionRow {
+                    at: 1_000,
+                    process: "gh".to_owned(),
+                    confidence: "path".to_owned(),
+                    pid: 1,
+                    destination: Some("140.82.121.6".to_owned()),
+                    port: 443,
+                })
+                .unwrap();
+        }
+        // And one whose traffic was read, which must not appear.
+        store
+            .record_connection(ConnectionRow {
+                at: 1_000,
+                process: "curl".to_owned(),
+                confidence: "path".to_owned(),
+                pid: 2,
+                destination: Some("93.184.216.34".to_owned()),
+                port: 443,
+            })
+            .unwrap();
+        store
+            .record_request(request(1_000, "curl", "example.com", 10))
+            .unwrap();
+
+        let coverage = store.coverage(0).unwrap();
+        assert_eq!(
+            coverage.unread,
+            vec![Unread {
+                process: "gh".to_owned(),
+                connections: 3
+            }]
+        );
+        assert_eq!(coverage.requests, 1);
+        assert_eq!(coverage.processes_read, 1);
+        assert_eq!(coverage.connections, 4);
+    }
+
+    /// A connection to something that is not HTTPS is not evidence of anything unread. SSH, DNS over TCP and
+    /// a database connection are all traffic this deliberately does not try to read.
+    #[test]
+    fn a_connection_that_is_not_https_is_not_counted_as_unread() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .record_connection(ConnectionRow {
+                at: 1_000,
+                process: "ssh".to_owned(),
+                confidence: "path".to_owned(),
+                pid: 1,
+                destination: Some("10.0.0.1".to_owned()),
+                port: 22,
+            })
+            .unwrap();
+        assert!(store.coverage(0).unwrap().unread.is_empty());
+    }
+
+    /// Coverage is about a window. A process read from last week and silent today is unread today.
+    #[test]
+    fn the_window_decides_what_counts_as_unread() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .record_request(request(1_000, "gh", "api.github.com", 10))
+            .unwrap();
+        store
+            .record_connection(ConnectionRow {
+                at: 50_000,
+                process: "gh".to_owned(),
+                confidence: "path".to_owned(),
+                pid: 1,
+                destination: None,
+                port: 443,
+            })
+            .unwrap();
+        assert!(store.coverage(0).unwrap().unread.is_empty());
+        assert_eq!(store.coverage(40_000).unwrap().unread.len(), 1);
+    }
+
+    #[test]
+    fn the_things_that_were_read_imperfectly_are_counted() {
+        let mut store = Store::in_memory().unwrap();
+        let mut truncated = request(1_000, "claude", "api.anthropic.com", 61_440);
+        truncated.truncated = true;
+        store.record_request(truncated).unwrap();
+
+        let mut undecodable = request(1_000, "node", "", 40);
+        undecodable.unreadable = Some("joined late".to_owned());
+        store.record_request(undecodable).unwrap();
+
+        let mut weak = request(1_000, "git-remote-http", "github.com", 40);
+        weak.confidence = "comm".to_owned();
+        store.record_request(weak).unwrap();
+
+        let mut nameless = request(1_000, "pid 91", "", 40);
+        nameless.confidence = "pid".to_owned();
+        store.record_request(nameless).unwrap();
+
+        let coverage = store.coverage(0).unwrap();
+        assert_eq!(coverage.truncated, 1);
+        assert_eq!(coverage.undecodable, 1);
+        assert_eq!(coverage.named_by_comm, 1);
+        assert_eq!(coverage.named_by_pid, 1);
+    }
+
+    /// A library that cannot be probed cannot be probed every five seconds for the rest of the week. One
+    /// row, updated, not ten thousand copies of one fact.
+    #[test]
+    fn a_note_about_the_same_thing_twice_is_one_note() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .record_note("unprobed-library", "/usr/lib/libssl.so.3", "no symbols")
+            .unwrap();
+        store
+            .record_note(
+                "unprobed-library",
+                "/usr/lib/libssl.so.3",
+                "still no symbols",
+            )
+            .unwrap();
+        let coverage = store.coverage(0).unwrap();
+        assert_eq!(coverage.unprobed.len(), 1);
+        assert_eq!(coverage.unprobed[0].detail, "still no symbols");
+    }
+
+    /// Drops accumulate. Each report is a count since the last one, not a total.
+    #[test]
+    fn dropped_records_add_up() {
+        let mut store = Store::in_memory().unwrap();
+        store.record_drop(12).unwrap();
+        store.record_drop(30).unwrap();
+        assert_eq!(store.coverage(0).unwrap().dropped, 42);
+    }
+
+    #[test]
+    fn coverage_of_an_empty_database_is_zero_rather_than_an_error() {
+        let mut store = Store::in_memory().unwrap();
+        let coverage = store.coverage(0).unwrap();
+        assert_eq!(coverage.requests, 0);
+        assert_eq!(coverage.dropped, 0);
+        assert!(coverage.unread.is_empty());
+        assert!(coverage.unprobed.is_empty());
     }
 
     /// This file holds every host every process on the machine reached. On a shared machine that is a list

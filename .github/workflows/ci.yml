@@ -88,6 +88,10 @@ jobs:
       # requests, and insists on finding them: the connection with the right process and port, and the
       # request itself in the clear.
       - name: Attribute and read a real request
+        env:
+          # `gh` is written in Go, so its TLS is linked into its own binary and Flowlight cannot read it.
+          # That is the case Coverage exists to name, and the smoke test asserts it does.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           # A client that uses GnuTLS by definition, so the GnuTLS probes are exercised rather than assumed.
