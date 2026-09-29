@@ -5,9 +5,11 @@
 
 use crate::Command;
 use anyhow::{Context as _, bail};
+use flowlight_agents::mcp;
 use flowlight_store::{RequestRow, Store};
+use serde::Serialize;
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Answers one question and exits.
@@ -45,9 +47,44 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
             }
             for row in rows {
                 if json {
-                    writeln!(out, "{}", request_json(&row))?;
+                    writeln!(out, "{}", line(&RequestView::from(&row)))?;
                 } else {
                     writeln!(out, "{}", request_line(&row))?;
+                }
+            }
+        }
+        Command::Agents { since } => {
+            let window = parse_window(since)
+                .with_context(|| format!("reading `{since}` as a length of time"))?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs() as i64);
+            let agents = store.agents(now - window)?;
+            if agents.is_empty() {
+                eprintln!(
+                    "No agent has been seen in the last {since}. Flowlight recognises an agent by the name \
+                     of its executable and attributes anything it starts to it; a tool it does not \
+                     recognise appears under its own name instead."
+                );
+                return Ok(());
+            }
+            let configured = configured_servers();
+            for agent in agents {
+                let contacted: Vec<(String, i64)> = store
+                    .hosts_for_agent(&agent.agent, now - window, 200)?
+                    .into_iter()
+                    .map(|host| (host.host, host.requests))
+                    .collect();
+                let mine: Vec<mcp::Server> = configured
+                    .iter()
+                    .filter(|server| server.agent == agent.agent)
+                    .cloned()
+                    .collect();
+                let domains = mcp::merge(&mine, &contacted, mcp::endpoints_for(&agent.agent));
+                if json {
+                    writeln!(out, "{}", line(&agent_view(&agent, &mine, &domains)))?;
+                } else {
+                    write!(out, "{}", agent_report(&agent, &mine, &domains))?;
                 }
             }
         }
@@ -59,7 +96,7 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
                 .map_or(0, |since| since.as_secs() as i64);
             let coverage = store.coverage(now - window)?;
             if json {
-                writeln!(out, "{}", coverage_json(&coverage))?;
+                writeln!(out, "{}", line(&coverage_view(&coverage)))?;
             } else {
                 write!(out, "{}", coverage_report(&coverage, since))?;
             }
@@ -77,12 +114,14 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
                 if json {
                     writeln!(
                         out,
-                        "{{\"day\":{},\"process\":{},\"host\":{},\"requests\":{},\"bytes\":{}}}",
-                        quote(&row.day),
-                        quote(&row.process),
-                        quote(&row.host),
-                        row.requests,
-                        row.bytes
+                        "{}",
+                        line(&DailyView {
+                            day: &row.day,
+                            process: &row.process,
+                            host: &row.host,
+                            requests: row.requests,
+                            bytes: row.bytes,
+                        })
                     )?;
                 } else {
                     writeln!(
@@ -95,6 +134,91 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
         }
     }
     Ok(())
+}
+
+/// Every MCP server configured anywhere on the machine.
+///
+/// Home directories rather than one: this daemon runs as root and watches the whole machine, and the agents
+/// on it belong to users. Reading only root's configuration would find nothing on every machine anyone
+/// actually uses.
+pub fn configured_servers() -> Vec<mcp::Server> {
+    let mut homes = vec![PathBuf::from("/root")];
+    if let Ok(entries) = std::fs::read_dir("/home") {
+        homes.extend(entries.flatten().map(|entry| entry.path()));
+    }
+    mcp::configuration_files(&homes)
+        .iter()
+        .flat_map(|(agent, path)| mcp::read(agent, path))
+        .collect()
+}
+
+/// One agent, as prose.
+fn agent_report(
+    agent: &flowlight_store::AgentRow,
+    configured: &[mcp::Server],
+    domains: &[mcp::Domain],
+) -> String {
+    let mut out = format!(
+        "\n{}\n  {} request(s) from {} process(es), {} host(s), last {} seconds ago\n",
+        agent.agent,
+        agent.requests,
+        agent.processes,
+        agent.hosts,
+        seconds_ago(agent.last_seen)
+    );
+
+    let local: Vec<&mcp::Server> = configured
+        .iter()
+        .filter(|server| !server.transport.crosses_the_network())
+        .collect();
+    if !local.is_empty() {
+        // Said rather than omitted. A server that talks over a pipe is a server nothing here can ever see,
+        // and leaving it off the screen invites the conclusion that Flowlight looked and found nothing.
+        out.push_str(&format!(
+            "\n  {} MCP server(s) run locally and never touch the network, so nothing here can see them: {}\n",
+            local.len(),
+            local
+                .iter()
+                .map(|server| server.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    if domains.is_empty() {
+        out.push_str("\n  No hosts reached, and none configured.\n");
+        return out;
+    }
+
+    out.push_str("\n  Hosts, against what this agent was configured to reach:\n\n");
+    for domain in domains {
+        let servers = if domain.servers.is_empty() {
+            String::new()
+        } else {
+            format!("  ({})", domain.servers.join(", "))
+        };
+        out.push_str(&format!(
+            "    {:<11} {:<44} {:>6} request(s){servers}\n",
+            domain.standing.as_str(),
+            domain.host,
+            domain.requests
+        ));
+    }
+    out.push_str(
+        "\n    unexpected  reached, and in no configuration — the one worth a second look\n\
+         \x20   unused      configured, and not reached\n\
+         \x20   used        configured, and reached\n\
+         \x20   endpoint    the agent's own service, which is neither MCP nor a surprise\n",
+    );
+    out
+}
+
+/// How long ago, in seconds, without pulling in a date library for one number.
+fn seconds_ago(at: i64) -> i64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64);
+    (now - at).max(0)
 }
 
 /// Coverage, as prose.
@@ -162,47 +286,6 @@ fn coverage_report(coverage: &flowlight_store::Coverage, window: &str) -> String
     out
 }
 
-/// Coverage, as one JSON object.
-fn coverage_json(coverage: &flowlight_store::Coverage) -> String {
-    let unread: Vec<String> = coverage
-        .unread
-        .iter()
-        .map(|unread| {
-            format!(
-                "{{\"process\":{},\"connections\":{}}}",
-                quote(&unread.process),
-                unread.connections
-            )
-        })
-        .collect();
-    let unprobed: Vec<String> = coverage
-        .unprobed
-        .iter()
-        .map(|note| {
-            format!(
-                "{{\"path\":{},\"reason\":{}}}",
-                quote(&note.subject),
-                quote(&note.detail)
-            )
-        })
-        .collect();
-    format!(
-        "{{\"requests\":{},\"processes_read\":{},\"connections\":{},\"truncated\":{},\
-         \"undecodable\":{},\"named_by_comm\":{},\"named_by_pid\":{},\"dropped\":{},\
-         \"unread\":[{}],\"unprobed\":[{}]}}",
-        coverage.requests,
-        coverage.processes_read,
-        coverage.connections,
-        coverage.truncated,
-        coverage.undecodable,
-        coverage.named_by_comm,
-        coverage.named_by_pid,
-        coverage.dropped,
-        unread.join(","),
-        unprobed.join(",")
-    )
-}
-
 /// One stored request, as a line.
 fn request_line(row: &RequestRow) -> String {
     let arrow = if row.direction == "out" { "→" } else { "←" };
@@ -219,60 +302,197 @@ fn request_line(row: &RequestRow) -> String {
     } else {
         format!("{} bytes", row.bytes)
     };
-    format!(
-        "{}  {:<24} pid {:<8} {arrow} {what}",
-        row.at, row.process, row.pid
-    )
+    // The agent and the process, when they are not the same thing: `node` is true and answers nobody's
+    // question.
+    let who = match &row.agent {
+        Some(agent) if *agent != row.process => format!("{agent}/{}", row.process),
+        _ => row.process.clone(),
+    };
+    format!("{}  {:<28} pid {:<8} {arrow} {what}", row.at, who, row.pid)
 }
 
-/// One stored request, as JSON.
-fn request_json(row: &RequestRow) -> String {
-    let mut fields = vec![
-        format!("\"at\":{}", row.at),
-        format!("\"process\":{}", quote(&row.process)),
-        format!("\"confidence\":{}", quote(&row.confidence)),
-        format!("\"pid\":{}", row.pid),
-        format!("\"direction\":{}", quote(&row.direction)),
-        format!("\"bytes\":{}", row.bytes),
-    ];
-    for (name, value) in [
-        ("protocol", &row.protocol),
-        ("method", &row.method),
-        ("target", &row.target),
-        ("host", &row.host),
-        ("unreadable", &row.unreadable),
-    ] {
-        if let Some(value) = value {
-            fields.push(format!("\"{name}\":{}", quote(value)));
-        }
-    }
-    if let Some(status) = row.status {
-        fields.push(format!("\"status\":{status}"));
-    }
-    if row.truncated {
-        fields.push("\"truncated\":true".to_owned());
-    }
-    format!("{{{}}}", fields.join(","))
+/// Everything the JSON forms share: a field added to a row is a field that appears, rather than one
+/// somebody has to remember to add in a second place.
+///
+/// This was hand-built once, and the `agent` column shipped without reaching it — the live stream had it
+/// and `history --json` did not, because the two were written months apart and only one of them derived
+/// anything. Deriving removes the class of mistake rather than the instance.
+#[derive(Serialize)]
+struct RequestView<'a> {
+    at: i64,
+    process: &'a str,
+    confidence: &'a str,
+    pid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<&'a str>,
+    direction: &'a str,
+    bytes: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protocol: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<u16>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unreadable: Option<&'a str>,
 }
 
-/// A JSON string. Hand-written because the rows come out of our own database and back into a terminal, and
-/// pulling serde into this module to quote four fields would be the larger cost.
-fn quote(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for c in value.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+impl<'a> From<&'a RequestRow> for RequestView<'a> {
+    fn from(row: &'a RequestRow) -> Self {
+        Self {
+            at: row.at,
+            process: &row.process,
+            confidence: &row.confidence,
+            pid: row.pid,
+            agent: row.agent.as_deref(),
+            direction: &row.direction,
+            bytes: row.bytes,
+            protocol: row.protocol.as_deref(),
+            method: row.method.as_deref(),
+            target: row.target.as_deref(),
+            host: row.host.as_deref(),
+            status: row.status,
+            truncated: row.truncated,
+            unreadable: row.unreadable.as_deref(),
         }
     }
-    out.push('"');
-    out
+}
+
+#[derive(Serialize)]
+struct DailyView<'a> {
+    day: &'a str,
+    process: &'a str,
+    host: &'a str,
+    requests: i64,
+    bytes: i64,
+}
+
+#[derive(Serialize)]
+struct CoverageView<'a> {
+    requests: i64,
+    processes_read: i64,
+    connections: i64,
+    truncated: i64,
+    undecodable: i64,
+    named_by_comm: i64,
+    named_by_pid: i64,
+    dropped: i64,
+    unread: Vec<UnreadView<'a>>,
+    unprobed: Vec<UnprobedView<'a>>,
+}
+
+#[derive(Serialize)]
+struct UnreadView<'a> {
+    process: &'a str,
+    connections: i64,
+}
+
+#[derive(Serialize)]
+struct UnprobedView<'a> {
+    path: &'a str,
+    reason: &'a str,
+}
+
+#[derive(Serialize)]
+struct AgentView<'a> {
+    agent: &'a str,
+    requests: i64,
+    processes: i64,
+    hosts: i64,
+    bytes: i64,
+    last_seen: i64,
+    configured: Vec<ServerView<'a>>,
+    domains: Vec<DomainView<'a>>,
+}
+
+#[derive(Serialize)]
+struct ServerView<'a> {
+    name: &'a str,
+    transport: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host: Option<&'a str>,
+    source: &'a str,
+}
+
+#[derive(Serialize)]
+struct DomainView<'a> {
+    host: &'a str,
+    standing: &'a str,
+    requests: i64,
+    servers: &'a [String],
+}
+
+/// One line of JSON, or a message if it somehow will not serialise.
+fn line<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value).unwrap_or_else(|err| format!("{{\"error\":\"{err}\"}}"))
+}
+
+fn coverage_view(coverage: &flowlight_store::Coverage) -> CoverageView<'_> {
+    CoverageView {
+        requests: coverage.requests,
+        processes_read: coverage.processes_read,
+        connections: coverage.connections,
+        truncated: coverage.truncated,
+        undecodable: coverage.undecodable,
+        named_by_comm: coverage.named_by_comm,
+        named_by_pid: coverage.named_by_pid,
+        dropped: coverage.dropped,
+        unread: coverage
+            .unread
+            .iter()
+            .map(|unread| UnreadView {
+                process: &unread.process,
+                connections: unread.connections,
+            })
+            .collect(),
+        unprobed: coverage
+            .unprobed
+            .iter()
+            .map(|note| UnprobedView {
+                path: &note.subject,
+                reason: &note.detail,
+            })
+            .collect(),
+    }
+}
+
+fn agent_view<'a>(
+    agent: &'a flowlight_store::AgentRow,
+    configured: &'a [mcp::Server],
+    domains: &'a [mcp::Domain],
+) -> AgentView<'a> {
+    AgentView {
+        agent: &agent.agent,
+        requests: agent.requests,
+        processes: agent.processes,
+        hosts: agent.hosts,
+        bytes: agent.bytes,
+        last_seen: agent.last_seen,
+        configured: configured
+            .iter()
+            .map(|server| ServerView {
+                name: &server.name,
+                transport: server.transport.as_str(),
+                host: server.host.as_deref(),
+                source: &server.source,
+            })
+            .collect(),
+        domains: domains
+            .iter()
+            .map(|domain| DomainView {
+                host: &domain.host,
+                standing: domain.standing.as_str(),
+                requests: domain.requests,
+                servers: &domain.servers,
+            })
+            .collect(),
+    }
 }
 
 /// Reads `30m`, `6h`, `2d`, or a bare number of seconds.
@@ -360,10 +580,118 @@ mod tests {
         assert!(report.contains("0 call(s) carried more than"), "{report}");
     }
 
+    /// `node` is true and answers nobody's question. The report leads with the agent.
     #[test]
-    fn a_string_with_a_quote_in_it_survives_being_json() {
-        assert_eq!(quote(r#"a"b"#), r#""a\"b""#);
-        assert_eq!(quote("a\nb"), r#""a\nb""#);
-        assert_eq!(quote("a\u{1}b"), r#""a\u0001b""#);
+    fn an_agents_report_names_what_it_reached_and_what_it_did_not() {
+        let agent = flowlight_store::AgentRow {
+            agent: "claude".to_owned(),
+            requests: 42,
+            hosts: 3,
+            processes: 4,
+            bytes: 1_000,
+            last_seen: 0,
+        };
+        let configured = [mcp::Server {
+            name: "sentry".to_owned(),
+            agent: "claude".to_owned(),
+            source: "~/.claude.json".to_owned(),
+            transport: mcp::Transport::Http,
+            host: Some("mcp.sentry.dev".to_owned()),
+            command: None,
+        }];
+        let contacted = [
+            ("mcp.sentry.dev".to_owned(), 12),
+            ("telemetry.example".to_owned(), 3),
+            ("api.anthropic.com".to_owned(), 27),
+        ];
+        let domains = mcp::merge(&configured, &contacted, mcp::endpoints_for("claude"));
+        let report = agent_report(&agent, &configured, &domains);
+
+        assert!(report.contains("claude"), "{report}");
+        assert!(report.contains("unexpected  telemetry.example"), "{report}");
+        assert!(report.contains("used        mcp.sentry.dev"), "{report}");
+        assert!(report.contains("endpoint    api.anthropic.com"), "{report}");
+    }
+
+    /// A server that talks over a pipe is a server nothing here can ever see. Leaving it off the screen
+    /// invites the conclusion that Flowlight looked and found nothing.
+    #[test]
+    fn a_local_mcp_server_is_said_to_be_invisible_rather_than_omitted() {
+        let agent = flowlight_store::AgentRow {
+            agent: "claude".to_owned(),
+            requests: 0,
+            hosts: 0,
+            processes: 0,
+            bytes: 0,
+            last_seen: 0,
+        };
+        let configured = [mcp::Server {
+            name: "filesystem".to_owned(),
+            agent: "claude".to_owned(),
+            source: "~/.claude.json".to_owned(),
+            transport: mcp::Transport::Stdio,
+            host: None,
+            command: Some("npx".to_owned()),
+        }];
+        let report = agent_report(&agent, &configured, &[]);
+        assert!(report.contains("never touch the network"), "{report}");
+        assert!(report.contains("filesystem"), "{report}");
+    }
+
+    /// The bug that caused this to be derived rather than hand-written: the `agent` column reached the
+    /// live stream and not this, because the two were written months apart and only one derived anything.
+    #[test]
+    fn every_column_of_a_stored_request_reaches_the_json() {
+        let row = RequestRow {
+            at: 1_000,
+            process: "node".to_owned(),
+            confidence: "path".to_owned(),
+            pid: 4711,
+            agent: Some("claude".to_owned()),
+            direction: "out".to_owned(),
+            protocol: Some("http/2".to_owned()),
+            method: Some("POST".to_owned()),
+            target: Some("/v1/messages".to_owned()),
+            host: Some("api.anthropic.com".to_owned()),
+            status: None,
+            bytes: 3_800,
+            truncated: true,
+            unreadable: None,
+        };
+        let json = line(&RequestView::from(&row));
+        for expected in [
+            r#""agent":"claude""#,
+            r#""process":"node""#,
+            r#""method":"POST""#,
+            r#""host":"api.anthropic.com""#,
+            r#""truncated":true"#,
+        ] {
+            assert!(json.contains(expected), "{expected} missing from {json}");
+        }
+        // And nothing that is not true.
+        assert!(!json.contains("status"), "{json}");
+        assert!(!json.contains("unreadable"), "{json}");
+    }
+
+    /// `node` is true and answers nobody's question.
+    #[test]
+    fn a_line_names_the_agent_and_the_process() {
+        let row = RequestRow {
+            at: 1_000,
+            process: "node".to_owned(),
+            confidence: "path".to_owned(),
+            pid: 4711,
+            agent: Some("claude".to_owned()),
+            direction: "out".to_owned(),
+            protocol: None,
+            method: Some("GET".to_owned()),
+            target: Some("/".to_owned()),
+            host: Some("example.com".to_owned()),
+            status: None,
+            bytes: 10,
+            truncated: false,
+            unreadable: None,
+        };
+        assert!(request_line(&row).contains("claude/node"));
     }
 }

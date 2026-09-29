@@ -30,6 +30,9 @@ pub struct Payload {
     pub confidence: &'static str,
     /// The process.
     pub pid: u32,
+    /// The agent this process is working for, filled in after the fact from the process tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// `out` for a write, `in` for a read.
     pub direction: &'static str,
     /// How many bytes the call carried, which is not always how many were captured.
@@ -73,6 +76,7 @@ impl Payload {
             process: identity.key,
             confidence: identity.confidence.as_str(),
             pid: chunk.tgid,
+            agent: None,
             direction: if chunk.is_outbound() { "out" } else { "in" },
             bytes: chunk.total,
             truncated: chunk.is_truncated(),
@@ -109,6 +113,7 @@ impl Payload {
             process: identity.key,
             confidence: identity.confidence.as_str(),
             pid: chunk.tgid,
+            agent: None,
             direction: if chunk.is_outbound() { "out" } else { "in" },
             bytes: chunk.total,
             truncated: chunk.is_truncated(),
@@ -118,6 +123,14 @@ impl Payload {
             status: None,
             protocol: None,
             unreadable: None,
+        }
+    }
+
+    /// The name column: the agent and the process, when they are not the same thing.
+    pub fn who(&self) -> String {
+        match &self.agent {
+            Some(agent) if *agent != self.process => format!("{agent}/{}", self.process),
+            _ => self.process.clone(),
         }
     }
 
@@ -152,6 +165,7 @@ impl Payload {
             process: self.process.clone(),
             confidence: self.confidence.to_owned(),
             pid: self.pid,
+            agent: self.agent.clone(),
             direction: self.direction.to_owned(),
             protocol: self.protocol.map(str::to_owned),
             method: self.method.clone(),
@@ -199,7 +213,8 @@ impl Payload {
         let truncated = if self.truncated { "  [truncated]" } else { "" };
         format!(
             "{:<24} pid {:<8} {arrow} {what}{truncated}",
-            self.process, self.pid
+            self.who(),
+            self.pid
         )
     }
 }

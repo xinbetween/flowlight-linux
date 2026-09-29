@@ -13,6 +13,7 @@ name = "flowlightd"
 path = "src/main.rs"
 
 [dependencies]
+flowlight-agents.workspace = true
 flowlight-common = { workspace = true, features = ["user"] }
 flowlight-store.workspace = true
 anyhow.workspace = true

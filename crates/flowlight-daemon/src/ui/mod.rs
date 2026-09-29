@@ -74,6 +74,7 @@ fn run(server: &Server, database: &Path, token: &str) {
                 "/api/requests" => json_or_error(|| requests(database, query)),
                 "/api/processes" => json_or_error(|| processes(database, query)),
                 "/api/hosts" => json_or_error(|| hosts(database, query)),
+                "/api/agents" => json_or_error(|| agents(database, query)),
                 "/api/coverage" => json_or_error(|| coverage(database, query)),
                 _ => text(404, "not found"),
             }
@@ -168,6 +169,7 @@ fn now() -> i64 {
 struct RequestView {
     at: i64,
     process: String,
+    agent: Option<String>,
     confidence: String,
     pid: u32,
     direction: String,
@@ -198,6 +200,28 @@ struct HostView {
     host: String,
     requests: i64,
     last_seen: i64,
+}
+
+/// What the page shows for one agent, with the comparison already made.
+#[derive(Serialize)]
+struct AgentView {
+    agent: String,
+    requests: i64,
+    hosts: i64,
+    processes: i64,
+    bytes: i64,
+    last_seen: i64,
+    /// Configured servers that never touch the network, which nothing here can ever see.
+    local: Vec<String>,
+    domains: Vec<DomainView>,
+}
+
+#[derive(Serialize)]
+struct DomainView {
+    host: String,
+    standing: String,
+    requests: i64,
+    servers: Vec<String>,
 }
 
 /// What the page shows on the Coverage tab.
@@ -239,6 +263,7 @@ fn requests(database: &Path, query: &str) -> Result<String> {
         .map(|row| RequestView {
             at: row.at,
             process: row.process,
+            agent: row.agent,
             confidence: row.confidence,
             pid: row.pid,
             direction: row.direction,
@@ -285,6 +310,55 @@ fn hosts(database: &Path, query: &str) -> Result<String> {
         })
         .collect();
     Ok(serde_json::to_string(&rows)?)
+}
+
+fn agents(database: &Path, query: &str) -> Result<String> {
+    let mut store = Store::open_read_only(database)?;
+    let since = window(query);
+    // Read per request rather than cached: they are a handful of small files, and a configuration edited
+    // while the page is open should show up on the next poll rather than the next restart.
+    let configured = crate::history::configured_servers();
+    let mut views = Vec::new();
+    for row in store.agents(since)? {
+        let contacted: Vec<(String, i64)> = store
+            .hosts_for_agent(&row.agent, since, 200)?
+            .into_iter()
+            .map(|host| (host.host, host.requests))
+            .collect();
+        let mine: Vec<flowlight_agents::mcp::Server> = configured
+            .iter()
+            .filter(|server| server.agent == row.agent)
+            .cloned()
+            .collect();
+        let domains = flowlight_agents::mcp::merge(
+            &mine,
+            &contacted,
+            flowlight_agents::mcp::endpoints_for(&row.agent),
+        );
+        views.push(AgentView {
+            agent: row.agent,
+            requests: row.requests,
+            hosts: row.hosts,
+            processes: row.processes,
+            bytes: row.bytes,
+            last_seen: row.last_seen,
+            local: mine
+                .iter()
+                .filter(|server| !server.transport.crosses_the_network())
+                .map(|server| server.name.clone())
+                .collect(),
+            domains: domains
+                .into_iter()
+                .map(|domain| DomainView {
+                    host: domain.host,
+                    standing: domain.standing.as_str().to_owned(),
+                    requests: domain.requests,
+                    servers: domain.servers,
+                })
+                .collect(),
+        });
+    }
+    Ok(serde_json::to_string(&views)?)
 }
 
 fn coverage(database: &Path, query: &str) -> Result<String> {
