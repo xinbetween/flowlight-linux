@@ -67,8 +67,10 @@ sudo ./target/release/flowlightd
 ```
 
 ```text
-flowlightd 0.1.3: watching sock/inet_sock_set_state. Outbound TCP only; inbound connections are not
-attributed. Nothing is stored.
+flowlightd 0.1.5: watching sock/inet_sock_set_state. Outbound TCP only; inbound connections are not
+attributed.
+storing to /var/lib/flowlight/flowlight.db, keeping individual requests for 7 days, and a daily summary
+for 90 days
 reading openssl through /usr/lib/x86_64-linux-gnu/libssl.so.3 (SSL_write, SSL_write_ex, SSL_read, SSL_read_ex)
 curl                     pid 18422    → 93.184.216.34:443
 curl                     pid 18422    → GET example.com/
@@ -76,11 +78,34 @@ curl                     pid 18422    ← 200  1256 bytes
 claude                   pid 17903    → POST api.anthropic.com/v1/messages
 ```
 
+Then ask it afterwards:
+
+```sh
+sudo ./target/release/flowlightd history --since 6h
+sudo ./target/release/flowlightd summary
+```
+
 The name column is what the process is called. When a fourth column appears on a connection line — `[comm]`
 or `[pid]` — it says the name is worth less than usual: `[comm]` means the process was gone by the time
 Flowlight looked it up, so the name is the one the kernel captured, which it cuts at fifteen characters.
 
-Nothing is stored, nothing is blocked, and nothing is modified.
+Nothing is blocked and nothing is modified.
+
+### What is kept, and for how long
+
+Two tiers, both with a number attached, and both printed at startup rather than left in a manual:
+
+- **Detail** — every connection and every request, for **seven days**. Hosts, paths, methods, statuses, byte
+  counts. The tier that answers *what happened*.
+- **Summary** — one row per day per process per host, for **ninety days**. Counts and totals, no paths. The
+  tier that answers *is this normal*, and what the detail is folded into rather than what replaces it after
+  the fact.
+
+Nothing is kept forever. The database is created mode `600` in a directory mode `700`, because it holds every
+host every process on the machine reached — on a shared machine, a list of what everyone was doing. Credentials
+are redacted before a record is made, so they are not in it either.
+
+`--no-store` keeps nothing at all.
 
 Useful flags:
 
@@ -93,6 +118,10 @@ Useful flags:
 | `--seconds N` | stop after N seconds |
 | `--count N` | stop after N records |
 | `--tracefs PATH` | if tracefs is mounted somewhere unusual |
+| `--database PATH` | where to keep what is seen. Default `/var/lib/flowlight/flowlight.db` |
+| `--no-store` | keep nothing; watch the terminal and let it scroll |
+| `--retention-days N` | days of individual requests. Default 7 |
+| `--summary-days N` | days of the daily summary. Default 90 |
 
 If it refuses to start, the message says why — an unmounted tracefs, a kernel built without the tracepoint,
 and a policy that forbids loading programs are three different problems and it will not conflate them.

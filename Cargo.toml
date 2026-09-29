@@ -1,15 +1,20 @@
 [workspace]
 resolver = "3"
-members = ["crates/flowlight-common", "crates/flowlight-daemon", "crates/flowlight-ebpf"]
+members = [
+    "crates/flowlight-common",
+    "crates/flowlight-daemon",
+    "crates/flowlight-ebpf",
+    "crates/flowlight-store",
+]
 
 # Only the crate that builds anywhere is a default member. `flowlight-ebpf` compiles for
 # `bpfel-unknown-none` alone, and `flowlight-daemon` builds it and links aya, so both need a Linux host. A
 # bare `cargo test` should therefore run the tests the machine in front of you can actually run; CI names the
 # whole workspace explicitly, on Linux, which is the only place any of this runs.
-default-members = ["crates/flowlight-common"]
+default-members = ["crates/flowlight-common", "crates/flowlight-store"]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/xinbetween/flowlight-linux"
@@ -18,6 +23,7 @@ rust-version = "1.87"
 
 [workspace.dependencies]
 flowlight-common = { path = "crates/flowlight-common", default-features = false }
+flowlight-store = { path = "crates/flowlight-store" }
 aya = "0.14"
 aya-build = "0.2"
 aya-ebpf = "0.2"
