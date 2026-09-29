@@ -237,12 +237,12 @@ impl ConnectionEvent {
 
     /// The address that was connected to.
     pub fn destination(&self) -> Option<IpAddr> {
-        address(self.family, &self.daddr)
+        address_of(self.family, &self.daddr)
     }
 
     /// The address it was connected from. Often unspecified at this point in the handshake for IPv6.
     pub fn source(&self) -> Option<IpAddr> {
-        address(self.family, &self.saddr)
+        address_of(self.family, &self.saddr)
     }
 }
 
@@ -255,8 +255,11 @@ pub const fn ipv4_bytes(v4: [u8; 4]) -> [u8; 16] {
     [a, b, c, d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 }
 
-/// Reads an address out of the sixteen bytes the event carries for it.
-fn address(family: u16, bytes: &[u8; 16]) -> Option<IpAddr> {
+/// Reads an address out of sixteen bytes, according to the family they were recorded with.
+///
+/// Shared rather than duplicated: two places that widen an IPv4 address into sixteen bytes and two that
+/// read it back is four chances to disagree about which four bytes matter.
+pub fn address_of(family: u16, bytes: &[u8; 16]) -> Option<IpAddr> {
     match family {
         AF_INET => {
             let mut v4 = [0u8; 4];

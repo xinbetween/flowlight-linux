@@ -60,6 +60,8 @@ pub struct ConnectionRow {
     pub destination: Option<String>,
     /// The port.
     pub port: u16,
+    /// Whether this connection was refused before the SYN rather than opened.
+    pub blocked: bool,
 }
 
 /// A request or response, as it is stored.
@@ -128,6 +130,21 @@ pub struct ProcessRow {
     pub last_seen: i64,
 }
 
+/// A rule: something a process may not reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleRow {
+    /// When it was written.
+    pub created: i64,
+    /// A hostname, or a literal address.
+    pub subject: String,
+    /// The port, or zero for every port.
+    pub port: u16,
+    /// `global` for now. Per-agent scope is the next release.
+    pub scope: String,
+    /// Why, if whoever wrote it said.
+    pub note: Option<String>,
+}
+
 /// One agent, and what it has been doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRow {
@@ -193,6 +210,8 @@ pub struct Coverage {
     pub named_by_pid: i64,
     /// Records the kernel had nowhere to put.
     pub dropped: i64,
+    /// Connections refused before the handshake, because a rule said so.
+    pub refused: i64,
     /// Libraries found and not probed.
     pub unprobed: Vec<Note>,
 }
@@ -326,7 +345,7 @@ impl Store {
     }
 
     /// The schema this version of the code expects.
-    const SCHEMA: i64 = 2;
+    pub const SCHEMA: i64 = 3;
 
     /// Creates the schema, or brings an older one up to it.
     ///
@@ -349,7 +368,8 @@ impl Store {
                 pid         INTEGER NOT NULL,
                 destination TEXT,
                 port        INTEGER NOT NULL,
-                agent       TEXT
+                agent       TEXT,
+                blocked     INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS connections_at ON connections(at);
             CREATE TABLE IF NOT EXISTS requests (
@@ -379,6 +399,15 @@ impl Store {
                 bytes    INTEGER NOT NULL,
                 PRIMARY KEY (day, process, host)
             );
+            CREATE TABLE IF NOT EXISTS rules (
+                id      INTEGER PRIMARY KEY,
+                created INTEGER NOT NULL,
+                subject TEXT    NOT NULL,
+                port    INTEGER NOT NULL,
+                scope   TEXT    NOT NULL,
+                note    TEXT,
+                UNIQUE (subject, port, scope)
+            );
             CREATE TABLE IF NOT EXISTS notes (
                 id      INTEGER PRIMARY KEY,
                 at      INTEGER NOT NULL,
@@ -397,11 +426,20 @@ impl Store {
             );
             ",
         )?;
-        // Schema 1 is 0.1.5 through 0.1.7: everything above, without `agent`.
-        for (table, column) in [("requests", "agent"), ("connections", "agent")] {
+        // Schema 1 is 0.1.5 through 0.1.7: everything above, without `agent`. Schema 2 is 0.1.8, without
+        // `blocked`. Each column is added if it is missing rather than if the recorded version says so,
+        // because a database interrupted halfway through an upgrade is a database that has to open again.
+        for (table, column, kind) in [
+            ("requests", "agent", "TEXT"),
+            ("connections", "agent", "TEXT"),
+            ("connections", "blocked", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
             if !self.has_column(table, column)? {
                 self.connection
-                    .execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), [])
+                    .execute(
+                        &format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"),
+                        [],
+                    )
                     .with_context(|| format!("adding {table}.{column} to an existing database"))?;
             }
         }
@@ -467,8 +505,8 @@ impl Store {
         let transaction = self.connection.transaction()?;
         {
             let mut insert = transaction.prepare_cached(
-                "INSERT INTO connections(at, process, confidence, pid, destination, port, agent)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO connections(at, process, confidence, pid, destination, port, agent, blocked)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
             for row in &self.pending_connections {
                 insert.execute(params![
@@ -478,7 +516,8 @@ impl Store {
                     row.pid,
                     row.destination,
                     row.port,
-                    row.agent
+                    row.agent,
+                    row.blocked
                 ])?;
             }
             let mut insert = transaction.prepare_cached(
@@ -688,6 +727,11 @@ impl Store {
             params![since],
             |row| row.get(0),
         )?;
+        coverage.refused = self.connection.query_row(
+            "SELECT count(*) FROM connections WHERE at >= ?1 AND blocked = 1",
+            params![since],
+            |row| row.get(0),
+        )?;
         coverage.dropped = self
             .connection
             .query_row(
@@ -762,6 +806,62 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Writes a rule, or leaves an identical one alone.
+    ///
+    /// Returns whether anything changed, so that `block` on something already blocked says so rather than
+    /// implying it has just done something.
+    pub fn add_rule(
+        &mut self,
+        subject: &str,
+        port: u16,
+        scope: &str,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        let changed = self.connection.execute(
+            "INSERT INTO rules(created, subject, port, scope, note)
+             VALUES (unixepoch(), ?1, ?2, ?3, ?4)
+             ON CONFLICT(subject, port, scope) DO NOTHING",
+            params![subject, port, scope, note],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Removes a rule. Returns whether there was one.
+    pub fn remove_rule(&mut self, subject: &str, port: u16, scope: &str) -> Result<bool> {
+        let removed = self.connection.execute(
+            "DELETE FROM rules WHERE subject = ?1 AND port = ?2 AND scope = ?3",
+            params![subject, port, scope],
+        )?;
+        Ok(removed > 0)
+    }
+
+    /// Every rule, oldest first.
+    pub fn rules(&mut self) -> Result<Vec<RuleRow>> {
+        let mut statement = self.connection.prepare(
+            "SELECT created, subject, port, scope, note FROM rules ORDER BY created, subject",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(RuleRow {
+                created: row.get(0)?,
+                subject: row.get(1)?,
+                port: row.get(2)?,
+                scope: row.get(3)?,
+                note: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// How many connections were refused in a window.
+    pub fn blocked_since(&mut self, since: i64) -> Result<i64> {
+        self.flush()?;
+        Ok(self.connection.query_row(
+            "SELECT count(*) FROM connections WHERE at >= ?1 AND blocked = 1",
+            params![since],
+            |row| row.get(0),
+        )?)
     }
 
     /// Every agent something was read from, busiest first.
@@ -1045,6 +1145,7 @@ mod tests {
                 agent: None,
                 destination: Some("93.184.216.34".to_owned()),
                 port: 443,
+                blocked: false,
             })
             .unwrap();
         let swept = store.sweep(now, Retention::default()).unwrap();
@@ -1084,6 +1185,7 @@ mod tests {
                     agent: None,
                     destination: Some("140.82.121.6".to_owned()),
                     port: 443,
+                    blocked: false,
                 })
                 .unwrap();
         }
@@ -1097,6 +1199,7 @@ mod tests {
                 agent: None,
                 destination: Some("93.184.216.34".to_owned()),
                 port: 443,
+                blocked: false,
             })
             .unwrap();
         store
@@ -1130,6 +1233,7 @@ mod tests {
                 agent: None,
                 destination: Some("10.0.0.1".to_owned()),
                 port: 22,
+                blocked: false,
             })
             .unwrap();
         assert!(store.coverage(0).unwrap().unread.is_empty());
@@ -1151,6 +1255,7 @@ mod tests {
                 agent: None,
                 destination: None,
                 port: 443,
+                blocked: false,
             })
             .unwrap();
         assert!(store.coverage(0).unwrap().unread.is_empty());
@@ -1394,7 +1499,7 @@ mod tests {
         drop(old);
 
         let mut store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), Store::SCHEMA);
 
         // The old row is still there, and reads back with no agent rather than failing.
         let rows = store.requests_since(0, 10).unwrap();
@@ -1420,10 +1525,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         let path = directory.join("flowlight.db");
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), Store::SCHEMA);
         drop(store);
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), Store::SCHEMA);
+    }
+
+    // Rules
+
+    #[test]
+    fn a_rule_written_is_a_rule_read_back() {
+        let mut store = Store::in_memory().unwrap();
+        assert!(
+            store
+                .add_rule("example.com", 443, "global", Some("noisy"))
+                .unwrap()
+        );
+        let rules = store.rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].subject, "example.com");
+        assert_eq!(rules[0].port, 443);
+        assert_eq!(rules[0].note.as_deref(), Some("noisy"));
+    }
+
+    /// Blocking something already blocked has done nothing, and saying otherwise teaches somebody that the
+    /// command's output means nothing.
+    #[test]
+    fn writing_the_same_rule_twice_changes_nothing_and_says_so() {
+        let mut store = Store::in_memory().unwrap();
+        assert!(store.add_rule("example.com", 443, "global", None).unwrap());
+        assert!(!store.add_rule("example.com", 443, "global", None).unwrap());
+        assert_eq!(store.rules().unwrap().len(), 1);
+    }
+
+    /// A rule for one port and a rule for every port are different rules.
+    #[test]
+    fn a_rule_for_every_port_is_not_the_same_rule() {
+        let mut store = Store::in_memory().unwrap();
+        store.add_rule("example.com", 443, "global", None).unwrap();
+        store.add_rule("example.com", 0, "global", None).unwrap();
+        assert_eq!(store.rules().unwrap().len(), 2);
+        assert!(store.remove_rule("example.com", 443, "global").unwrap());
+        assert_eq!(store.rules().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn removing_a_rule_that_is_not_there_says_so() {
+        let mut store = Store::in_memory().unwrap();
+        assert!(!store.remove_rule("example.com", 443, "global").unwrap());
+    }
+
+    /// A refusal is a connection that did not happen, and the record of it is the only evidence there is.
+    #[test]
+    fn a_refused_connection_is_recorded_as_one() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .record_connection(ConnectionRow {
+                at: 1_000,
+                process: "curl".to_owned(),
+                confidence: "path".to_owned(),
+                pid: 1,
+                agent: None,
+                destination: Some("93.184.216.34".to_owned()),
+                port: 443,
+                blocked: true,
+            })
+            .unwrap();
+        assert_eq!(store.blocked_since(0).unwrap(), 1);
+        assert_eq!(store.blocked_since(2_000).unwrap(), 0);
     }
 
     /// This file holds every host every process on the machine reached. On a shared machine that is a list

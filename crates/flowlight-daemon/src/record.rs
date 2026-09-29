@@ -6,6 +6,7 @@
 //! is the truncated one the kernel captured at the time. That is not a failure to report, it is a fact to
 //! report, which is why [`Record::confidence`] is a field rather than a log line.
 
+use flowlight_common::block::BlockEvent;
 use flowlight_common::connection::ConnectionEvent;
 use flowlight_common::identity::{Confidence, Identity, executable_was_replaced};
 use flowlight_store::ConnectionRow;
@@ -41,6 +42,9 @@ pub struct Record {
     pub destination: Option<String>,
     /// The port it was connecting to.
     pub port: u16,
+    /// Set when the connection was refused before the handshake rather than opened.
+    #[serde(skip_serializing_if = "is_false")]
+    pub blocked: bool,
 }
 
 /// serde needs a function, and `bool::not` is not one it will take by path.
@@ -70,6 +74,31 @@ impl Record {
                 .map(str::to_owned),
             destination: event.destination().map(|address| address.to_string()),
             port: event.dport,
+            blocked: false,
+        }
+    }
+
+    /// A connection that was refused before the SYN.
+    ///
+    /// A separate constructor rather than a flag on the other one, because it is a different event from a
+    /// different program: there is no thread to report, no source address, and nothing was sent.
+    pub fn refused(event: &BlockEvent, exe: Option<&str>) -> Self {
+        let comm = event.comm_str();
+        let identity = Identity::derive(exe, comm, event.tgid as i32);
+        Self {
+            process: identity.key.clone(),
+            confidence: identity.confidence.as_str(),
+            name_may_be_truncated: identity.may_be_truncated(),
+            executable_replaced: exe.is_some_and(executable_was_replaced),
+            pid: event.tgid,
+            agent: None,
+            thread: (event.pid != event.tgid).then_some(event.pid),
+            comm: comm
+                .filter(|c| *c != identity.key || identity.confidence != Confidence::Path)
+                .map(str::to_owned),
+            destination: event.destination().map(|address| address.to_string()),
+            port: event.port,
+            blocked: true,
         }
     }
 
@@ -93,6 +122,7 @@ impl Record {
             agent: self.agent.clone(),
             destination: self.destination.clone(),
             port: self.port,
+            blocked: self.blocked,
         }
     }
 
@@ -113,8 +143,11 @@ impl Record {
         } else {
             ":"
         };
+        // A different arrow, because a refusal is not a slower connection — it is one that did not happen,
+        // and the application has already been told so.
+        let arrow = if self.blocked { "⊘" } else { "→" };
         format!(
-            "{:<24} pid {:<8} → {destination}{separator}{}{note}",
+            "{:<24} pid {:<8} {arrow} {destination}{separator}{}{note}",
             self.who(),
             self.pid,
             self.port
@@ -194,6 +227,29 @@ mod tests {
         };
         let line = Record::describe(&ev, Some("/usr/bin/curl")).human();
         assert!(line.contains("2606:4700::6441  port 443"), "{line}");
+    }
+
+    /// A refusal is a connection that did not happen, and the line has to read as one.
+    #[test]
+    fn a_refused_connection_is_reported_as_refused() {
+        let mut event = flowlight_common::block::BlockEvent {
+            tgid: 4711,
+            pid: 4711,
+            family: AF_INET,
+            address: ipv4_bytes([93, 184, 216, 34]),
+            port: 443,
+            ..flowlight_common::block::BlockEvent::zeroed()
+        };
+        event.comm[..4].copy_from_slice(b"curl");
+        let record = Record::refused(&event, Some("/usr/bin/curl"));
+        assert!(record.blocked);
+        assert_eq!(record.process, "curl");
+        assert_eq!(record.port, 443);
+        assert!(record.human().contains("⊘"), "{}", record.human());
+        assert!(record.stored(0).blocked);
+
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains(r#""blocked":true"#), "{json}");
     }
 
     #[test]

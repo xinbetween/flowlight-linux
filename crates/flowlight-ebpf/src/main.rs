@@ -1,9 +1,10 @@
 //! The eBPF programs Flowlight loads into the kernel.
 //!
-//! Two things, and they are independent of each other. [`attribution`] answers which process opened which
+//! Three things, and they are independent of each other. [`attribution`] answers which process opened which
 //! connection, from a tracepoint on the socket path. [`tls`] answers what was actually sent, from uprobes on
 //! the TLS library — before the encryption, which is why it needs no certificate and no trust store and
-//! cannot be defeated by pinning.
+//! cannot be defeated by pinning. [`block`] refuses a connection before the SYN, from a hook inside
+//! `connect()` — which needs neither of the other two and is not needed by them.
 //!
 //! Everything in here runs under the kernel's verifier, which is a stricter reviewer than any person: it
 //! rejects unbounded loops, unbounded memory access, and reads it cannot prove are in range. Code that looks
@@ -19,6 +20,7 @@
 )]
 
 mod attribution;
+mod block;
 mod tls;
 
 /// Never reached: nothing in this program can panic, and there is nothing to unwind into if it did.

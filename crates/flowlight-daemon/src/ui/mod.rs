@@ -234,6 +234,7 @@ struct CoverageView {
     undecodable: i64,
     named_by_comm: i64,
     named_by_pid: i64,
+    refused: i64,
     dropped: i64,
     unread: Vec<UnreadView>,
     unprobed: Vec<UnprobedView>,
@@ -372,6 +373,7 @@ fn coverage(database: &Path, query: &str) -> Result<String> {
         undecodable: coverage.undecodable,
         named_by_comm: coverage.named_by_comm,
         named_by_pid: coverage.named_by_pid,
+        refused: coverage.refused,
         dropped: coverage.dropped,
         unread: coverage
             .unread
