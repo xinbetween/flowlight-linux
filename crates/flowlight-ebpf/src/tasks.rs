@@ -14,18 +14,20 @@
 
 use aya_ebpf::{
     macros::{map, tracepoint},
-    maps::{Array, LruHashMap},
+    maps::{Array, HashMap},
     programs::TracePointContext,
 };
 use flowlight_common::connection::TaskLayout;
 
 /// Which agent each process is working for, as an identifier userspace assigns.
 ///
-/// Least-recently-used rather than a plain hash: a machine forks constantly, and a map that filled up would
-/// stop marking new children — silently, and exactly when the machine is busiest. Eviction under pressure
-/// loses the oldest mark, which is the least likely to matter.
+/// A plain hash rather than a least-recently-used one. The LRU variant looks like the careful choice — a
+/// machine forks constantly, and a map that fills up stops marking children — but only processes descended
+/// from an agent are ever in here, the exit tracepoint takes each one out again, and twenty thousand of
+/// those at once is not a machine anybody has. What the LRU variant bought was eviction nobody needed, at
+/// the cost of being the one map in this object whose writes were not already known to work.
 #[map]
-pub static PID_AGENT: LruHashMap<u32, u32> = LruHashMap::with_max_entries(20480, 0);
+pub static PID_AGENT: HashMap<u32, u32> = HashMap::with_max_entries(20480, 0);
 
 /// Where the scheduler's tracepoints keep their fields on this kernel.
 #[map]
@@ -37,7 +39,7 @@ static TASK_LAYOUT: Array<TaskLayout> = Array::with_max_entries(1, 0);
 /// an agent-scoped rule failed to bite because the agent was not recognised, or because the propagation
 /// that is supposed to reach its children never ran. Without them the two look identical from outside.
 #[map]
-pub static FORK_COUNTS: Array<u64> = Array::with_max_entries(5, 0);
+pub static FORK_COUNTS: Array<u64> = Array::with_max_entries(6, 0);
 
 /// Index of the count of forks seen.
 pub const FORKS_SEEN: u32 = 0;
@@ -55,6 +57,11 @@ pub const LAST_PARENT: u32 = 3;
 /// Zero forever means no fork ever had a marked parent, which is a different problem from the reads being
 /// wrong — and the two are indistinguishable without it.
 pub const LAST_PARENT_FOUND: u32 = 4;
+/// Index of the last error returned by an attempt to mark a child.
+///
+/// Marking was counted before this, and counted whether or not it worked, because the result was thrown
+/// away. A number that is counted and an action that happened are not the same thing.
+pub const LAST_INSERT_ERROR: u32 = 5;
 
 /// Adds one to a counter, as far as the verifier is concerned safely.
 fn bump(index: u32) {
@@ -99,8 +106,12 @@ fn on_fork(ctx: &TracePointContext) -> Result<(), i64> {
     record(LAST_PARENT_FOUND, u64::from(parent));
     // A full map means this child goes unmarked, which means an agent-scoped rule does not reach it. That
     // is a hole, and 0.2.x's Coverage is where holes are reported rather than papered over.
-    let _ = PID_AGENT.insert(&child, &agent, 0);
-    bump(MARKS_COPIED);
+    match PID_AGENT.insert(&child, &agent, 0) {
+        Ok(()) => bump(MARKS_COPIED),
+        // A full map means this child goes unmarked, which means an agent-scoped rule does not reach it.
+        // That is a hole, and a hole is worth a number.
+        Err(error) => record(LAST_INSERT_ERROR, error.unsigned_abs().into()),
+    }
     Ok(())
 }
 

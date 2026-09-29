@@ -73,6 +73,8 @@ pub struct Propagation {
     pub last_parent_found: u64,
     /// Processes the kernel currently holds a mark for.
     pub held: usize,
+    /// The last error an attempt to mark a child returned, as a positive errno.
+    pub last_error: u64,
 }
 
 /// Keeps the kernel's table matching the rules, and its marks matching the processes.
@@ -151,6 +153,7 @@ impl Blocking {
             layout_ready: at(2),
             last_parent: at(3),
             last_parent_found: at(4),
+            last_error: at(5),
             held: self.marked(),
         }
     }

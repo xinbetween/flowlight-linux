@@ -511,13 +511,14 @@ fn run(
             if propagation != last_propagation {
                 eprintln!(
                     "forks {}, layout ready {}, marks copied {}, last parent {}, last marked parent {}, \
-                     marks held {}",
+                     marks held {}, last marking error {}",
                     propagation.forks,
                     propagation.layout_ready,
                     propagation.copied,
                     propagation.last_parent,
                     propagation.last_parent_found,
-                    propagation.held
+                    propagation.held,
+                    propagation.last_error
                 );
                 last_propagation = propagation;
             }
