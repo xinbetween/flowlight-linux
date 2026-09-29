@@ -150,6 +150,19 @@ if curl -sS --max-time 8 "https://$blocked_address/" -o /dev/null 2>/dev/null; t
 
     # `sleep 3` because an agent is noticed by a scan that runs once a second, and this one would otherwise
     # be gone before it was ever seen. A real agent is long-lived; this one is a copy of /bin/sh.
+    #
+    # Two shapes, and they fail for different reasons, so they are asked separately. `exec` replaces the
+    # shell with curl and keeps the process identifier, so this asks only whether the mark and the lookup
+    # work.
+    if [ "$agent_tested" = yes ] \
+        && "$fake_agent" -c "sleep 3; exec curl -sS --max-time 8 https://$blocked_address/ -o /dev/null" \
+            2>/dev/null; then
+        fail "a connection from the agent's own process was not refused."
+    fi
+    echo "OK: a connection from the agent itself was refused"
+
+    # And this one forks, so it asks the other question: whether the mark reached a child that the kernel
+    # had to copy it to.
     if [ "$agent_tested" = yes ] \
         && "$fake_agent" -c "sleep 3; curl -sS --max-time 8 https://$blocked_address/ -o /dev/null; :" \
             2>/dev/null; then
