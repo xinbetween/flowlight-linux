@@ -414,13 +414,24 @@ mod tests {
     fn a_hole_through_a_header_block_makes_the_connection_unreadable() {
         let mut connections = Connections::default();
         let mut encoder = Encoder::new();
-        let block = encoder.encode([(b":method".as_slice(), b"POST".as_slice())]);
-        let frame = frame(FRAME_HEADERS, FLAG_END_HEADERS, 1, &block);
+        // Long literal values, so the block is bigger than a capture can be cut to. `:method: POST` alone
+        // would not do: it is one static-table byte, and a frame of ten bytes cannot be truncated to ten.
+        let block = encoder.encode([
+            (b":method".as_slice(), b"POST".as_slice()),
+            (b":path", b"/v1/messages?a-long-enough-query-to-matter=1"),
+            (b":authority", b"api.anthropic.com"),
+            (
+                b"user-agent",
+                b"a fairly long user agent string, as they are",
+            ),
+        ]);
+        let bytes = frame(FRAME_HEADERS, FLAG_END_HEADERS, 1, &block);
+        assert!(bytes.len() > 40, "the fixture must be long enough to cut");
 
-        // Only the first few bytes captured, the rest of the frame reported as missing.
-        let mut cut = chunk(1, &frame);
-        cut.len = 10;
-        cut.total = frame.len() as u32;
+        // Only the first twenty bytes captured, the rest of the frame reported as missing.
+        let mut cut = chunk(1, &bytes);
+        cut.len = 20;
+        cut.total = bytes.len() as u32;
         let events = connections.feed(&cut);
         assert!(
             events.iter().any(|e| matches!(e, Event::Unreadable(_))),
