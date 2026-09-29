@@ -1,17 +1,30 @@
 [workspace]
 resolver = "3"
-members = ["crates/flowlight-common"]
+members = ["crates/flowlight-common", "crates/flowlight-daemon", "crates/flowlight-ebpf"]
 
-# The eBPF programs and the daemon that loads them join this list once there is something to load. They only
-# build on Linux, and adding them before then would mean a workspace that cannot be checked on the machine most
-# of this is being written on — which is how unverified code gets committed.
+# Only the crate that builds anywhere is a default member. `flowlight-ebpf` compiles for
+# `bpfel-unknown-none` alone, and `flowlight-daemon` builds it and links aya, so both need a Linux host. A
+# bare `cargo test` should therefore run the tests the machine in front of you can actually run; CI names the
+# whole workspace explicitly, on Linux, which is the only place any of this runs.
+default-members = ["crates/flowlight-common"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/xinbetween/flowlight-linux"
-rust-version = "1.85"
+# aya-build sets the floor here; nothing in our own code needs anything this recent.
+rust-version = "1.87"
+
+[workspace.dependencies]
+flowlight-common = { path = "crates/flowlight-common", default-features = false }
+aya = "0.14"
+aya-build = "0.2"
+aya-ebpf = "0.2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -24,3 +37,11 @@ unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
 indexing_slicing = "deny"
+
+# The eBPF programs are built by aya-build as a separate cargo invocation, and they are built in release even
+# when the daemon is not: the verifier rejects the debug build's stack usage and unrolled bounds checks long
+# before it rejects anything we wrote.
+[profile.dev.package.flowlight-ebpf]
+opt-level = 3
+debug = false
+overflow-checks = false

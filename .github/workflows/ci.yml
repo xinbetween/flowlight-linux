@@ -21,6 +21,10 @@ env:
   CARGO_TERM_COLOR: always
   # A warning that nobody has to act on is a warning everybody learns to scroll past.
   RUSTFLAGS: -D warnings
+  # Pinned, with its hash. The linker turns our code into the bytecode the kernel's verifier judges, so a new
+  # one arriving unannounced would change what the verifier sees without anything in this repository changing.
+  BPF_LINKER_VERSION: "0.11.1"
+  BPF_LINKER_SHA256: "e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8"
 
 jobs:
   check:
@@ -35,18 +39,36 @@ jobs:
           set -euo pipefail
           rustup toolchain install stable --profile minimal --component clippy,rustfmt
           rustup default stable
+          # The BPF target has no prebuilt `core`, so it is compiled from source, which is nightly-only.
+          rustup toolchain install nightly --profile minimal --component rust-src
           rustc --version && cargo --version
 
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
 
+      # The prebuilt binary rather than `cargo install`: building it from source means building against a
+      # matching LLVM, which means installing one, which is ten minutes of CI for a tool that does not change.
+      - name: Install bpf-linker
+        run: |
+          set -euo pipefail
+          url="https://github.com/aya-rs/bpf-linker/releases/download/v${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          curl -fsSL -o /tmp/bpf-linker.tar.zst "$url"
+          echo "${BPF_LINKER_SHA256}  /tmp/bpf-linker.tar.zst" | sha256sum --check --strict
+          mkdir -p "$HOME/.local/bin"
+          tar -xpf /tmp/bpf-linker.tar.zst -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/bpf-linker" --version
+
       - name: Formatting
         run: cargo fmt --all --check
 
+      # `flowlight-ebpf` is excluded from the host-target commands and checked by being compiled for the BPF
+      # target as part of the daemon's build script. Linting it here would mean linting it for x86_64, which
+      # is not a target it has a meaning on.
       - name: Clippy
-        run: cargo clippy --all-targets --all-features
+        run: cargo clippy --workspace --exclude flowlight-ebpf --all-targets --all-features
 
       - name: Tests
-        run: cargo test --all-features
+        run: cargo test --workspace --exclude flowlight-ebpf --all-features
 
       # The kernel this runs on, recorded in the log. When a probe later fails to attach, the first question is
       # always which kernel it was, and a run from six months ago cannot be asked afterwards.
@@ -55,3 +77,14 @@ jobs:
           uname -srm
           echo "unprivileged_bpf_disabled: $(cat /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null || echo 'unreadable')"
           test -d /sys/fs/bpf && echo "bpffs: mounted" || echo "bpffs: absent"
+          echo "--- sock/inet_sock_set_state layout on this kernel:"
+          sudo cat /sys/kernel/tracing/events/sock/inet_sock_set_state/format 2>/dev/null \
+            || sudo cat /sys/kernel/debug/tracing/events/sock/inet_sock_set_state/format
+
+      - name: Build the daemon
+        run: cargo build --release --package flowlight-daemon
+
+      # The part that cannot be faked. Loads the program into a real kernel, attaches it, makes a real
+      # connection, and insists on finding it — with the right process name and the right port.
+      - name: Attribute a real connection
+        run: ./scripts/smoke.sh target/release/flowlightd
