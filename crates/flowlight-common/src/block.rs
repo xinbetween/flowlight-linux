@@ -49,6 +49,12 @@ pub const EVERYONE: u32 = 0;
 /// A rule that applies whatever port was asked for.
 pub const ANY_PORT: u16 = 0;
 
+/// A rule that applies whatever address was asked for.
+///
+/// `AF_UNSPEC`, which is never a real family, with an address of nothing. `block *` for an agent cannot be
+/// written as a set of addresses — there is no set — so it is written as this instead.
+pub const ANY_FAMILY: u16 = 0;
+
 impl BlockKey {
     /// A rule for one address and port.
     pub const fn new(agent: u32, family: u16, address: [u8; 16], port: u16) -> Self {
@@ -60,14 +66,21 @@ impl BlockKey {
         }
     }
 
-    /// The same rule with the port removed, which is how the kernel asks its second question.
-    ///
-    /// Two lookups rather than one: a rule naming a port is more specific than one that does not, and the
-    /// alternative — iterating the table — is not something a BPF program may do.
+    /// The same key with the port removed.
     pub const fn any_port(&self) -> Self {
         Self {
             port: ANY_PORT,
             ..*self
+        }
+    }
+
+    /// The key for "anything at all", for one agent and one port.
+    pub const fn anything(agent: u32, port: u16) -> Self {
+        Self {
+            agent,
+            family: ANY_FAMILY,
+            port,
+            address: [0; 16],
         }
     }
 }
@@ -141,6 +154,20 @@ mod tests {
     fn the_wire_types_are_the_size_both_sides_agree_on() {
         assert_eq!(size_of::<BlockKey>(), 24);
         assert_eq!(size_of::<BlockEvent>(), 48);
+    }
+
+    /// `block *` for an agent cannot be written as a set of addresses, because there is no set.
+    #[test]
+    fn anything_is_a_key_of_its_own() {
+        let anything = BlockKey::anything(7, 443);
+        assert_eq!(anything.family, ANY_FAMILY);
+        assert_eq!(anything.address, [0; 16]);
+        assert_eq!(anything.agent, 7);
+        // And it cannot collide with a real address, because no address has family zero.
+        assert_ne!(
+            anything,
+            BlockKey::new(7, AF_INET, ipv4_bytes([0, 0, 0, 0]), 443)
+        );
     }
 
     /// A rule naming a port and a rule naming none are different rules, and the kernel asks for both.

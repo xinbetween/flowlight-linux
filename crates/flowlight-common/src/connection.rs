@@ -372,6 +372,39 @@ mod tests {
         assert!(Layout::from_format(&Format::new(&odd)).is_err());
     }
 
+    const FORK: &str = "\
+	field:char parent_comm[16];	offset:8;	size:16;	signed:0;
+	field:pid_t parent_pid;	offset:24;	size:4;	signed:1;
+	field:char child_comm[16];	offset:28;	size:16;	signed:0;
+	field:pid_t child_pid;	offset:44;	size:4;	signed:1;
+";
+
+    const EXIT: &str = "\
+	field:char comm[16];	offset:8;	size:16;	signed:0;
+	field:pid_t pid;	offset:24;	size:4;	signed:1;
+	field:int prio;	offset:28;	size:4;	signed:1;
+";
+
+    #[test]
+    fn the_scheduler_tracepoints_are_read_the_same_way_as_the_socket_one() {
+        let layout = TaskLayout::from_formats(&Format::new(FORK), &Format::new(EXIT)).unwrap();
+        assert_eq!(layout.fork_parent, 24);
+        assert_eq!(layout.fork_child, 44);
+        assert_eq!(layout.exit_pid, 24);
+    }
+
+    /// A kernel without the field is a kernel that cannot do this, and saying so beats reading offset zero.
+    #[test]
+    fn a_scheduler_tracepoint_missing_a_field_is_refused_by_name() {
+        let err = TaskLayout::from_formats(&Format::new(""), &Format::new(EXIT)).unwrap_err();
+        assert_eq!(
+            err,
+            LayoutError::Missing {
+                field: "parent_pid"
+            }
+        );
+    }
+
     // The transition
 
     #[test]
@@ -468,3 +501,36 @@ mod tests {
         assert_eq!(ev.destination(), None);
     }
 }
+
+/// Where the scheduler's fork and exit tracepoints keep the fields this needs.
+///
+/// Read from the kernel's own `format` files, like [`Layout`], and for the same reason: these offsets have
+/// moved before and the cost of assuming is a program that reads plausible wrong numbers in silence.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TaskLayout {
+    /// `sched_process_fork`'s `parent_pid`.
+    pub fork_parent: u16,
+    /// `sched_process_fork`'s `child_pid`.
+    pub fork_child: u16,
+    /// `sched_process_exit`'s `pid`.
+    pub exit_pid: u16,
+    /// Unused, and present so the struct's size is a decision rather than a consequence.
+    pub reserved: u16,
+}
+
+impl TaskLayout {
+    /// Derives the layout from the two `format` files, which are read separately and belong together.
+    pub fn from_formats(fork: &Format<'_>, exit: &Format<'_>) -> Result<Self, LayoutError> {
+        Ok(Self {
+            fork_parent: offset_of(fork, "parent_pid", 4)?,
+            fork_child: offset_of(fork, "child_pid", 4)?,
+            exit_pid: offset_of(exit, "pid", 4)?,
+            reserved: 0,
+        })
+    }
+}
+
+#[cfg(feature = "user")]
+// SAFETY: `#[repr(C)]` and four integers.
+unsafe impl aya::Pod for TaskLayout {}

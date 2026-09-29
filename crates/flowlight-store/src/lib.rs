@@ -130,19 +130,34 @@ pub struct ProcessRow {
     pub last_seen: i64,
 }
 
-/// A rule: something a process may not reach.
+/// A rule: what to do about something a process tries to reach.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleRow {
+    /// Its identifier, so a verdict can name the rule that produced it and `forget` can take it away.
+    pub id: i64,
     /// When it was written.
     pub created: i64,
-    /// A hostname, or a literal address.
+    /// `allow`, `ask` or `block`.
+    pub action: String,
+    /// A hostname, a pattern, a literal address, or `*`.
     pub subject: String,
     /// The port, or zero for every port.
     pub port: u16,
-    /// `global` for now. Per-agent scope is the next release.
+    /// `everyone`, or `agent:<name>`.
     pub scope: String,
     /// Why, if whoever wrote it said.
     pub note: Option<String>,
+}
+
+/// What writing a rule did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wrote {
+    /// There was no such rule.
+    Added,
+    /// There was one, saying something else.
+    Changed,
+    /// There was one, saying exactly this.
+    Unchanged,
 }
 
 /// One agent, and what it has been doing.
@@ -345,7 +360,7 @@ impl Store {
     }
 
     /// The schema this version of the code expects.
-    pub const SCHEMA: i64 = 3;
+    pub const SCHEMA: i64 = 4;
 
     /// Creates the schema, or brings an older one up to it.
     ///
@@ -406,6 +421,7 @@ impl Store {
                 port    INTEGER NOT NULL,
                 scope   TEXT    NOT NULL,
                 note    TEXT,
+                action  TEXT    NOT NULL DEFAULT 'block',
                 UNIQUE (subject, port, scope)
             );
             CREATE TABLE IF NOT EXISTS notes (
@@ -433,6 +449,8 @@ impl Store {
             ("requests", "agent", "TEXT"),
             ("connections", "agent", "TEXT"),
             ("connections", "blocked", "INTEGER NOT NULL DEFAULT 0"),
+            // Schema 3 is 0.2.0, where every rule was a block and every scope was global.
+            ("rules", "action", "TEXT NOT NULL DEFAULT 'block'"),
         ] {
             if !self.has_column(table, column)? {
                 self.connection
@@ -808,47 +826,64 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Writes a rule, or leaves an identical one alone.
+    /// Writes a rule, replacing whatever was said about the same subject, port and scope.
     ///
-    /// Returns whether anything changed, so that `block` on something already blocked says so rather than
-    /// implying it has just done something.
-    pub fn add_rule(
+    /// Replacing rather than adding, because `allow x` after `block x` is somebody changing their mind
+    /// about `x` — and leaving both would make it a contradiction, resolved conservatively, which is the
+    /// opposite of what they just asked for.
+    pub fn put_rule(
         &mut self,
+        action: &str,
         subject: &str,
         port: u16,
         scope: &str,
         note: Option<&str>,
-    ) -> Result<bool> {
-        let changed = self.connection.execute(
-            "INSERT INTO rules(created, subject, port, scope, note)
-             VALUES (unixepoch(), ?1, ?2, ?3, ?4)
-             ON CONFLICT(subject, port, scope) DO NOTHING",
-            params![subject, port, scope, note],
+    ) -> Result<Wrote> {
+        let existing: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT action FROM rules WHERE subject = ?1 AND port = ?2 AND scope = ?3",
+                params![subject, port, scope],
+                |row| row.get(0),
+            )
+            .optional()?;
+        self.connection.execute(
+            "INSERT INTO rules(created, action, subject, port, scope, note)
+             VALUES (unixepoch(), ?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(subject, port, scope) DO UPDATE
+               SET action = excluded.action, note = excluded.note, created = excluded.created",
+            params![action, subject, port, scope, note],
         )?;
-        Ok(changed > 0)
+        Ok(match existing {
+            None => Wrote::Added,
+            Some(previous) if previous == action => Wrote::Unchanged,
+            Some(_) => Wrote::Changed,
+        })
     }
 
-    /// Removes a rule. Returns whether there was one.
-    pub fn remove_rule(&mut self, subject: &str, port: u16, scope: &str) -> Result<bool> {
-        let removed = self.connection.execute(
-            "DELETE FROM rules WHERE subject = ?1 AND port = ?2 AND scope = ?3",
-            params![subject, port, scope],
-        )?;
-        Ok(removed > 0)
+    /// Removes one rule by its identifier. Returns whether there was one.
+    pub fn forget_rule(&mut self, id: i64) -> Result<bool> {
+        Ok(self
+            .connection
+            .execute("DELETE FROM rules WHERE id = ?1", params![id])?
+            > 0)
     }
 
     /// Every rule, oldest first.
     pub fn rules(&mut self) -> Result<Vec<RuleRow>> {
         let mut statement = self.connection.prepare(
-            "SELECT created, subject, port, scope, note FROM rules ORDER BY created, subject",
+            "SELECT id, created, action, subject, port, scope, note FROM rules
+             ORDER BY created, subject",
         )?;
         let rows = statement.query_map([], |row| {
             Ok(RuleRow {
-                created: row.get(0)?,
-                subject: row.get(1)?,
-                port: row.get(2)?,
-                scope: row.get(3)?,
-                note: row.get(4)?,
+                id: row.get(0)?,
+                created: row.get(1)?,
+                action: row.get(2)?,
+                subject: row.get(3)?,
+                port: row.get(4)?,
+                scope: row.get(5)?,
+                note: row.get(6)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1536,43 +1571,83 @@ mod tests {
     #[test]
     fn a_rule_written_is_a_rule_read_back() {
         let mut store = Store::in_memory().unwrap();
-        assert!(
+        assert_eq!(
             store
-                .add_rule("example.com", 443, "global", Some("noisy"))
-                .unwrap()
+                .put_rule("block", "example.com", 443, "everyone", Some("noisy"))
+                .unwrap(),
+            Wrote::Added
         );
         let rules = store.rules().unwrap();
         assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].action, "block");
         assert_eq!(rules[0].subject, "example.com");
         assert_eq!(rules[0].port, 443);
         assert_eq!(rules[0].note.as_deref(), Some("noisy"));
     }
 
-    /// Blocking something already blocked has done nothing, and saying otherwise teaches somebody that the
+    /// `allow x` after `block x` is somebody changing their mind about `x`. Keeping both would make it a
+    /// contradiction, resolved conservatively, which is the opposite of what they just asked for.
+    #[test]
+    fn writing_a_different_answer_for_the_same_thing_replaces_it() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .put_rule("block", "example.com", 0, "everyone", None)
+            .unwrap();
+        assert_eq!(
+            store
+                .put_rule("allow", "example.com", 0, "everyone", None)
+                .unwrap(),
+            Wrote::Changed
+        );
+        let rules = store.rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].action, "allow");
+    }
+
+    /// Writing the same thing twice has done nothing, and saying otherwise teaches somebody that the
     /// command's output means nothing.
     #[test]
     fn writing_the_same_rule_twice_changes_nothing_and_says_so() {
         let mut store = Store::in_memory().unwrap();
-        assert!(store.add_rule("example.com", 443, "global", None).unwrap());
-        assert!(!store.add_rule("example.com", 443, "global", None).unwrap());
+        store
+            .put_rule("block", "example.com", 443, "everyone", None)
+            .unwrap();
+        assert_eq!(
+            store
+                .put_rule("block", "example.com", 443, "everyone", None)
+                .unwrap(),
+            Wrote::Unchanged
+        );
         assert_eq!(store.rules().unwrap().len(), 1);
     }
 
-    /// A rule for one port and a rule for every port are different rules.
+    /// A rule for one port, a rule for every port, and a rule for one agent are three different rules
+    /// about the same host.
     #[test]
-    fn a_rule_for_every_port_is_not_the_same_rule() {
+    fn scope_and_port_make_rules_distinct() {
         let mut store = Store::in_memory().unwrap();
-        store.add_rule("example.com", 443, "global", None).unwrap();
-        store.add_rule("example.com", 0, "global", None).unwrap();
-        assert_eq!(store.rules().unwrap().len(), 2);
-        assert!(store.remove_rule("example.com", 443, "global").unwrap());
-        assert_eq!(store.rules().unwrap().len(), 1);
+        store
+            .put_rule("block", "example.com", 443, "everyone", None)
+            .unwrap();
+        store
+            .put_rule("block", "example.com", 0, "everyone", None)
+            .unwrap();
+        store
+            .put_rule("allow", "example.com", 0, "agent:claude", None)
+            .unwrap();
+        assert_eq!(store.rules().unwrap().len(), 3);
     }
 
     #[test]
-    fn removing_a_rule_that_is_not_there_says_so() {
+    fn a_rule_can_be_taken_away_by_its_identifier() {
         let mut store = Store::in_memory().unwrap();
-        assert!(!store.remove_rule("example.com", 443, "global").unwrap());
+        store
+            .put_rule("block", "example.com", 443, "everyone", None)
+            .unwrap();
+        let id = store.rules().unwrap()[0].id;
+        assert!(store.forget_rule(id).unwrap());
+        assert!(!store.forget_rule(id).unwrap());
+        assert!(store.rules().unwrap().is_empty());
     }
 
     /// A refusal is a connection that did not happen, and the record of it is the only evidence there is.

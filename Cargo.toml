@@ -5,6 +5,7 @@ members = [
     "crates/flowlight-common",
     "crates/flowlight-daemon",
     "crates/flowlight-ebpf",
+    "crates/flowlight-rules",
     "crates/flowlight-store",
 ]
 
@@ -15,11 +16,12 @@ members = [
 default-members = [
     "crates/flowlight-agents",
     "crates/flowlight-common",
+    "crates/flowlight-rules",
     "crates/flowlight-store",
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/xinbetween/flowlight-linux"
@@ -29,6 +31,7 @@ rust-version = "1.87"
 [workspace.dependencies]
 flowlight-common = { path = "crates/flowlight-common", default-features = false }
 flowlight-agents = { path = "crates/flowlight-agents" }
+flowlight-rules = { path = "crates/flowlight-rules" }
 flowlight-store = { path = "crates/flowlight-store" }
 aya = "0.14"
 aya-build = "0.2"

@@ -1,8 +1,9 @@
-//! Turning rules into the two hash lookups the kernel does.
+//! Turning rules into the table the kernel consults, and telling the kernel who is who.
 //!
-//! The kernel's side of blocking is deliberately stupid: two map lookups inside `connect()`. Everything
-//! that requires thought happens here, in userspace, where being slow costs nothing and being wrong can be
-//! corrected on the next pass.
+//! [`flowlight_rules`] decides what the rules mean and in what order the kernel should ask its questions.
+//! This resolves the names, writes the answers in, and keeps the kernel's idea of which process belongs to
+//! which agent current. Being slow here costs nothing and being wrong can be corrected on the next pass,
+//! which is exactly the opposite of the program on the other side of the map.
 //!
 //! # The hard part is that a rule names a host and the kernel sees an address
 //!
@@ -15,18 +16,16 @@
 //! names are re-resolved on a timer; and a block on a shared address is a block on everything at that
 //! address. Neither is solvable at this layer, and pretending otherwise would be worse than saying so.
 
-use aya::maps::{HashMap as BpfHashMap, MapData};
-use flowlight_common::block::{BlockKey, EVERYONE};
+use aya::maps::{Array, HashMap as BpfHashMap, MapData};
+use flowlight_common::block::{ANY_PORT, BlockKey, EVERYONE};
 use flowlight_common::connection::{AF_INET, AF_INET6, ipv4_bytes};
+use flowlight_rules::{Action, KeySpec, Rule, Scope, Subject, table};
 use flowlight_store::RuleRow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, ToSocketAddrs as _};
 use std::time::{Duration, Instant};
 
 /// How long a name's addresses are trusted before it is looked up again.
-///
-/// Short enough that a host moving is noticed within a minute, long enough that a machine with fifty rules
-/// is not a machine making fifty lookups every two seconds.
 const RESOLVED_FOR: Duration = Duration::from_secs(60);
 
 /// The port used when asking the resolver, discarded afterwards. Zero is refused by some resolvers and
@@ -36,84 +35,228 @@ const RESOLVER_PORT: u16 = 443;
 /// What a pass over the rules did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Report {
-    /// Addresses newly refused.
+    /// Keys newly written.
     pub added: usize,
-    /// Addresses no longer refused.
+    /// Keys taken away.
     pub removed: usize,
     /// Rules whose subject could not be resolved, which are rules that are not in force.
     pub unresolved: Vec<String>,
+    /// Rules that cannot be enforced before the handshake at all, by their identifiers.
+    pub unenforceable: Vec<i64>,
+    /// Rows the database holds that this version does not understand.
+    pub unreadable: Vec<i64>,
 }
 
 impl Report {
     /// Whether anything happened worth a line.
     pub fn is_quiet(&self) -> bool {
-        self.added == 0 && self.removed == 0 && self.unresolved.is_empty()
+        self.added == 0
+            && self.removed == 0
+            && self.unresolved.is_empty()
+            && self.unenforceable.is_empty()
+            && self.unreadable.is_empty()
     }
 }
 
-/// Keeps the kernel's table matching the rules.
+/// What the fork tracepoint has been doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Propagation {
+    /// Forks the kernel saw.
+    pub forks: u64,
+    /// Marks carried to a child.
+    pub copied: u64,
+}
+
+/// Keeps the kernel's table matching the rules, and its marks matching the processes.
 pub struct Blocking {
-    blocked: BpfHashMap<MapData, BlockKey, u8>,
-    installed: BTreeSet<BlockKey>,
+    verdicts: BpfHashMap<MapData, BlockKey, u8>,
+    marks: BpfHashMap<MapData, u32, u32>,
+    counts: Array<MapData, u64>,
+    installed: BTreeMap<BlockKey, u8>,
     resolved: HashMap<String, (Vec<IpAddr>, Instant)>,
     /// Subjects whose failure to resolve has already been said out loud.
     complained: BTreeSet<String>,
+    /// Identifiers handed to agents, so the kernel can compare a number instead of a name.
+    identities: HashMap<String, u32>,
+    /// Which process identifiers have been marked, and with what.
+    marked: HashMap<u32, u32>,
 }
 
 impl Blocking {
-    /// Takes ownership of the kernel's table.
-    pub fn new(blocked: BpfHashMap<MapData, BlockKey, u8>) -> Self {
+    /// Takes ownership of the two maps.
+    pub fn new(
+        verdicts: BpfHashMap<MapData, BlockKey, u8>,
+        marks: BpfHashMap<MapData, u32, u32>,
+        counts: Array<MapData, u64>,
+    ) -> Self {
         Self {
-            blocked,
-            installed: BTreeSet::new(),
+            verdicts,
+            marks,
+            counts,
+            installed: BTreeMap::new(),
             resolved: HashMap::new(),
             complained: BTreeSet::new(),
+            identities: HashMap::new(),
+            marked: HashMap::new(),
         }
     }
 
-    /// Makes the kernel's table say what the rules say.
-    pub fn apply(&mut self, rules: &[RuleRow]) -> Report {
-        let mut report = Report::default();
-        let mut desired = BTreeSet::new();
+    /// The number this agent is known by in the kernel, assigning one if it has none.
+    ///
+    /// Identifiers start at one, because zero means everyone.
+    fn identity(&mut self, agent: &str) -> u32 {
+        let next = self.identities.len() as u32 + 1;
+        *self
+            .identities
+            .entry(agent.to_owned())
+            .or_insert_with(|| next)
+    }
 
-        for rule in rules {
-            // 0.2.0 has one scope. An unknown one is skipped rather than guessed at: a rule whose meaning
-            // this version does not know is a rule it must not enforce as though it did.
-            if rule.scope != "global" {
-                continue;
+    /// Tells the kernel that this process is working for this agent.
+    ///
+    /// Only the agents themselves are marked here. Everything they start is marked by the fork tracepoint,
+    /// in the kernel, because a child can connect before anything in userspace has noticed it exists.
+    pub fn mark(&mut self, pid: u32, agent: &str) -> bool {
+        let identity = self.identity(agent);
+        if self.marked.get(&pid) == Some(&identity) {
+            return false;
+        }
+        match self.marks.insert(pid, identity, 0) {
+            Ok(()) => {
+                self.marked.insert(pid, identity);
+                true
             }
-            match self.addresses_for(&rule.subject) {
-                Some(addresses) => {
-                    for address in addresses {
-                        desired.insert(key_for(address, rule.port));
-                    }
-                }
-                None => {
-                    if self.complained.insert(rule.subject.clone()) {
-                        report.unresolved.push(rule.subject.clone());
-                    }
-                }
+            Err(_) => false,
+        }
+    }
+
+    /// Forks the kernel saw, and marks it carried to a child.
+    ///
+    /// Answers a question nothing else can: whether an agent-scoped rule failed to bite because the agent
+    /// was never recognised, or because the propagation that reaches its children never ran. From outside
+    /// those look identical.
+    pub fn propagation(&self) -> Propagation {
+        Propagation {
+            forks: self.counts.get(&0, 0).unwrap_or(0),
+            copied: self.counts.get(&1, 0).unwrap_or(0),
+        }
+    }
+
+    /// Marks every agent currently running.
+    ///
+    /// Called on a timer. An agent is a long-lived process, so noticing it a second after it starts is
+    /// fine; its children are another matter entirely, and they are marked in the kernel at fork.
+    ///
+    /// Marks are never taken *out* of the kernel here. An earlier version did, for any process a scan did
+    /// not find — and a scan can fail to find a running process for a dozen uninteresting reasons, because
+    /// `/proc` is a directory being read while the machine changes underneath it. One unlucky scan removed
+    /// a live agent's mark, and the next thing it forked was unmarked and reached what a rule said it
+    /// should not. The kernel's own exit tracepoint removes a mark when the process it belongs to ends,
+    /// which is the only event that actually means what removing a mark means.
+    pub fn mark_all(&mut self, running: &[(u32, String)]) -> Vec<(u32, String)> {
+        let present: BTreeSet<u32> = running.iter().map(|(pid, _)| *pid).collect();
+        let mut newly = Vec::new();
+        for (pid, agent) in running {
+            if self.mark(*pid, agent) {
+                newly.push((*pid, agent.clone()));
             }
         }
+        // Local bookkeeping only: this set exists so the same mark is not written every second, so an entry
+        // for a process that has gone is a reason to write again if its identifier comes back.
+        self.marked.retain(|pid, _| present.contains(pid));
+        newly
+    }
 
-        for key in desired.difference(&self.installed.clone()) {
-            if self.blocked.insert(key, 1, 0).is_ok() {
-                self.installed.insert(*key);
+    /// Makes the kernel's table say what the rules say.
+    pub fn apply(&mut self, rows: &[RuleRow]) -> Report {
+        let mut report = Report::default();
+        let rules = self.read(rows, &mut report);
+        let table = table(&rules);
+        report.unenforceable = table.unenforceable;
+
+        let mut desired = BTreeMap::new();
+        for key in &table.keys {
+            self.expand(key, &mut desired, &mut report);
+        }
+
+        for (key, value) in &desired {
+            if self.installed.get(key) == Some(value) {
+                continue;
+            }
+            if self.verdicts.insert(key, value, 0).is_ok() {
+                self.installed.insert(*key, *value);
                 report.added += 1;
             }
         }
-        for key in self.installed.clone().difference(&desired) {
-            // Removed from the table even if the kernel says it was not there, because the alternative is a
-            // rule that was deleted and an address that stays refused until a restart.
-            let _ = self.blocked.remove(key);
-            self.installed.remove(key);
+        let stale: Vec<BlockKey> = self
+            .installed
+            .keys()
+            .filter(|key| !desired.contains_key(*key))
+            .copied()
+            .collect();
+        for key in stale {
+            // Removed even if the kernel says it was not there, because the alternative is a rule that was
+            // deleted and an address that stays refused until a restart.
+            let _ = self.verdicts.remove(&key);
+            self.installed.remove(&key);
             report.removed += 1;
         }
 
         report
     }
 
-    /// The addresses a rule's subject currently means.
+    /// Reads the database's rows into rules, saying so about any it does not understand.
+    ///
+    /// A row whose action or scope this version does not know is left out rather than guessed at. A rule
+    /// enforced as something other than what it says is worse than a rule not enforced.
+    fn read(&self, rows: &[RuleRow], report: &mut Report) -> Vec<Rule> {
+        let mut rules = Vec::new();
+        for row in rows {
+            let (Some(action), Some(scope)) =
+                (Action::parse(&row.action), Scope::parse(&row.scope))
+            else {
+                report.unreadable.push(row.id);
+                continue;
+            };
+            rules.push(Rule {
+                id: row.id,
+                action,
+                scope,
+                subject: Subject::parse(&row.subject),
+                port: (row.port != 0).then_some(row.port),
+            });
+        }
+        rules
+    }
+
+    /// Turns one key into however many the kernel needs: one per address a name resolves to.
+    fn expand(&mut self, key: &KeySpec, desired: &mut BTreeMap<BlockKey, u8>, report: &mut Report) {
+        let agent = key
+            .agent
+            .as_deref()
+            .map_or(EVERYONE, |agent| self.identity(agent));
+        let port = key.port.unwrap_or(ANY_PORT);
+        let value = u8::from(key.action.refuses());
+
+        let Some(subject) = key.subject.as_deref() else {
+            desired.insert(BlockKey::anything(agent, port), value);
+            return;
+        };
+        match self.addresses_for(subject) {
+            Some(addresses) => {
+                for address in addresses {
+                    desired.insert(kernel_key(agent, address, port), value);
+                }
+            }
+            None => {
+                if self.complained.insert(subject.to_owned()) {
+                    report.unresolved.push(subject.to_owned());
+                }
+            }
+        }
+    }
+
+    /// The addresses a subject currently means.
     fn addresses_for(&mut self, subject: &str) -> Option<Vec<IpAddr>> {
         if let Some(address) = parse_address(subject) {
             return Some(vec![address]);
@@ -144,18 +287,17 @@ pub fn parse_address(subject: &str) -> Option<IpAddr> {
     subject.parse().ok()
 }
 
-/// The kernel's key for one address and port.
-pub fn key_for(address: IpAddr, port: u16) -> BlockKey {
+/// The kernel's key for one agent, address and port.
+pub fn kernel_key(agent: u32, address: IpAddr, port: u16) -> BlockKey {
     match address {
-        IpAddr::V4(v4) => BlockKey::new(EVERYONE, AF_INET, ipv4_bytes(v4.octets()), port),
-        IpAddr::V6(v6) => BlockKey::new(EVERYONE, AF_INET6, v6.octets(), port),
+        IpAddr::V4(v4) => BlockKey::new(agent, AF_INET, ipv4_bytes(v4.octets()), port),
+        IpAddr::V6(v6) => BlockKey::new(agent, AF_INET6, v6.octets(), port),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flowlight_common::block::ANY_PORT;
 
     #[test]
     fn a_literal_address_is_not_looked_up() {
@@ -172,35 +314,41 @@ mod tests {
     /// IPv4 address in a sixteen-byte field, and the other twelve zero.
     #[test]
     fn a_key_matches_the_shape_the_kernel_builds() {
-        let key = key_for("93.184.216.34".parse().unwrap(), 443);
+        let key = kernel_key(EVERYONE, "93.184.216.34".parse().unwrap(), 443);
         assert_eq!(key.family, AF_INET);
         assert_eq!(key.port, 443);
         assert_eq!(key.address[..4], [93, 184, 216, 34]);
         assert_eq!(key.address[4..], [0; 12]);
         assert_eq!(key.agent, EVERYONE);
 
-        let v6 = key_for("2606:4700::6441".parse().unwrap(), ANY_PORT);
+        let v6 = kernel_key(7, "2606:4700::6441".parse().unwrap(), ANY_PORT);
         assert_eq!(v6.family, AF_INET6);
-        assert_eq!(v6.port, ANY_PORT);
+        assert_eq!(v6.agent, 7);
         assert_eq!(v6.address[0], 0x26);
     }
 
     #[test]
     fn a_report_with_nothing_in_it_is_quiet() {
         assert!(Report::default().is_quiet());
-        assert!(
-            !Report {
+        for report in [
+            Report {
                 added: 1,
                 ..Report::default()
-            }
-            .is_quiet()
-        );
-        assert!(
-            !Report {
+            },
+            Report {
                 unresolved: vec!["x".to_owned()],
                 ..Report::default()
-            }
-            .is_quiet()
-        );
+            },
+            Report {
+                unenforceable: vec![1],
+                ..Report::default()
+            },
+            Report {
+                unreadable: vec![1],
+                ..Report::default()
+            },
+        ] {
+            assert!(!report.is_quiet(), "{report:?}");
+        }
     }
 }

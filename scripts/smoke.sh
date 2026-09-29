@@ -34,13 +34,16 @@ trap cleanup EXIT
 # waste of everybody's afternoon.
 fail() {
     echo "FAIL: $1" >&2
+    # The daemon reports on a timer, so the line describing the moment this failed has usually not been
+    # written yet. Waiting for one more round of it costs two seconds and saves a round trip through CI.
+    sleep 3
     echo "--- what the daemon said:" >&2
     cat "$log" >&2
     exit 1
 }
 
 echo "Watching..."
-sudo "$binary" --json --seconds 45 --database "$database" --ui 127.0.0.1:0 >"$output" 2>"$log" &
+sudo "$binary" --json --seconds 70 --database "$database" --ui 127.0.0.1:0 >"$output" 2>"$log" &
 watcher=$!
 
 # The probes are attached by the time the daemon prints its banner, but the banner goes to stderr and the
@@ -134,10 +137,54 @@ blocked_address=1.1.1.1
 block_tested=no
 if curl -sS --max-time 8 "https://$blocked_address/" -o /dev/null 2>/dev/null; then
     block_tested=yes
-    echo "Blocking $blocked_address..."
+
+    # Scoped to one agent, which is the harder half: the kernel has to know, inside connect(), that the
+    # process calling it is working for `claude`. Userspace marks the agent; the fork tracepoint marks
+    # everything it starts, before the child can run.
+    echo "Blocking $blocked_address for the agent only..."
+    sudo "$binary" --database "$database" block "$blocked_address" --port 443 --agent claude
+    sleep 4
+
+    # Everyone else is unaffected. Without this the next check would pass for the wrong reason.
+    if ! curl -sS --max-time 8 "https://$blocked_address/" -o /dev/null 2>/dev/null; then
+        fail "a rule scoped to one agent refused a connection from something else."
+    fi
+    echo "OK: a rule scoped to an agent leaves everything else alone"
+
+    # `sleep 3` because an agent is noticed by a scan that runs once a second, and this one would otherwise
+    # be gone before it was ever seen. A real agent is long-lived; this one is a copy of /bin/sh.
+    #
+    # Two shapes, and they fail for different reasons, so they are asked separately. `exec` replaces the
+    # shell with curl and keeps the process identifier, so this asks only whether the mark and the lookup
+    # work.
+    if [ "$agent_tested" = yes ] \
+        && "$fake_agent" -c "sleep 3; exec curl -sS --max-time 8 https://$blocked_address/ -o /dev/null" \
+            2>/dev/null; then
+        fail "a connection from the agent's own process was not refused."
+    fi
+    echo "OK: a connection from the agent itself was refused"
+
+    # And this one forks, so it asks the other question: whether the mark reached a child that the kernel
+    # had to copy it to.
+    # `exit $?` rather than `:` at the end. A trailing `:` stops the shell replacing itself with curl --
+    # which is the point, since this is the forking case -- but it also makes the shell exit successfully
+    # whatever curl did, so this check passed nothing on to be checked. It reported a working block as a
+    # failure for several runs.
+    if [ "$agent_tested" = yes ] \
+        && "$fake_agent" -c \
+            "sleep 3; curl -sS --max-time 8 https://$blocked_address/ -o /dev/null; exit \$?" \
+            2>/dev/null; then
+        fail "a connection from the agent's own child was not refused."
+    fi
+    echo "OK: a connection from something the agent started was refused"
+
+    sudo "$binary" --database "$database" rules
+    scoped_rule=$(sudo "$binary" --database "$database" --json rules | jq -rs '.[] | select(.scope == "agent:claude") | .id')
+    sudo "$binary" --database "$database" forget "$scoped_rule"
+
+    # And now for everyone, which is the simpler half and the one somebody will try first.
+    echo "Blocking $blocked_address for everyone..."
     sudo "$binary" --database "$database" block "$blocked_address" --port 443 --note "smoke test"
-    # The daemon reads the rules back every two seconds. This is how long a rule takes to come into force,
-    # and waiting for it is part of what is being tested.
     sleep 4
     if curl -sS --max-time 8 "https://$blocked_address/" -o /dev/null 2>/dev/null; then
         fail "a blocked address was still reachable."
@@ -295,13 +342,17 @@ if [ "$block_tested" = yes ]; then
     fi
     echo "OK: the refusal was reported, with the process that was refused"
 
-    if ! grep -q "1 connection(s) were refused" "$reported"; then
-        echo "FAIL: Coverage did not account for the refused connection." >&2
+    # A count rather than a number: there are three refusals in this file now, and an assertion that knows
+    # how many is an assertion that breaks every time one is added.
+    if ! jq -e '.refused > 0' "$coverage_json" >/dev/null; then
+        echo "FAIL: Coverage did not account for the refused connections." >&2
+        cat "$reported" >&2
         exit 1
     fi
     echo "OK: Coverage accounts for what was refused"
 
-    sudo "$binary" --database "$database" allow "$blocked_address" --port 443
+    id=$(sudo "$binary" --database "$database" --json rules | jq -rs '.[0].id')
+    sudo "$binary" --database "$database" forget "$id"
     if sudo "$binary" --database "$database" rules 2>&1 | grep -q "$blocked_address"; then
         echo "FAIL: the rule survived being removed." >&2
         exit 1

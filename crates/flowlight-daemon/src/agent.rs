@@ -4,7 +4,7 @@
 //! uses — the part that can be wrong in an interesting way is testable on a machine with no `/proc`, and
 //! the part that cannot is fifty lines of reading files.
 
-use flowlight_agents::ancestry::{Process, agent_for};
+use flowlight_agents::ancestry::{Process, agent_for, is_agent};
 use flowlight_common::identity::name_from_path;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -49,6 +49,51 @@ impl Agents {
         self.cache.insert(tgid, (answer.clone(), now));
         answer
     }
+}
+
+/// Every task belonging to a process Flowlight recognises as an agent.
+///
+/// Tasks rather than processes: an agent's children are marked in the kernel by the fork tracepoint, which
+/// copies the mark from the *forking thread*. A multithreaded agent — which every agent written in Node is
+/// — forks from whichever thread happened to be running, so marking only the main one would leave most of
+/// its children unmarked.
+pub fn running_agents() -> Vec<(u32, String)> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Some(process) = read_process(pid) else {
+            continue;
+        };
+        if !is_agent(&process.name) {
+            continue;
+        }
+        let tasks = std::fs::read_dir(entry.path().join("task"));
+        match tasks {
+            Ok(tasks) => {
+                for task in tasks.flatten() {
+                    if let Some(tid) = task
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| name.parse::<u32>().ok())
+                    {
+                        found.push((tid, process.name.clone()));
+                    }
+                }
+            }
+            // A process that exited between the listing and the read is the normal case, not an error.
+            Err(_) => found.push((pid as u32, process.name.clone())),
+        }
+    }
+    found
 }
 
 /// One process, out of `/proc`.
@@ -120,6 +165,13 @@ mod tests {
         let mine = std::process::id() as i32;
         assert!(parent_of(mine).is_some());
         assert!(read_process(mine).is_some());
+    }
+
+    /// This process is not an agent, and the scan must complete on a real `/proc` without complaining.
+    #[test]
+    fn the_scan_for_agents_completes_on_this_machine() {
+        let running = running_agents();
+        assert!(running.iter().all(|(_, name)| is_agent(name)));
     }
 
     /// Two answers in a row for the same process must be the same answer, and must not require two walks.

@@ -25,6 +25,7 @@
 //! So: no references to the context, no branch between the reads, and `read_volatile` to stop the optimiser
 //! rearranging them into something the verifier will not take.
 
+use crate::tasks::PID_AGENT;
 use aya_ebpf::{
     helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid},
     macros::{cgroup_sock_addr, map},
@@ -32,7 +33,7 @@ use aya_ebpf::{
     programs::SockAddrContext,
 };
 use core::ptr::read_volatile;
-use flowlight_common::block::{BlockEvent, BlockKey, EVERYONE};
+use flowlight_common::block::{ANY_PORT, BlockEvent, BlockKey, EVERYONE};
 use flowlight_common::connection::{AF_INET, AF_INET6};
 
 /// Allow the connection.
@@ -40,9 +41,13 @@ const ALLOW: i32 = 1;
 /// Refuse it. The application sees `EPERM` from `connect()`.
 const REFUSE: i32 = 0;
 
-/// The rules, written by userspace.
+/// The answers, written by userspace.
+///
+/// Not the rules — the *answers*. Userspace resolves names, works out which rule wins and writes the
+/// verdict for each address and port it knows about, so that a value of zero here is an explicit allow that
+/// stops the search rather than an absence that lets a broader block through.
 #[map]
-static BLOCKED: HashMap<BlockKey, u8> = HashMap::with_max_entries(65536, 0);
+static VERDICTS: HashMap<BlockKey, u8> = HashMap::with_max_entries(65536, 0);
 
 /// Connections that were refused, on their way up to be reported.
 ///
@@ -102,28 +107,85 @@ fn port_of(raw: u32) -> u16 {
 
 /// Whether this connection may proceed.
 ///
+/// Eight lookups, most specific first, and the first key that exists decides. That order *is* precedence:
+/// it is the same ordering [`flowlight_rules::Rule::specificity`] defines — subject, then port, then scope
+/// — written out as a sequence, because a BPF program may not sort a table and may not loop over one.
+///
+/// A key whose value is zero is an explicit allow and stops the search. Without that, an exception for one
+/// port would be defeated by a block on every port, and an exception for one agent by a block on everyone.
+///
 /// Every path that is not a match allows, including every path that fails: a bug in here must not be a
 /// machine that cannot reach the network. That asymmetry is deliberate and is the reason there is no `?`
 /// anywhere below.
 fn decide(ctx: &SockAddrContext, family: u16, address: [u8; 16], port: u16) -> i32 {
-    let keyed = BlockKey::new(EVERYONE, family, address, port);
-    // SAFETY for both: the values are `u8` written by userspace, and neither reference outlives its lookup.
-    let matched = unsafe { BLOCKED.get(&keyed) }.is_some()
-        || unsafe { BLOCKED.get(&keyed.any_port()) }.is_some();
-    if !matched {
-        return ALLOW;
+    let thread = bpf_get_current_pid_tgid();
+    let tgid = (thread >> 32) as u32;
+    // SAFETY: a `u32` written by userspace or by the fork tracepoint; the reference does not outlive it.
+    let agent = unsafe { PID_AGENT.get(&tgid) }.copied().unwrap_or(EVERYONE);
+    let scoped = agent != EVERYONE;
+
+    let mut matched = EVERYONE;
+    let mut verdict = None;
+
+    // Specificity 7 down to 0. Each pair is the same question asked first about this agent and then about
+    // everyone, because an agent-scoped rule is the more specific of two that otherwise say the same.
+    if scoped {
+        verdict = look(&BlockKey::new(agent, family, address, port));
+        if verdict.is_some() {
+            matched = agent;
+        }
+    }
+    if verdict.is_none() {
+        verdict = look(&BlockKey::new(EVERYONE, family, address, port));
+    }
+    if verdict.is_none() && scoped {
+        verdict = look(&BlockKey::new(agent, family, address, ANY_PORT));
+        if verdict.is_some() {
+            matched = agent;
+        }
+    }
+    if verdict.is_none() {
+        verdict = look(&BlockKey::new(EVERYONE, family, address, ANY_PORT));
+    }
+    if verdict.is_none() && scoped {
+        verdict = look(&BlockKey::anything(agent, port));
+        if verdict.is_some() {
+            matched = agent;
+        }
+    }
+    if verdict.is_none() {
+        verdict = look(&BlockKey::anything(EVERYONE, port));
+    }
+    if verdict.is_none() && scoped {
+        verdict = look(&BlockKey::anything(agent, ANY_PORT));
+        if verdict.is_some() {
+            matched = agent;
+        }
+    }
+    if verdict.is_none() {
+        verdict = look(&BlockKey::anything(EVERYONE, ANY_PORT));
     }
 
-    let thread = bpf_get_current_pid_tgid();
+    match verdict {
+        Some(refuse) if refuse != 0 => {}
+        _ => return ALLOW,
+    }
+
     let event = BlockEvent {
-        tgid: (thread >> 32) as u32,
+        tgid,
         pid: thread as u32,
         comm: bpf_get_current_comm().unwrap_or([0; 16]),
         address,
         port,
         family,
-        agent: EVERYONE,
+        agent: matched,
     };
     BLOCK_EVENTS.output(ctx, &event, 0);
     REFUSE
+}
+
+/// One lookup in the table.
+fn look(key: &BlockKey) -> Option<u8> {
+    // SAFETY: the value is a `u8` written by userspace, and the reference does not outlive the lookup.
+    unsafe { VERDICTS.get(key) }.copied()
 }

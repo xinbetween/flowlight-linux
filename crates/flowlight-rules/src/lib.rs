@@ -1,0 +1,781 @@
+//! What a rule means, which rule wins, and what the answer is.
+//!
+//! No I/O and no dependencies. That is not tidiness: the macOS build has a `RuleBook` that answers the same
+//! questions, and two implementations of "block" that quietly come to mean different things is the failure
+//! mode that matters most in a pair of tools people use together. A module with no I/O is a module whose
+//! semantics can be written down as cases and run by both test suites, which is what 0.2.9 is for.
+//!
+//! # What a rule is
+//!
+//! Four parts, each of which can be left unsaid:
+//!
+//! - an [`Action`] — allow, block, or ask;
+//! - a [`Scope`] — everyone, or one agent;
+//! - a [`Subject`] — a host, a pattern of hosts, an address, or anything;
+//! - a port, or any port.
+//!
+//! # Which rule wins
+//!
+//! The most specific one. Specificity is read in a fixed order — **subject, then port, then scope** — and
+//! the order is a claim about what people mean. A rule about a host is a rule about the thing being
+//! reached, which is the strongest statement anyone writes; a rule about an agent is a statement about who
+//! is asking, which is weaker than a statement about what they are asking for.
+//!
+//! So `block telemetry.example` for everyone beats `allow *` for one agent, and `allow mcp.sentry.dev for
+//! claude` beats `block mcp.sentry.dev` for everyone. Both are what somebody writing those two rules
+//! meant.
+//!
+//! Two rules of equal specificity that disagree are a contradiction, and a contradiction resolves the
+//! careful way: **block, then ask, then allow**. Nobody writes that pair on purpose, and of the two ways to
+//! be wrong about it, refusing something that should have been allowed is the one somebody notices.
+//!
+//! # The default is allow
+//!
+//! Nothing is refused unless a rule says so. This is a tool for watching that can also refuse, not a
+//! firewall with a default-deny posture, and the difference should not be discovered by a machine losing
+//! its network.
+
+#![no_std]
+
+extern crate alloc;
+
+use alloc::borrow::ToOwned as _;
+use alloc::string::String;
+use alloc::vec::Vec;
+
+/// What to do about a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Action {
+    /// Let it through. The default, and the meaning of an explicit exception.
+    Allow,
+    /// Put the question to a person. See [`Action::Ask`]'s documentation for what that means here.
+    ///
+    /// On macOS an agent's connection can be held open while somebody decides. Here it cannot: the decision
+    /// happens inside `connect()`, in a BPF program, which may not sleep and may not talk to anyone. So
+    /// `ask` **refuses, and records the question**. Answering it writes a rule, and the next attempt —
+    /// which every network client makes — gets the answer.
+    ///
+    /// That is a weaker promise than the macOS one and is stated rather than blurred. What it is not is a
+    /// connection that silently hangs.
+    Ask,
+    /// Refuse it before the SYN.
+    Block,
+}
+
+impl Action {
+    /// A word for the interface and for the database.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Ask => "ask",
+            Self::Block => "block",
+        }
+    }
+
+    /// Reads one back.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "allow" => Some(Self::Allow),
+            "ask" => Some(Self::Ask),
+            "block" => Some(Self::Block),
+            _ => None,
+        }
+    }
+
+    /// Whether the connection is refused.
+    ///
+    /// `ask` refuses too, which is the whole of the difference between this and the macOS build.
+    pub fn refuses(self) -> bool {
+        self != Self::Allow
+    }
+}
+
+/// Who a rule is about.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Scope {
+    /// Every process on the machine.
+    Everyone,
+    /// One agent, and anything it started.
+    Agent(String),
+}
+
+impl Scope {
+    /// How this reads in the database and on the screen.
+    pub fn as_text(&self) -> String {
+        match self {
+            Self::Everyone => "everyone".to_owned(),
+            Self::Agent(agent) => alloc::format!("agent:{agent}"),
+        }
+    }
+
+    /// Reads one back. An unrecognised scope is `None` rather than [`Scope::Everyone`], because a rule
+    /// whose meaning this version does not know must not be enforced as though it did.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "everyone" | "global" => Some(Self::Everyone),
+            other => other
+                .strip_prefix("agent:")
+                .filter(|agent| !agent.is_empty())
+                .map(|agent| Self::Agent(agent.to_owned())),
+        }
+    }
+
+    /// Whether this scope covers a request from this agent.
+    fn covers(&self, agent: Option<&str>) -> bool {
+        match self {
+            Self::Everyone => true,
+            Self::Agent(mine) => agent == Some(mine.as_str()),
+        }
+    }
+}
+
+/// What a rule is about reaching.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Subject {
+    /// Anything at all.
+    Anything,
+    /// Exactly this host.
+    Host(String),
+    /// Any subdomain of this host, and not the host itself.
+    ///
+    /// `*.example.com` is `a.example.com` and `a.b.example.com`, and not `example.com`. That is a choice
+    /// and it is the predictable one: a pattern that silently included the apex would make
+    /// `block *.example.com` and `allow example.com` a contradiction nobody wrote.
+    Subdomains(String),
+    /// A literal address, which is what a rule means by the time the kernel sees it.
+    Address(String),
+}
+
+impl Subject {
+    /// Reads a subject out of what somebody typed.
+    pub fn parse(text: &str) -> Self {
+        let text = text.trim();
+        if text == "*" || text.is_empty() {
+            return Self::Anything;
+        }
+        if let Some(rest) = text.strip_prefix("*.") {
+            return Self::Subdomains(rest.to_ascii_lowercase());
+        }
+        // An address is a host that happens to be written as numbers, and telling them apart matters only
+        // because a pattern cannot be resolved and an address does not need to be.
+        if looks_like_an_address(text) {
+            return Self::Address(text.to_owned());
+        }
+        Self::Host(text.to_ascii_lowercase())
+    }
+
+    /// How this reads in the database and on the screen.
+    pub fn as_text(&self) -> String {
+        match self {
+            Self::Anything => "*".to_owned(),
+            Self::Host(host) | Self::Address(host) => host.clone(),
+            Self::Subdomains(host) => alloc::format!("*.{host}"),
+        }
+    }
+
+    /// Whether this subject is one the kernel can be told about.
+    ///
+    /// A pattern cannot: the kernel has an address, and a pattern has to be matched against a name that was
+    /// resolved and thrown away before `connect()` was called. So a pattern is enforced by watching what is
+    /// reached and refusing the address afterwards, which costs the first connection.
+    pub fn is_resolvable(&self) -> bool {
+        matches!(self, Self::Host(_) | Self::Address(_))
+    }
+
+    /// Whether this subject covers a host.
+    fn covers_host(&self, host: &str) -> bool {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        match self {
+            Self::Anything => true,
+            Self::Host(mine) | Self::Address(mine) => host == *mine,
+            Self::Subdomains(mine) => host
+                .strip_suffix(mine.as_str())
+                .is_some_and(|prefix| prefix.ends_with('.')),
+        }
+    }
+
+    /// Whether this subject covers an address.
+    fn covers_address(&self, address: &str) -> bool {
+        match self {
+            Self::Anything => true,
+            Self::Address(mine) => address == mine,
+            // A name is not an address until something resolves it, and this module does not resolve
+            // anything. The caller supplies whichever it knows.
+            Self::Host(_) | Self::Subdomains(_) => false,
+        }
+    }
+
+    /// How specific this is, on its own.
+    fn weight(&self) -> u8 {
+        match self {
+            Self::Anything => 0,
+            Self::Subdomains(_) => 1,
+            Self::Host(_) | Self::Address(_) => 2,
+        }
+    }
+}
+
+/// Whether some text is a literal address rather than a name.
+///
+/// Deliberately crude, and correct for the only question being asked: names contain letters, addresses do
+/// not, except for IPv6, which contains colons and nothing else does.
+fn looks_like_an_address(text: &str) -> bool {
+    if text.contains(':') {
+        return true;
+    }
+    let parts: Vec<&str> = text.split('.').collect();
+    parts.len() == 4
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// One rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rule {
+    /// Its identifier in the database, so that a verdict can name the rule that produced it.
+    pub id: i64,
+    /// What to do.
+    pub action: Action,
+    /// Who it is about.
+    pub scope: Scope,
+    /// What it is about reaching.
+    pub subject: Subject,
+    /// Which port, or every port.
+    pub port: Option<u16>,
+}
+
+impl Rule {
+    /// How specific this rule is.
+    ///
+    /// Subject, then port, then scope — in that order and with that weighting, so that a more specific
+    /// subject always beats a more specific anything else. The numbers exist to make the ordering total;
+    /// the ordering is the decision.
+    pub fn specificity(&self) -> u8 {
+        self.subject.weight() * 4 + u8::from(self.port.is_some()) * 2 + u8::from(self.is_scoped())
+    }
+
+    /// Whether this rule names an agent.
+    pub fn is_scoped(&self) -> bool {
+        matches!(self.scope, Scope::Agent(_))
+    }
+
+    /// Whether this rule applies to a connection.
+    fn applies(&self, facts: &Facts) -> bool {
+        if !self.scope.covers(facts.agent.as_deref()) {
+            return false;
+        }
+        if let Some(port) = self.port
+            && port != facts.port
+        {
+            return false;
+        }
+        match (&facts.host, &facts.address) {
+            // A connection we know the name of is judged by name, and by address only if no name matched:
+            // a rule naming a host should not be defeated by that host having an address.
+            (Some(host), address) => {
+                self.subject.covers_host(host)
+                    || address
+                        .as_ref()
+                        .is_some_and(|address| self.subject.covers_address(address))
+            }
+            (None, Some(address)) => self.subject.covers_address(address),
+            (None, None) => matches!(self.subject, Subject::Anything),
+        }
+    }
+}
+
+/// What is known about a connection when it is judged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Facts {
+    /// The agent that caused it, if any.
+    pub agent: Option<String>,
+    /// The host, when it is known — which at `connect()` it is not.
+    pub host: Option<String>,
+    /// The address, as text.
+    pub address: Option<String>,
+    /// The port.
+    pub port: u16,
+}
+
+/// The answer, and where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    /// What to do.
+    pub action: Action,
+    /// The rule that decided, or `None` when nothing matched and the default applied.
+    pub rule: Option<i64>,
+}
+
+impl Verdict {
+    /// The answer when no rule has anything to say.
+    pub const fn default_allow() -> Self {
+        Self {
+            action: Action::Allow,
+            rule: None,
+        }
+    }
+}
+
+/// Decides what to do about a connection.
+///
+/// The most specific matching rule wins. Among equally specific rules that disagree, the most restrictive
+/// wins — a contradiction nobody wrote on purpose, resolved the careful way.
+pub fn decide(facts: &Facts, rules: &[Rule]) -> Verdict {
+    let mut best: Option<&Rule> = None;
+    for rule in rules {
+        if !rule.applies(facts) {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some(current) => match rule.specificity().cmp(&current.specificity()) {
+                core::cmp::Ordering::Greater => true,
+                core::cmp::Ordering::Less => false,
+                // `Action` is ordered allow, ask, block, so the greater one is the stricter one.
+                core::cmp::Ordering::Equal => rule.action > current.action,
+            },
+        };
+        if better {
+            best = Some(rule);
+        }
+    }
+    best.map_or_else(Verdict::default_allow, |rule| Verdict {
+        action: rule.action,
+        rule: Some(rule.id),
+    })
+}
+
+/// One entry in the table the kernel consults, before its subject has been resolved to addresses.
+///
+/// The kernel cannot run [`decide`]: it may not loop, and it has an address where a rule has a name. So
+/// precedence is expressed for it as a lookup order — most specific key first, first key found wins — and
+/// this produces the keys. Each is the strictest thing said at exactly that level of specificity, which is
+/// what makes "first found wins" equivalent to "most specific wins".
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct KeySpec {
+    /// The agent, or `None` for everyone.
+    pub agent: Option<String>,
+    /// The host or address to resolve, or `None` for anything at all.
+    pub subject: Option<String>,
+    /// The port, or `None` for any port.
+    pub port: Option<u16>,
+    /// What to do.
+    pub action: Action,
+}
+
+impl KeySpec {
+    /// How specific this is, on the same scale [`Rule::specificity`] uses.
+    pub fn specificity(&self) -> u8 {
+        u8::from(self.subject.is_some()) * 4
+            + u8::from(self.port.is_some()) * 2
+            + u8::from(self.agent.is_some())
+    }
+}
+
+/// The table the kernel consults, and the rules that could not be put into it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Table {
+    /// The keys, most specific first.
+    pub keys: Vec<KeySpec>,
+    /// Rules that cannot be enforced before the handshake, and why.
+    ///
+    /// A pattern is the only kind: it has to be matched against a name, and the name was resolved and
+    /// thrown away before `connect()` was called. Reported rather than dropped, because a rule that is
+    /// written and silently not enforced is worse than one that was refused.
+    pub unenforceable: Vec<i64>,
+}
+
+/// Turns rules into the table the kernel consults.
+///
+/// Rules at the same level of specificity about the same thing are merged, strictest first — the same
+/// resolution [`decide`] uses for a contradiction, applied in the one place the kernel cannot.
+pub fn table(rules: &[Rule]) -> Table {
+    let mut table = Table::default();
+    let mut merged: Vec<KeySpec> = Vec::new();
+
+    for rule in rules {
+        let subject = match &rule.subject {
+            Subject::Anything => None,
+            Subject::Host(host) | Subject::Address(host) => Some(host.clone()),
+            Subject::Subdomains(_) => {
+                table.unenforceable.push(rule.id);
+                continue;
+            }
+        };
+        let agent = match &rule.scope {
+            Scope::Everyone => None,
+            Scope::Agent(agent) => Some(agent.clone()),
+        };
+        let candidate = KeySpec {
+            agent,
+            subject,
+            port: rule.port,
+            action: rule.action,
+        };
+        match merged.iter_mut().find(|existing| {
+            existing.agent == candidate.agent
+                && existing.subject == candidate.subject
+                && existing.port == candidate.port
+        }) {
+            Some(existing) => existing.action = existing.action.max(candidate.action),
+            None => merged.push(candidate),
+        }
+    }
+
+    merged.sort_by(|a, b| b.specificity().cmp(&a.specificity()).then(a.cmp(b)));
+    table.keys = merged;
+    table
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(id: i64, action: Action, scope: &str, subject: &str, port: Option<u16>) -> Rule {
+        Rule {
+            id,
+            action,
+            scope: Scope::parse(scope).unwrap(),
+            subject: Subject::parse(subject),
+            port,
+        }
+    }
+
+    fn facts(agent: Option<&str>, host: Option<&str>, address: Option<&str>, port: u16) -> Facts {
+        Facts {
+            agent: agent.map(|text| text.to_owned()),
+            host: host.map(|text| text.to_owned()),
+            address: address.map(|text| text.to_owned()),
+            port,
+        }
+    }
+
+    /// This is a tool for watching that can also refuse, not a firewall with a default-deny posture, and
+    /// the difference should not be discovered by a machine losing its network.
+    #[test]
+    fn nothing_is_refused_unless_a_rule_says_so() {
+        let verdict = decide(&facts(None, Some("example.com"), None, 443), &[]);
+        assert_eq!(verdict, Verdict::default_allow());
+        assert_eq!(verdict.action, Action::Allow);
+        assert!(!verdict.action.refuses());
+    }
+
+    #[test]
+    fn a_rule_naming_a_host_decides_a_connection_to_it() {
+        let rules = [rule(
+            1,
+            Action::Block,
+            "everyone",
+            "telemetry.example",
+            None,
+        )];
+        let verdict = decide(&facts(None, Some("telemetry.example"), None, 443), &rules);
+        assert_eq!(verdict.action, Action::Block);
+        assert_eq!(verdict.rule, Some(1));
+    }
+
+    /// The commonest pair anybody writes: block a thing, and let one agent have it anyway.
+    #[test]
+    fn an_exception_for_one_agent_beats_a_block_for_everyone() {
+        let rules = [
+            rule(1, Action::Block, "everyone", "mcp.sentry.dev", None),
+            rule(2, Action::Allow, "agent:claude", "mcp.sentry.dev", None),
+        ];
+        assert_eq!(
+            decide(
+                &facts(Some("claude"), Some("mcp.sentry.dev"), None, 443),
+                &rules
+            )
+            .action,
+            Action::Allow
+        );
+        assert_eq!(
+            decide(
+                &facts(Some("codex"), Some("mcp.sentry.dev"), None, 443),
+                &rules
+            )
+            .action,
+            Action::Block
+        );
+    }
+
+    /// The other direction, and the reason subject outranks scope. A rule about a host is a statement about
+    /// the thing being reached, which is stronger than a statement about who is asking.
+    #[test]
+    fn a_rule_about_a_host_beats_a_blanket_rule_about_an_agent() {
+        let rules = [
+            rule(1, Action::Allow, "agent:claude", "*", None),
+            rule(2, Action::Block, "everyone", "telemetry.example", None),
+        ];
+        assert_eq!(
+            decide(
+                &facts(Some("claude"), Some("telemetry.example"), None, 443),
+                &rules
+            )
+            .action,
+            Action::Block
+        );
+    }
+
+    #[test]
+    fn a_rule_naming_a_port_beats_one_that_does_not() {
+        let rules = [
+            rule(1, Action::Block, "everyone", "example.com", None),
+            rule(2, Action::Allow, "everyone", "example.com", Some(443)),
+        ];
+        assert_eq!(
+            decide(&facts(None, Some("example.com"), None, 443), &rules).action,
+            Action::Allow
+        );
+        assert_eq!(
+            decide(&facts(None, Some("example.com"), None, 80), &rules).action,
+            Action::Block
+        );
+    }
+
+    /// Nobody writes this on purpose. Of the two ways to be wrong about it, refusing something that should
+    /// have been allowed is the one somebody notices.
+    #[test]
+    fn a_contradiction_resolves_the_careful_way() {
+        let rules = [
+            rule(1, Action::Allow, "everyone", "example.com", None),
+            rule(2, Action::Block, "everyone", "example.com", None),
+        ];
+        assert_eq!(
+            decide(&facts(None, Some("example.com"), None, 443), &rules).action,
+            Action::Block
+        );
+        // And in the other order, so that the answer does not depend on which was written first.
+        let reversed = [rules[1].clone(), rules[0].clone()];
+        assert_eq!(
+            decide(&facts(None, Some("example.com"), None, 443), &reversed).action,
+            Action::Block
+        );
+    }
+
+    #[test]
+    fn ask_sits_between_allow_and_block() {
+        assert!(Action::Block > Action::Ask);
+        assert!(Action::Ask > Action::Allow);
+        assert!(Action::Ask.refuses());
+        let rules = [
+            rule(1, Action::Allow, "everyone", "example.com", None),
+            rule(2, Action::Ask, "everyone", "example.com", None),
+        ];
+        assert_eq!(
+            decide(&facts(None, Some("example.com"), None, 443), &rules).action,
+            Action::Ask
+        );
+    }
+
+    // Subjects
+
+    /// A pattern that silently included the apex would make `block *.example.com` and `allow example.com` a
+    /// contradiction nobody wrote.
+    #[test]
+    fn a_subdomain_pattern_is_subdomains_and_not_the_host_itself() {
+        let rules = [rule(1, Action::Block, "everyone", "*.example.com", None)];
+        for host in ["a.example.com", "a.b.example.com"] {
+            assert_eq!(
+                decide(&facts(None, Some(host), None, 443), &rules).action,
+                Action::Block,
+                "{host}"
+            );
+        }
+        for host in ["example.com", "notexample.com", "example.com.evil.test"] {
+            assert_eq!(
+                decide(&facts(None, Some(host), None, 443), &rules).action,
+                Action::Allow,
+                "{host}"
+            );
+        }
+    }
+
+    /// `notexample.com` ends with `example.com` and is a different domain. Suffix matching without the dot
+    /// is the classic way to block the wrong thing, or fail to block the right one.
+    #[test]
+    fn a_suffix_that_is_not_a_subdomain_does_not_match() {
+        let subject = Subject::parse("*.example.com");
+        assert!(subject.covers_host("a.example.com"));
+        assert!(!subject.covers_host("notexample.com"));
+        assert!(!subject.covers_host("example.com"));
+    }
+
+    #[test]
+    fn hosts_are_matched_without_regard_to_case_or_a_trailing_dot() {
+        let rules = [rule(1, Action::Block, "everyone", "Example.COM", None)];
+        for host in ["example.com", "EXAMPLE.com", "example.com."] {
+            assert_eq!(
+                decide(&facts(None, Some(host), None, 443), &rules).action,
+                Action::Block,
+                "{host}"
+            );
+        }
+    }
+
+    /// At `connect()` there is no name — it was resolved and thrown away. A rule naming an address is the
+    /// only kind that can decide there.
+    #[test]
+    fn a_connection_with_no_name_is_judged_by_its_address() {
+        let rules = [rule(1, Action::Block, "everyone", "93.184.216.34", None)];
+        assert_eq!(
+            decide(&facts(None, None, Some("93.184.216.34"), 443), &rules).action,
+            Action::Block
+        );
+        assert_eq!(
+            decide(&facts(None, None, Some("93.184.216.35"), 443), &rules).action,
+            Action::Allow
+        );
+    }
+
+    /// A rule naming a host should not be defeated by that host having an address, nor the other way
+    /// round: whichever the caller knows is what the rule is asked about.
+    #[test]
+    fn a_connection_with_both_is_judged_by_either() {
+        let by_host = [rule(1, Action::Block, "everyone", "example.com", None)];
+        let by_address = [rule(1, Action::Block, "everyone", "93.184.216.34", None)];
+        let both = facts(None, Some("example.com"), Some("93.184.216.34"), 443);
+        assert_eq!(decide(&both, &by_host).action, Action::Block);
+        assert_eq!(decide(&both, &by_address).action, Action::Block);
+    }
+
+    #[test]
+    fn a_rule_about_anything_applies_to_a_connection_we_know_nothing_about() {
+        let rules = [rule(1, Action::Block, "agent:claude", "*", None)];
+        assert_eq!(
+            decide(&facts(Some("claude"), None, None, 443), &rules).action,
+            Action::Block
+        );
+        assert_eq!(
+            decide(&facts(Some("codex"), None, None, 443), &rules).action,
+            Action::Allow
+        );
+    }
+
+    #[test]
+    fn addresses_and_names_are_told_apart() {
+        assert_eq!(
+            Subject::parse("93.184.216.34"),
+            Subject::Address("93.184.216.34".to_owned())
+        );
+        assert_eq!(Subject::parse("::1"), Subject::Address("::1".to_owned()));
+        assert_eq!(
+            Subject::parse("example.com"),
+            Subject::Host("example.com".to_owned())
+        );
+        assert_eq!(Subject::parse("*"), Subject::Anything);
+        assert_eq!(Subject::parse(""), Subject::Anything);
+        // Four numeric parts and nothing else is an address; three is a name that looks unusual.
+        assert_eq!(Subject::parse("1.2.3"), Subject::Host("1.2.3".to_owned()));
+    }
+
+    /// A pattern cannot be handed to the kernel: it has an address, and the name was thrown away before
+    /// `connect()`. The interface has to be able to say which rules are enforced there and which are not.
+    #[test]
+    fn a_pattern_is_not_something_the_kernel_can_be_told() {
+        assert!(Subject::parse("example.com").is_resolvable());
+        assert!(Subject::parse("93.184.216.34").is_resolvable());
+        assert!(!Subject::parse("*.example.com").is_resolvable());
+        assert!(!Subject::parse("*").is_resolvable());
+    }
+
+    // The table the kernel consults
+
+    /// The kernel cannot run `decide`: it may not loop, and it has an address where a rule has a name. So
+    /// precedence becomes a lookup order, and this is what makes the two agree.
+    #[test]
+    fn the_table_is_ordered_the_way_precedence_is() {
+        let rules = [
+            rule(1, Action::Block, "agent:claude", "*", None),
+            rule(2, Action::Block, "everyone", "example.com", None),
+            rule(3, Action::Allow, "agent:claude", "example.com", Some(443)),
+        ];
+        let table = table(&rules);
+        let specificities: Vec<u8> = table.keys.iter().map(KeySpec::specificity).collect();
+        assert_eq!(specificities, [7, 4, 1]);
+        assert_eq!(table.keys[0].action, Action::Allow);
+        assert_eq!(table.keys[0].subject.as_deref(), Some("example.com"));
+        assert_eq!(table.keys[0].agent.as_deref(), Some("claude"));
+    }
+
+    /// Two rules saying different things about exactly the same thing are one key, resolved the same way
+    /// `decide` resolves a contradiction.
+    #[test]
+    fn rules_at_the_same_specificity_about_the_same_thing_become_one_key() {
+        let rules = [
+            rule(1, Action::Allow, "everyone", "example.com", None),
+            rule(2, Action::Block, "everyone", "example.com", None),
+        ];
+        let table = table(&rules);
+        assert_eq!(table.keys.len(), 1);
+        assert_eq!(table.keys[0].action, Action::Block);
+    }
+
+    /// A pattern has to be matched against a name, and the name was resolved and thrown away before
+    /// `connect()`. A rule that is written and silently not enforced is worse than one that was refused.
+    #[test]
+    fn a_pattern_is_reported_as_unenforceable_rather_than_dropped() {
+        let rules = [
+            rule(1, Action::Block, "everyone", "*.example.com", None),
+            rule(2, Action::Block, "everyone", "example.com", None),
+        ];
+        let table = table(&rules);
+        assert_eq!(table.unenforceable, [1]);
+        assert_eq!(table.keys.len(), 1);
+        assert_eq!(table.keys[0].subject.as_deref(), Some("example.com"));
+    }
+
+    /// The whole table, for a set of rules whose ordering is the point. Reading down it is reading
+    /// precedence: the kernel takes the first key it finds.
+    #[test]
+    fn every_level_of_specificity_has_its_own_place_in_the_order() {
+        let rules = [
+            rule(1, Action::Block, "everyone", "*", None),
+            rule(2, Action::Block, "agent:claude", "*", None),
+            rule(3, Action::Block, "everyone", "*", Some(443)),
+            rule(4, Action::Block, "agent:claude", "*", Some(443)),
+            rule(5, Action::Block, "everyone", "a.example", None),
+            rule(6, Action::Block, "agent:claude", "a.example", None),
+            rule(7, Action::Block, "everyone", "a.example", Some(443)),
+            rule(8, Action::Block, "agent:claude", "a.example", Some(443)),
+        ];
+        let specificities: Vec<u8> = table(&rules)
+            .keys
+            .iter()
+            .map(KeySpec::specificity)
+            .collect();
+        assert_eq!(specificities, [7, 6, 5, 4, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn a_table_of_no_rules_is_empty_rather_than_anything_else() {
+        assert_eq!(table(&[]), Table::default());
+    }
+
+    // Round-tripping, because these go through a database
+
+    #[test]
+    fn every_part_of_a_rule_survives_being_written_down_and_read_back() {
+        for text in ["allow", "ask", "block"] {
+            assert_eq!(Action::parse(text).map(Action::as_str), Some(text));
+        }
+        assert_eq!(Action::parse("maybe"), None);
+
+        for scope in [Scope::Everyone, Scope::Agent("claude".to_owned())] {
+            assert_eq!(Scope::parse(&scope.as_text()).as_ref(), Some(&scope));
+        }
+        for subject in ["*", "example.com", "*.example.com", "93.184.216.34"] {
+            assert_eq!(Subject::parse(subject).as_text(), subject);
+        }
+    }
+
+    /// 0.2.0 wrote `global`. A database from it must keep working, and a scope this version does not
+    /// understand must not be enforced as though it did.
+    #[test]
+    fn an_older_scope_is_understood_and_an_unknown_one_is_not() {
+        assert_eq!(Scope::parse("global"), Some(Scope::Everyone));
+        assert_eq!(Scope::parse("agent:"), None);
+        assert_eq!(Scope::parse("something-new"), None);
+    }
+}
