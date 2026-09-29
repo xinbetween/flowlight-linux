@@ -39,7 +39,7 @@ Tested on Ubuntu 24.04. Needs root, because loading an eBPF program does — the
 does not.
 
 ```sh
-sudo apt-get install -y build-essential curl jq zstd git
+sudo apt-get install -y build-essential curl jq zstd git libgtk-4-dev libadwaita-1-dev
 
 # Rust, plus a nightly toolchain: the BPF target has no prebuilt `core`, so it is compiled from source.
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -53,10 +53,10 @@ export PATH="$HOME/.local/bin:$PATH"
 
 git clone https://github.com/xinbetween/flowlight-linux
 cd flowlight-linux
-cargo build --release --package flowlight-daemon
+cargo build --release --package flowlight-daemon --package flowlight-gui
 ```
 
-`--package flowlight-daemon` is not optional: a bare `cargo build` builds only the crate that compiles on any
+Naming the packages is not optional: a bare `cargo build` builds only the crates that compile on any
 machine, because most of this is written on a Mac where the rest cannot be.
 
 Then watch:
@@ -66,11 +66,11 @@ sudo ./target/release/flowlightd
 ```
 
 ```text
-flowlightd 0.1.7: watching sock/inet_sock_set_state. Outbound TCP only; inbound connections are not
+flowlightd 0.2.2: watching sock/inet_sock_set_state. Outbound TCP only; inbound connections are not
 attributed.
 storing to /var/lib/flowlight/flowlight.db, keeping individual requests for 7 days, and a daily summary
 for 90 days
-interface at http://127.0.0.1:7890/?token=9f3c1a7e42b8d05c6e1f0a93d7b45cc2
+interface socket at /run/flowlight/flowlight.sock, owned by uid 1000
 reading openssl through /usr/lib/x86_64-linux-gnu/libssl.so.3 (SSL_write, SSL_write_ex, SSL_read, SSL_read_ex)
 curl                     pid 18422    → 93.184.216.34:443
 curl                     pid 18422    → GET example.com/
@@ -78,8 +78,11 @@ curl                     pid 18422    ← 200  1256 bytes
 claude                   pid 17903    → POST api.anthropic.com/v1/messages
 ```
 
-**Open the URL it prints.** That is the interface: what is happening now, which process has been talking to
-what, and — the tab worth looking at — what could not be read.
+Then open the window, as yourself — not as root:
+
+```sh
+./target/release/flowlight
+```
 
 Or ask it from the terminal:
 
@@ -122,8 +125,9 @@ Useful flags:
 | `--seconds N` | stop after N seconds |
 | `--count N` | stop after N records |
 | `--tracefs PATH` | if tracefs is mounted somewhere unusual |
-| `--ui ADDRESS` | where to serve the interface. Default `127.0.0.1:7890`, loopback only |
-| `--no-ui` | do not serve an interface |
+| `--socket PATH` | where the interface connects. Default `/run/flowlight/flowlight.sock` |
+| `--no-socket` | do not open a control socket, so no interface can connect |
+| `--web [ADDRESS]` | also serve the web page, for a machine with no desktop session |
 | `--no-block` | do not enforce rules; nothing is refused whatever the rules say |
 | `--database PATH` | where to keep what is seen. Default `/var/lib/flowlight/flowlight.db` |
 | `--no-store` | keep nothing; watch the terminal and let it scroll |
@@ -292,20 +296,38 @@ the conclusion that Flowlight looked and found nothing.
 
 ### The interface
 
-A page on `127.0.0.1`, because a daemon with no window is a daemon nobody looks at. Four tabs — **Live**,
-**Agents**, **Processes**, **Coverage** — and a window selector from fifteen minutes to seven days.
+A native window, GTK4, running **as you** while the daemon runs as root.
 
-The awkward part, said here rather than left to be discovered: this daemon runs as root, and what it knows is
-every host every process on the machine reached. **Loopback is not a permission boundary** — anything served
-there is available to every local user, not only the one who started it. On a single-user laptop that is
-nothing; on a shared machine it is a disclosure.
+```sh
+flowlight
+```
 
-So the page is bound to `127.0.0.1` and refuses to start anywhere else, every route is read-only, and it is
-behind a token generated at startup and printed once. The token lives in memory, never touches disk, and dies
-with the process. `--no-ui` turns the whole thing off.
+Four pages — **Live**, **Agents**, **Rules**, **Coverage** — and a window selector from fifteen minutes to
+seven days. On the Agents page each host an agent reached carries the two buttons the macOS build settled
+on: block it **for this agent**, or block it **everywhere**.
 
-Nothing on the page loads from anywhere: no content delivery network, no fonts, no scripts from outside. A
-root daemon that asks a browser to run somebody else's code has misunderstood its job.
+#### Why it is two programs
+
+Loading a probe needs root. Drawing a window does not, and should not. So the daemon keeps the privileges,
+the probes and the database, and the interface keeps a list and four buttons. Between them is a Unix socket
+at `/run/flowlight/flowlight.sock`, owned by whoever ran `sudo flowlightd`, mode `600`.
+
+That is a real permission boundary, which is what the page it replaces never had. **Loopback is not one** —
+anything served on `127.0.0.1` is reachable by every local user of the machine, and a token in a URL is a
+secret that leaks into shell history, process listings and screenshots. A socket has an owner and a mode,
+the kernel enforces them, and there is no secret to leak. Every connection is asked who it is a second time
+through `SO_PEERCRED`, which the kernel fills in and the peer cannot forge.
+
+#### The web page is still there
+
+It is the only one of the two that works over `ssh` on a machine with no desktop session — which is most
+machines actually running agents. It is off unless asked for:
+
+```sh
+sudo ./target/release/flowlightd --web
+```
+
+and it prints its own warning, because on a shared machine it is a disclosure.
 
 ### Coverage: what was *not* seen
 

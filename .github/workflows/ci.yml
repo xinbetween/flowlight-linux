@@ -34,6 +34,14 @@ jobs:
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
+      # The native interface is GTK4. Installed before anything is compiled, because the bindings need the
+      # headers at build time and the failure without them is a wall of pkg-config.
+      - name: Install the interface's libraries
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev
+
       - name: Install the toolchain
         run: |
           set -euo pipefail
@@ -81,8 +89,8 @@ jobs:
           sudo cat /sys/kernel/tracing/events/sock/inet_sock_set_state/format 2>/dev/null \
             || sudo cat /sys/kernel/debug/tracing/events/sock/inet_sock_set_state/format
 
-      - name: Build the daemon
-        run: cargo build --release --package flowlight-daemon
+      - name: Build the daemon and the interface
+        run: cargo build --release --package flowlight-daemon --package flowlight-gui
 
       # The part that cannot be faked. Loads the programs into a real kernel, attaches them, makes real
       # requests, and insists on finding them: the connection with the right process and port, and the
@@ -96,6 +104,5 @@ jobs:
           set -euo pipefail
           # A client that uses GnuTLS by definition, so the GnuTLS probes are exercised rather than assumed.
           # The runner's own curl and wget are both OpenSSL, which would test the same path three times.
-          sudo apt-get update -qq
           sudo apt-get install -y -qq gnutls-bin
           ./scripts/smoke.sh target/release/flowlightd

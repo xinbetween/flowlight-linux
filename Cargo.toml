@@ -5,6 +5,7 @@ members = [
     "crates/flowlight-common",
     "crates/flowlight-daemon",
     "crates/flowlight-ebpf",
+    "crates/flowlight-gui",
     "crates/flowlight-rules",
     "crates/flowlight-store",
 ]
@@ -21,7 +22,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/xinbetween/flowlight-linux"
