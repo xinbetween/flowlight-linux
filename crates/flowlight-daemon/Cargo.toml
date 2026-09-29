@@ -1,0 +1,29 @@
+[package]
+name = "flowlight-daemon"
+description = "Loads Flowlight's eBPF programs, resolves what the kernel reports into process identities, and prints them."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "flowlightd"
+path = "src/main.rs"
+
+[dependencies]
+flowlight-common = { workspace = true, features = ["user"] }
+anyhow.workspace = true
+aya.workspace = true
+clap.workspace = true
+libc = "0.2"
+serde.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+aya-build.workspace = true
+
+[lints]
+workspace = true

@@ -10,4 +10,14 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The default is the daemon's view. The eBPF programs take this crate with `default-features = false`, which
+# leaves the wire types and the parsing and removes everything that allocates.
+default = ["alloc"]
+alloc = []
+# Implements `aya::Pod` for the types that cross the map boundary. Only the daemon can do this, because only
+# the daemon links aya.
+user = ["dep:aya", "alloc"]
+
 [dependencies]
+aya = { workspace = true, optional = true }

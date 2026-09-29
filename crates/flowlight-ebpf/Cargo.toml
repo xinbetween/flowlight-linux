@@ -1,0 +1,22 @@
+[package]
+name = "flowlight-ebpf"
+description = "The eBPF programs Flowlight loads into the kernel. Builds only for bpfel-unknown-none."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "flowlight-ebpf"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf.workspace = true
+# Without `alloc`, which there is no allocator for in here. That the same crate serves both sides is the point:
+# the offsets the daemon parses and the offsets the program reads are one struct, not two that agree by hand.
+flowlight-common.workspace = true
+
+[lints]
+workspace = true
