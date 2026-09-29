@@ -88,4 +88,10 @@ jobs:
       # requests, and insists on finding them: the connection with the right process and port, and the
       # request itself in the clear.
       - name: Attribute and read a real request
-        run: ./scripts/smoke.sh target/release/flowlightd
+        run: |
+          set -euo pipefail
+          # A client that uses GnuTLS by definition, so the GnuTLS probes are exercised rather than assumed.
+          # The runner's own curl and wget are both OpenSSL, which would test the same path three times.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gnutls-bin
+          ./scripts/smoke.sh target/release/flowlightd
