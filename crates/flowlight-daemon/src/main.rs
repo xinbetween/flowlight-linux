@@ -24,14 +24,14 @@ use agent::Agents;
 use anyhow::{Context as _, anyhow, bail};
 use aya::Ebpf;
 use aya::maps::perf::{PerfEvent, PerfEventArrayBuffer};
-use aya::maps::{Array, HashMap as BpfHashMap, MapData, PerfEventArray};
+use aya::maps::{Array, HashMap as BpfHashMap, LruHashMap, MapData, PerfEventArray};
 use aya::programs::uprobe::UProbeScope;
 use aya::programs::{CgroupAttachMode, CgroupSockAddr, TracePoint, UProbe};
 use aya::util::online_cpus;
 use blocking::Blocking;
 use clap::{Parser, Subcommand};
 use flowlight_common::block::{BlockEvent, BlockKey};
-use flowlight_common::connection::{ConnectionEvent, Layout};
+use flowlight_common::connection::{ConnectionEvent, Layout, TaskLayout};
 use flowlight_common::procmaps::TlsLibrary;
 use flowlight_common::tls::TlsChunk;
 use flowlight_common::tracepoint::Format;
@@ -73,6 +73,13 @@ const RULES: Duration = Duration::from_secs(2);
 
 /// Where cgroup v2 is mounted on anything current.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// How often the machine is scanned for agents that have started.
+///
+/// An agent is a long-lived process, so noticing it a second late is fine. Its children are another matter,
+/// and they are marked in the kernel at fork — which is the only ordering that works, because a child can
+/// connect before anything in userspace has noticed it exists.
+const AGENT_SCAN: Duration = Duration::from_secs(1);
 
 /// How often a partial batch is written even though it is not full.
 ///
@@ -181,26 +188,25 @@ enum Command {
         limit: usize,
     },
     /// Refuse connections to a host or address, before the handshake starts.
-    Block {
-        /// A hostname, or a literal address.
-        subject: String,
-        /// Only this port. Every port by default.
-        #[arg(long, default_value_t = 0)]
-        port: u16,
-        /// Why, for whoever reads the rules later.
-        #[arg(long)]
-        note: Option<String>,
-    },
-    /// Remove a rule written by `block`.
-    Allow {
-        /// The hostname or address the rule names.
-        subject: String,
-        /// The port the rule names.
-        #[arg(long, default_value_t = 0)]
-        port: u16,
-    },
-    /// Every rule in force.
+    Block(RuleArgs),
+    /// Allow connections that a broader rule would refuse.
+    ///
+    /// An exception, not a deletion: `forget` removes a rule. Allowing is the default, so an allow rule
+    /// only means something alongside something stricter.
+    Allow(RuleArgs),
+    /// Refuse, and record the question.
+    ///
+    /// A connection cannot be held open while somebody decides — the decision happens inside `connect()`,
+    /// in a program that may not sleep. So this refuses and writes the question down; answering it with
+    /// `allow` or `block` settles the next attempt, which every network client makes.
+    Ask(RuleArgs),
+    /// Every rule, with the identifiers `forget` takes.
     Rules,
+    /// Remove a rule.
+    Forget {
+        /// The identifier, as `rules` prints it.
+        id: i64,
+    },
     /// Which agents have been running, and what each one reached against what it was configured to reach.
     Agents {
         /// How far back to look: `30m`, `6h`, `2d`, or a number of seconds.
@@ -223,6 +229,22 @@ impl Args {
             summary_days: self.summary_days,
         }
     }
+}
+
+/// What every rule-writing command takes.
+#[derive(clap::Args)]
+pub struct RuleArgs {
+    /// A hostname, `*.a-domain.example`, a literal address, or `*` for anything.
+    pub subject: String,
+    /// Only this port. Every port by default.
+    #[arg(long, default_value_t = 0)]
+    pub port: u16,
+    /// Only this agent, and anything it starts. Everyone by default.
+    #[arg(long, value_name = "NAME")]
+    pub agent: Option<String>,
+    /// Why, for whoever reads the rules later.
+    #[arg(long)]
+    pub note: Option<String>,
 }
 
 /// Now, in seconds since the epoch.
@@ -311,8 +333,8 @@ fn main() -> anyhow::Result<()> {
 
     let mut enforcing = None;
     if !args.no_block {
-        match attach_blocking(&mut ebpf) {
-            Ok(map) => enforcing = Some(Blocking::new(map)),
+        match attach_blocking(&mut ebpf, args.tracefs.as_deref()) {
+            Ok((verdicts, marks)) => enforcing = Some(Blocking::new(verdicts, marks)),
             // Not fatal. A kernel or a container that will not take a cgroup hook is a machine that cannot
             // refuse connections, and that is a reason to say so rather than a reason to stop watching.
             Err(err) => eprintln!(
@@ -440,6 +462,7 @@ fn run(
     let mut next_sweep = Instant::now();
     let mut next_flush = Instant::now() + FLUSH;
     let mut next_rules = Instant::now();
+    let mut next_agent_scan = Instant::now();
     let mut seen = 0_u64;
     let mut lost = 0_u64;
 
@@ -466,6 +489,13 @@ fn run(
             next_sweep = Instant::now() + SWEEP;
         }
 
+        if let Some(enforcing) = enforcing.as_deref_mut()
+            && Instant::now() >= next_agent_scan
+        {
+            enforcing.mark_all(&agent::running_agents());
+            next_agent_scan = Instant::now() + AGENT_SCAN;
+        }
+
         if let (Some(store), Some(enforcing)) = (store.as_deref_mut(), enforcing.as_deref_mut())
             && Instant::now() >= next_rules
         {
@@ -474,12 +504,25 @@ fn run(
                     let report = enforcing.apply(&rules);
                     if !report.is_quiet() {
                         eprintln!(
-                            "rules: {} address(es) now refused, {} no longer",
+                            "rules: {} key(s) written, {} taken away",
                             report.added, report.removed
                         );
                         for subject in &report.unresolved {
                             eprintln!(
                                 "  {subject} could not be resolved, so the rule naming it is not in force"
+                            );
+                        }
+                        for id in &report.unenforceable {
+                            eprintln!(
+                                "  rule {id} names a pattern, which cannot be refused before the \
+                                 handshake: the name is resolved and thrown away before connect() is \
+                                 called. It is still reported when it is reached."
+                            );
+                        }
+                        for id in &report.unreadable {
+                            eprintln!(
+                                "  rule {id} says something this version does not understand, so it is \
+                                 not enforced at all"
                             );
                         }
                     }
@@ -504,8 +547,13 @@ fn run(
                 .min(next_scan)
                 .min(next_sweep)
                 .min(next_flush)
-                .min(next_rules),
-            None => next_scan.min(next_sweep).min(next_flush).min(next_rules),
+                .min(next_rules)
+                .min(next_agent_scan),
+            None => next_scan
+                .min(next_sweep)
+                .min(next_flush)
+                .min(next_rules)
+                .min(next_agent_scan),
         };
         let timeout = until.saturating_duration_since(Instant::now());
 
@@ -773,7 +821,38 @@ fn keep(result: anyhow::Result<()>) {
 /// `cgroup_bpf_link_attach` passes that flag itself. Before 5.7 it attaches the old way, where the flag is
 /// the only thing standing between this and evicting somebody else's program. So: ask for no flags, and
 /// fall back to asking for multi, which is exactly one of those two answers on any given kernel.
-fn attach_blocking(ebpf: &mut Ebpf) -> anyhow::Result<BpfHashMap<MapData, BlockKey, u8>> {
+type Enforcement = (
+    BpfHashMap<MapData, BlockKey, u8>,
+    LruHashMap<MapData, u32, u32>,
+);
+
+fn attach_blocking(ebpf: &mut Ebpf, tracefs: Option<&Path>) -> anyhow::Result<Enforcement> {
+    // The scheduler's two tracepoints, read the same way as the socket one and for the same reason.
+    let fork_text = tracefs::format_text(tracefs, "sched", "sched_process_fork")?;
+    let exit_text = tracefs::format_text(tracefs, "sched", "sched_process_exit")?;
+    let task_layout = TaskLayout::from_formats(&Format::new(&fork_text), &Format::new(&exit_text))?;
+    let mut layouts: Array<_, TaskLayout> = Array::try_from(
+        ebpf.map_mut("TASK_LAYOUT")
+            .ok_or_else(|| anyhow!("the compiled program has no TASK_LAYOUT map"))?,
+    )?;
+    layouts
+        .set(0, task_layout, 0)
+        .context("telling the program where this kernel's scheduler tracepoint fields are")?;
+
+    for (program, category, name) in [
+        ("sched_fork", "sched", "sched_process_fork"),
+        ("sched_exit", "sched", "sched_process_exit"),
+    ] {
+        let tracepoint: &mut TracePoint = ebpf
+            .program_mut(program)
+            .ok_or_else(|| anyhow!("the compiled program has no {program} function"))?
+            .try_into()?;
+        tracepoint.load().map_err(explain_load_failure)?;
+        tracepoint
+            .attach(category, name)
+            .with_context(|| format!("attaching to {category}/{name}"))?;
+    }
+
     let cgroup = std::fs::File::open(CGROUP_ROOT).with_context(|| {
         format!(
             "opening {CGROUP_ROOT}. Refusing connections needs cgroup v2, which every distribution has \
@@ -797,10 +876,16 @@ fn attach_blocking(ebpf: &mut Ebpf) -> anyhow::Result<BpfHashMap<MapData, BlockK
                 })?;
         }
     }
-    let map = ebpf
-        .take_map("BLOCKED")
-        .ok_or_else(|| anyhow!("the compiled program has no BLOCKED map"))?;
-    Ok(BpfHashMap::try_from(map)?)
+    let verdicts = ebpf
+        .take_map("VERDICTS")
+        .ok_or_else(|| anyhow!("the compiled program has no VERDICTS map"))?;
+    let marks = ebpf
+        .take_map("PID_AGENT")
+        .ok_or_else(|| anyhow!("the compiled program has no PID_AGENT map"))?;
+    Ok((
+        BpfHashMap::try_from(verdicts)?,
+        LruHashMap::try_from(marks)?,
+    ))
 }
 
 /// `/proc/<pid>/exe`, if the process is still there and we may read it.

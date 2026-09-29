@@ -17,7 +17,10 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
     // A rule can be written before anything has been watched — that is a reasonable order to do things in,
     // and refusing would mean telling somebody to start a daemon in order to configure it. Every other
     // command is a question about history, and a missing database is the answer to it.
-    let writes = matches!(command, Command::Block { .. } | Command::Allow { .. });
+    let writes = matches!(
+        command,
+        Command::Block(_) | Command::Allow(_) | Command::Ask(_) | Command::Forget { .. }
+    );
     if !writes && !database.exists() {
         bail!(
             "there is no database at {}. Nothing has been recorded yet, or it was recorded somewhere else \
@@ -57,35 +60,14 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
                 }
             }
         }
-        Command::Block {
-            subject,
-            port,
-            note,
-        } => {
-            if store.add_rule(subject, *port, "global", note.as_deref())? {
-                let scope = if *port == 0 {
-                    "every port".to_owned()
-                } else {
-                    format!("port {port}")
-                };
-                // Said plainly, because the command returns before the rule is in force and somebody
-                // testing it a second later deserves to know why it has not taken effect yet.
-                eprintln!(
-                    "{subject} on {scope} will be refused. A running flowlightd picks this up within a \
-                     couple of seconds; if none is running, nothing is enforcing anything."
-                );
+        Command::Block(rule) => write_rule(&mut store, "block", rule)?,
+        Command::Allow(rule) => write_rule(&mut store, "allow", rule)?,
+        Command::Ask(rule) => write_rule(&mut store, "ask", rule)?,
+        Command::Forget { id } => {
+            if store.forget_rule(*id)? {
+                eprintln!("Rule {id} is gone.");
             } else {
-                eprintln!("{subject} was already blocked. Nothing changed.");
-            }
-        }
-        Command::Allow { subject, port } => {
-            if store.remove_rule(subject, *port, "global")? {
-                eprintln!("{subject} is no longer blocked.");
-            } else {
-                eprintln!(
-                    "There was no rule for {subject} on that port. `flowlightd rules` lists the ones \
-                     there are."
-                );
+                eprintln!("There is no rule {id}. `flowlightd rules` lists the ones there are.");
             }
         }
         Command::Rules => {
@@ -100,6 +82,8 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
                         out,
                         "{}",
                         line(&RuleView {
+                            id: rule.id,
+                            action: &rule.action,
                             subject: &rule.subject,
                             port: rule.port,
                             scope: &rule.scope,
@@ -115,7 +99,9 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
                     };
                     writeln!(
                         out,
-                        "block  {:<44} port {:<6} {}{}",
+                        "{:<4} {:<6} {:<40} port {:<6} {}{}",
+                        rule.id,
+                        rule.action,
                         rule.subject,
                         port,
                         rule.scope,
@@ -203,6 +189,60 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
                     )?;
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// Writes one rule and says what it did.
+///
+/// The scope is stated plainly, because `block example.com` and `block example.com --agent claude` are
+/// different enough that somebody who meant the second and typed the first should notice immediately.
+fn write_rule(store: &mut Store, action: &str, rule: &crate::RuleArgs) -> anyhow::Result<()> {
+    let scope = rule
+        .agent
+        .as_ref()
+        .map_or_else(|| "everyone".to_owned(), |agent| format!("agent:{agent}"));
+    let wrote = store.put_rule(
+        action,
+        &rule.subject,
+        rule.port,
+        &scope,
+        rule.note.as_deref(),
+    )?;
+
+    let ports = if rule.port == 0 {
+        "any port".to_owned()
+    } else {
+        format!("port {}", rule.port)
+    };
+    let who = rule
+        .agent
+        .as_ref()
+        .map_or_else(|| "everyone".to_owned(), |agent| format!("{agent} only"));
+    match wrote {
+        flowlight_store::Wrote::Unchanged => {
+            eprintln!(
+                "{} was already {action}ed for {who}. Nothing changed.",
+                rule.subject
+            );
+        }
+        flowlight_store::Wrote::Changed | flowlight_store::Wrote::Added => {
+            eprintln!("{}: {action}, {ports}, {who}.", rule.subject);
+            if rule.subject.starts_with("*.") {
+                // Said now rather than discovered later. The rule is real and is reported when it is
+                // reached; what it cannot do is refuse the connection before it happens.
+                eprintln!(
+                    "  A pattern cannot be refused before the handshake — the name is resolved and thrown \
+                     away before connect() is called. It is still matched and reported when it is reached."
+                );
+            }
+            // Said plainly, because the command returns before the rule is in force and somebody testing
+            // it a second later deserves to know why it has not taken effect yet.
+            eprintln!(
+                "  A running flowlightd picks this up within a couple of seconds; if none is running, \
+                 nothing is enforcing anything."
+            );
         }
     }
     Ok(())
@@ -442,6 +482,8 @@ impl<'a> From<&'a RequestRow> for RequestView<'a> {
 
 #[derive(Serialize)]
 struct RuleView<'a> {
+    id: i64,
+    action: &'a str,
     subject: &'a str,
     port: u16,
     scope: &'a str,

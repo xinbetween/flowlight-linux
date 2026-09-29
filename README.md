@@ -131,8 +131,8 @@ Useful flags:
 | `--summary-days N` | days of the daily summary. Default 90 |
 
 Plus subcommands that read the database rather than the kernel — `history --since 6h`, `agents`, `summary`,
-`coverage --since 24h` — and three that write rules: `block`, `allow`, `rules`. `--json` works on all of
-them.
+`coverage --since 24h` — and five for rules: `block`, `allow`, `ask`, `rules`, `forget`. `--json` works on
+all of them.
 
 If it refuses to start, the message says why — an unmounted tracefs, a kernel built without the tracepoint,
 and a policy that forbids loading programs are three different problems and it will not conflate them.
@@ -188,35 +188,71 @@ model name, a UUID, a page number — are left alone.
 claude    pid 17903    → PUT productionresultssa17.blob.core.windows.net/…/logs.txt?se=2026-09-29T08%3A31%3A14Z&sig=…&sp=cw
 ```
 
-### Blocking
+### Rules
 
 A `cgroup/connect` hook refuses a connection **before the SYN**. The application gets `EPERM` from
 `connect()` — the same answer a firewall gives, and one every network client already knows how to report.
 
 ```sh
 sudo ./target/release/flowlightd block telemetry.example.com
-sudo ./target/release/flowlightd block 198.51.100.7 --port 443 --note "noisy"
+sudo ./target/release/flowlightd block '*' --agent claude            # and nothing else
+sudo ./target/release/flowlightd allow api.anthropic.com --agent claude
+sudo ./target/release/flowlightd ask mcp.example.com
 sudo ./target/release/flowlightd rules
-sudo ./target/release/flowlightd allow telemetry.example.com
+sudo ./target/release/flowlightd forget 3
+```
+
+Three actions — **allow**, **ask**, **block** — each scoped to everyone or to one agent, naming a host, a
+`*.subdomain` pattern, a literal address or `*`, and one port or all of them.
+
+**The most specific rule wins**, and specificity reads in a fixed order: **subject, then port, then scope**.
+That order is a claim about what people mean. A rule about a host is a rule about the thing being reached,
+which is the strongest statement anyone writes; a rule about an agent is a statement about who is asking,
+which is weaker than a statement about what they are asking for. So `block telemetry.example` for everyone
+beats `allow *` for one agent, and `allow mcp.sentry.dev for claude` beats `block mcp.sentry.dev` for
+everyone. Both are what somebody writing those two rules meant.
+
+Two rules of equal specificity that disagree are a contradiction, and a contradiction resolves the careful
+way: **block, then ask, then allow**. And the default is allow — nothing is refused unless a rule says so.
+This is a tool for watching that can also refuse, not a firewall with a default-deny posture, and the
+difference should not be discovered by a machine losing its network.
+
+```text
+claude/curl              pid 18422    ⊘ 198.51.100.7:443
 ```
 
 Rules live in the database, so they survive restarts and can be written before the daemon starts. A running
-daemon picks a change up within a couple of seconds. Refusals appear in the live view and in Coverage:
+daemon picks a change up within a couple of seconds. Refusals appear in the live view and in Coverage.
 
-```text
-curl                     pid 18422    ⊘ 198.51.100.7:443
-```
+#### What `ask` means here
 
-This is independent of everything else here. The refusal happens in the kernel at `connect()`, the reading
-happens in the TLS library, and neither needs the other — which is better than the macOS build, where
-blocking goes through the proxy and a blocked connection is one that was first accepted.
+On macOS a connection can be held open while somebody decides. Here it cannot: the decision happens inside
+`connect()`, in a BPF program, which may not sleep and may not talk to anyone. So `ask` **refuses, and
+records the question**. Answering it with `allow` or `block` settles the next attempt, which every network
+client makes. That is a weaker promise than the macOS one, and what it is not is a connection that silently
+hangs.
 
-**What it costs, stated plainly.** The kernel does not have a hostname at `connect()` — the name was
-resolved and thrown away before this point. So blocking `api.example.com` means resolving it here and
-refusing what it currently resolves to. That is exactly right for a host with a stable address, and
-imprecise for anything behind a large content network, where addresses rotate and are shared with everything
-else on it. Names are re-resolved every minute; a block on a shared address is a block on everything at that
-address. `--no-block` turns enforcement off entirely.
+#### How an agent-scoped rule reaches an agent's children
+
+The kernel has to know, inside `connect()`, whether the calling process is working for an agent. Userspace
+cannot tell it in time — an agent spawns a process and that process connects milliseconds later. So
+userspace marks the agents themselves, which it has all the time in the world to notice, and a **fork
+tracepoint copies the mark to the child in the kernel**. Everything an agent starts is therefore marked
+before it can run.
+
+An agent is noticed within a second of starting. Its children are marked instantly.
+
+#### What it costs, stated plainly
+
+The kernel does not have a hostname at `connect()` — the name was resolved and thrown away before this
+point. So blocking `api.example.com` means resolving it here and refusing what it currently resolves to:
+exactly right for a host with a stable address, and imprecise for anything behind a large content network,
+where addresses rotate and are shared with everything else on it. Names are re-resolved every minute.
+
+A `*.subdomain` pattern cannot be refused before the handshake at all, for the same reason — there is no set
+of addresses to write down. The daemon says so when it loads such a rule rather than leaving it silently
+unenforced; the rule still matches and is reported when it is reached. `--no-block` turns enforcement off
+entirely.
 
 ### Agents
 

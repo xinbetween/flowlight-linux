@@ -39,7 +39,7 @@ blocking traffic you cannot attribute, and no point simulating a rule against hi
 | | | | |
 | --- | --- | --- | --- |
 | **0.2.0** | **Blocking** | A `cgroup/connect` hook that refuses before the SYN. Independent of how traffic is read, and better than the macOS equivalent: flow-level and request-level refusal compose here. | [released](https://github.com/xinbetween/flowlight-linux/releases/tag/v0.2.0) |
-| **0.2.1** | **Rules** | Allow, block, ask; precedence; scope by agent, host and port. The semantics are the macOS `RuleBook`'s, and they are not reimplemented from memory — see conformance below. | |
+| **0.2.1** | **Rules** | Allow, block, ask; precedence; scope by agent, host and port. The semantics are the macOS `RuleBook`'s, and they are not reimplemented from memory — see conformance below. | [released](https://github.com/xinbetween/flowlight-linux/releases/tag/v0.2.1) |
 | **0.2.2** | **Rule simulation** | What a rule would have changed, as a delta against real history: decide every recent flow twice and report only the verdicts that moved. The macOS build learnt this the hard way; a rule nobody can preview is a rule nobody enables. | |
 | **0.2.3** | **Budget and retention** | A header allowlist, a daily body-byte ceiling per application, a session window, and a retention period that is stated rather than assumed. Reading everything by default is not a feature. | |
 | **0.2.4** | **MCP domains** | The servers an agent is configured for, the ones it actually reached, and the gap between them — with the two buttons the macOS build settled on: block for this agent, or block everywhere. | |
