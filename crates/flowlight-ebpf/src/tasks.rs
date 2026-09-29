@@ -39,7 +39,7 @@ static TASK_LAYOUT: Array<TaskLayout> = Array::with_max_entries(1, 0);
 /// an agent-scoped rule failed to bite because the agent was not recognised, or because the propagation
 /// that is supposed to reach its children never ran. Without them the two look identical from outside.
 #[map]
-pub static FORK_COUNTS: Array<u64> = Array::with_max_entries(6, 0);
+pub static FORK_COUNTS: Array<u64> = Array::with_max_entries(8, 0);
 
 /// Index of the count of forks seen.
 pub const FORKS_SEEN: u32 = 0;
@@ -62,6 +62,10 @@ pub const LAST_PARENT_FOUND: u32 = 4;
 /// Marking was counted before this, and counted whether or not it worked, because the result was thrown
 /// away. A number that is counted and an action that happened are not the same thing.
 pub const LAST_INSERT_ERROR: u32 = 5;
+/// Index of the last child identifier a mark was written for.
+pub const LAST_CHILD: u32 = 6;
+/// Index of the last identifier the exit tracepoint took a mark away from.
+pub const LAST_EXIT: u32 = 7;
 
 /// Adds one to a counter, as far as the verifier is concerned safely.
 fn bump(index: u32) {
@@ -107,7 +111,10 @@ fn on_fork(ctx: &TracePointContext) -> Result<(), i64> {
     // A full map means this child goes unmarked, which means an agent-scoped rule does not reach it. That
     // is a hole, and 0.2.x's Coverage is where holes are reported rather than papered over.
     match PID_AGENT.insert(&child, &agent, 0) {
-        Ok(()) => bump(MARKS_COPIED),
+        Ok(()) => {
+            record(LAST_CHILD, u64::from(child));
+            bump(MARKS_COPIED);
+        }
         // A full map means this child goes unmarked, which means an agent-scoped rule does not reach it.
         // That is a hole, and a hole is worth a number.
         Err(error) => record(LAST_INSERT_ERROR, error.unsigned_abs().into()),
@@ -127,6 +134,9 @@ fn on_exit(ctx: &TracePointContext) -> Result<(), i64> {
     let layout = TASK_LAYOUT.get(0).ok_or(0_i64)?;
     // SAFETY: as above.
     let pid: u32 = unsafe { ctx.read_at(layout.exit_pid as usize) }?;
+    if unsafe { PID_AGENT.get(&pid) }.is_some() {
+        record(LAST_EXIT, u64::from(pid));
+    }
     let _ = PID_AGENT.remove(&pid);
     Ok(())
 }
