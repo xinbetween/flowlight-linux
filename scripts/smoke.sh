@@ -342,8 +342,11 @@ if [ "$block_tested" = yes ]; then
     fi
     echo "OK: the refusal was reported, with the process that was refused"
 
-    if ! grep -q "1 connection(s) were refused" "$reported"; then
-        echo "FAIL: Coverage did not account for the refused connection." >&2
+    # A count rather than a number: there are three refusals in this file now, and an assertion that knows
+    # how many is an assertion that breaks every time one is added.
+    if ! jq -e '.refused > 0' "$coverage_json" >/dev/null; then
+        echo "FAIL: Coverage did not account for the refused connections." >&2
+        cat "$reported" >&2
         exit 1
     fi
     echo "OK: Coverage accounts for what was refused"
