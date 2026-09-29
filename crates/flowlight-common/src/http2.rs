@@ -557,13 +557,7 @@ mod tests {
     #[test]
     fn a_lost_stream_is_picked_up_again_at_the_next_call() {
         let mut stream = Stream::new();
-        stream.feed(
-            &frame(FRAME_DATA, 0, 1, &[0; 100])
-                .get(..50)
-                .unwrap()
-                .to_vec(),
-            4000,
-        );
+        stream.feed(frame(FRAME_DATA, 0, 1, &[0; 100]).get(..50).unwrap(), 4000);
         assert!(stream.is_desynchronised());
 
         let records = stream.feed(&frame(FRAME_HEADERS, FLAG_END_HEADERS, 5, b"AGAIN"), 0);
@@ -580,13 +574,7 @@ mod tests {
     #[test]
     fn recovery_does_not_accept_bytes_that_are_not_a_frame() {
         let mut stream = Stream::new();
-        stream.feed(
-            &frame(FRAME_DATA, 0, 1, &[0; 100])
-                .get(..50)
-                .unwrap()
-                .to_vec(),
-            4000,
-        );
+        stream.feed(frame(FRAME_DATA, 0, 1, &[0; 100]).get(..50).unwrap(), 4000);
         assert!(
             stream
                 .feed(b"\xff\xff\xff\xff\xff\xff\xff\xff\xff", 0)
