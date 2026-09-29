@@ -142,14 +142,6 @@ impl Blocking {
         }
     }
 
-    /// How many processes the kernel currently has a mark for.
-    ///
-    /// Includes the children the fork tracepoint marked, which is what makes it worth reading rather than
-    /// counting what this side wrote.
-    pub fn marked(&self) -> usize {
-        self.marks.keys().filter(std::result::Result::is_ok).count()
-    }
-
     /// Marks every agent currently running.
     ///
     /// Called on a timer. An agent is a long-lived process, so noticing it a second after it starts is
