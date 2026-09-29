@@ -121,14 +121,14 @@ impl Blocking {
         }
     }
 
-    /// How many forks the kernel saw, and how many carried a mark to a child.
+    /// What the fork tracepoint has been doing: forks seen, marks copied, forks with a layout to read,
+    /// and the last parent identifier it read.
     ///
-    /// The only way to tell an agent that was never recognised from a propagation that never ran.
-    pub fn propagation(&self) -> (u64, u64) {
-        (
-            self.counts.get(&0, 0).unwrap_or(0),
-            self.counts.get(&1, 0).unwrap_or(0),
-        )
+    /// The only way to tell an agent that was never recognised from a propagation that never ran — and,
+    /// with the last identifier, a read that returned nothing from a lookup that missed.
+    pub fn propagation(&self) -> (u64, u64, u64, u64) {
+        let at = |index| self.counts.get(&index, 0).unwrap_or(0);
+        (at(0), at(1), at(2), at(3))
     }
 
     /// How many processes the kernel currently has a mark for.

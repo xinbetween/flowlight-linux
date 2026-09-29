@@ -465,7 +465,7 @@ fn run(
     let mut next_flush = Instant::now() + FLUSH;
     let mut next_rules = Instant::now();
     let mut next_agent_scan = Instant::now();
-    let mut last_propagation = (0_u64, 0_u64);
+    let mut last_propagation = (0_u64, 0_u64, 0_u64, 0_u64);
     let mut seen = 0_u64;
     let mut lost = 0_u64;
 
@@ -498,14 +498,16 @@ fn run(
             // Printed when it moves, not on a timer: the numbers answer a question that only comes up
             // when a rule scoped to an agent does not appear to bite, and the answer has to already be in
             // the log by the time anybody asks.
-            // Either number moving is worth a line. Reporting only the second hid whether the first was
-            // moving at all, which was the whole question.
+            // Every number moving is worth a line. Reporting only one of them hid whether the others
+            // were moving at all, which was the whole question.
             let propagation = enforcing.propagation();
             if propagation != last_propagation {
                 eprintln!(
-                    "the kernel has seen {} fork(s), copied {} mark(s) to children, and holds {} mark(s)",
+                    "forks {}, layout ready {}, marks copied {}, last parent {}, marks held {}",
                     propagation.0,
+                    propagation.2,
                     propagation.1,
+                    propagation.3,
                     enforcing.marked()
                 );
                 last_propagation = propagation;
@@ -651,9 +653,10 @@ fn run(
     }
 
     if let Some(enforcing) = enforcing {
-        let (forks, copied) = enforcing.propagation();
+        let (forks, copied, ready, last) = enforcing.propagation();
         eprintln!(
-            "the kernel saw {forks} fork(s) and carried an agent's mark to {copied} child process(es)"
+            "the kernel saw {forks} fork(s), had a layout for {ready} of them, carried a mark to {copied} \
+             child process(es); last parent seen was {last}"
         );
     }
 

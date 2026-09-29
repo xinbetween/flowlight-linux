@@ -37,12 +37,19 @@ static TASK_LAYOUT: Array<TaskLayout> = Array::with_max_entries(1, 0);
 /// an agent-scoped rule failed to bite because the agent was not recognised, or because the propagation
 /// that is supposed to reach its children never ran. Without them the two look identical from outside.
 #[map]
-pub static FORK_COUNTS: Array<u64> = Array::with_max_entries(2, 0);
+pub static FORK_COUNTS: Array<u64> = Array::with_max_entries(4, 0);
 
 /// Index of the count of forks seen.
 pub const FORKS_SEEN: u32 = 0;
 /// Index of the count of marks copied to a child.
 pub const MARKS_COPIED: u32 = 1;
+/// Index of the count of forks where the layout had been written.
+pub const LAYOUT_READY: u32 = 2;
+/// Index of the last parent identifier read out of a fork record.
+///
+/// Not a count. A number that should look like a process identifier, so that "the reads are wrong" and
+/// "the lookup missed" can be told apart without another round trip.
+pub const LAST_PARENT: u32 = 3;
 
 /// Adds one to a counter, as far as the verifier is concerned safely.
 fn bump(index: u32) {
@@ -50,6 +57,14 @@ fn bump(index: u32) {
         // SAFETY: a plain array value this program alone writes. Not atomic, and does not need to be: it
         // is a diagnostic, and losing one increment to a race on another CPU changes nothing it is for.
         unsafe { *slot += 1 };
+    }
+}
+
+/// Records a value rather than counting one.
+fn record(index: u32, value: u64) {
+    if let Some(slot) = FORK_COUNTS.get_ptr_mut(index) {
+        // SAFETY: as above.
+        unsafe { *slot = value };
     }
 }
 
@@ -68,10 +83,12 @@ pub fn sched_fork(ctx: TracePointContext) -> u32 {
 fn on_fork(ctx: &TracePointContext) -> Result<(), i64> {
     bump(FORKS_SEEN);
     let layout = TASK_LAYOUT.get(0).ok_or(0_i64)?;
+    bump(LAYOUT_READY);
     // SAFETY for both: the offsets come from the kernel's own description of this tracepoint, and the
     // daemon refused to load this program if either field was missing or an unexpected width.
     let parent: u32 = unsafe { ctx.read_at(layout.fork_parent as usize) }?;
     let child: u32 = unsafe { ctx.read_at(layout.fork_child as usize) }?;
+    record(LAST_PARENT, u64::from(parent));
     // SAFETY: the value is a `u32` and the reference does not outlive the lookup.
     let agent = unsafe { PID_AGENT.get(&parent) }.copied().ok_or(0_i64)?;
     // A full map means this child goes unmarked, which means an agent-scoped rule does not reach it. That
