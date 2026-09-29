@@ -88,22 +88,23 @@ pub struct Connections {
     conversations: HashMap<(u32, u64, bool), Conversation>,
 }
 
+/// How many connections are being followed.
+///
+/// Only the tests ask at the moment. Coverage — which is the release whose entire job is saying what was
+/// and was not seen — will want it for real, and it is left here rather than deleted because the number is
+/// the obvious thing that screen has to show.
+#[cfg(test)]
 impl Connections {
-    /// An empty set.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// How many connections are being followed, for the interface to be able to say.
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.conversations.len()
     }
 
-    /// Whether any connection is being followed.
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.conversations.is_empty()
     }
+}
 
+impl Connections {
     /// Feeds one captured buffer and returns whatever it completed.
     pub fn feed(&mut self, chunk: &TlsChunk) -> Vec<Event> {
         let key = (chunk.tgid, chunk.ssl, chunk.is_outbound());
@@ -250,7 +251,7 @@ mod tests {
         let mut bytes = PREFACE.to_vec();
         bytes.extend(frame(FRAME_HEADERS, FLAG_END_HEADERS, 1, &block));
 
-        let mut connections = Connections::new();
+        let mut connections = Connections::default();
         let events = connections.feed(&chunk(0xdead, &bytes));
         assert_eq!(
             events,
@@ -268,7 +269,7 @@ mod tests {
     #[test]
     fn a_second_request_that_refers_back_to_the_first_is_decoded() {
         let mut encoder = Encoder::new();
-        let mut connections = Connections::new();
+        let mut connections = Connections::default();
 
         let first = encoder.encode([
             (b":method".as_slice(), b"POST".as_slice()),
@@ -303,7 +304,7 @@ mod tests {
     /// slightly worse output — they produce confident nonsense.
     #[test]
     fn two_connections_of_one_process_do_not_share_a_table() {
-        let mut connections = Connections::new();
+        let mut connections = Connections::default();
         let mut first_encoder = Encoder::new();
         let mut second_encoder = Encoder::new();
 
@@ -356,7 +357,7 @@ mod tests {
     /// miniature.
     #[test]
     fn the_two_directions_of_a_connection_have_separate_tables() {
-        let mut connections = Connections::new();
+        let mut connections = Connections::default();
         let mut encoder = Encoder::new();
         let block = encoder.encode([(b":status".as_slice(), b"429".as_slice())]);
         let mut inbound = chunk(1, &frame(FRAME_HEADERS, FLAG_END_HEADERS, 1, &block));
@@ -376,7 +377,7 @@ mod tests {
     /// sender has, so the result is plausible and wrong — which has to be said rather than shown.
     #[test]
     fn a_connection_joined_late_is_reported_as_unreadable_rather_than_guessed_at() {
-        let mut connections = Connections::new();
+        let mut connections = Connections::default();
         // An indexed reference to a dynamic table entry that, from here, does not exist.
         let block = [0xbe_u8, 0xbf];
         let events = connections.feed(&chunk(
@@ -393,7 +394,7 @@ mod tests {
     /// kilobytes for the rest of a large upload.
     #[test]
     fn an_unreadable_connection_says_so_once() {
-        let mut connections = Connections::new();
+        let mut connections = Connections::default();
         let block = [0xbe_u8, 0xbf];
         let first = connections.feed(&chunk(
             1,
@@ -411,7 +412,7 @@ mod tests {
     /// decoded; what must not happen is a later block being decoded against a table that has fallen behind.
     #[test]
     fn a_hole_through_a_header_block_makes_the_connection_unreadable() {
-        let mut connections = Connections::new();
+        let mut connections = Connections::default();
         let mut encoder = Encoder::new();
         let block = encoder.encode([(b":method".as_slice(), b"POST".as_slice())]);
         let frame = frame(FRAME_HEADERS, FLAG_END_HEADERS, 1, &block);
@@ -429,7 +430,7 @@ mod tests {
 
     #[test]
     fn a_goaway_forgets_the_connection() {
-        let mut connections = Connections::new();
+        let mut connections = Connections::default();
         let mut encoder = Encoder::new();
         let block = encoder.encode([(b":method".as_slice(), b"GET".as_slice())]);
         connections.feed(&chunk(
