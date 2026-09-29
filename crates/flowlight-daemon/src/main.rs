@@ -72,7 +72,10 @@ const PERF_PAGES: usize = 64;
 )]
 struct Args {
     /// One JSON object per line, for anything that is not a person.
-    #[arg(long)]
+    ///
+    /// Global, so it reads the same before or after a subcommand. `flowlightd history --json` is what
+    /// people type, and being told it belongs three words earlier is a small insult.
+    #[arg(long, global = true)]
     json: bool,
 
     /// Include buffers that do not begin a request or a response — the middles of bodies, mostly.
@@ -100,7 +103,7 @@ struct Args {
     tracefs: Option<PathBuf>,
 
     /// Where to keep what is seen.
-    #[arg(long, value_name = "PATH", default_value = DEFAULT_DATABASE)]
+    #[arg(long, value_name = "PATH", default_value = DEFAULT_DATABASE, global = true)]
     database: PathBuf,
 
     /// Keep nothing. Watch the terminal and let it scroll.
