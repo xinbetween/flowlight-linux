@@ -54,6 +54,8 @@ pub struct ConnectionRow {
     pub confidence: String,
     /// The process.
     pub pid: u32,
+    /// The agent this process is working for, if it is working for one.
+    pub agent: Option<String>,
     /// The address, if the family was one we read.
     pub destination: Option<String>,
     /// The port.
@@ -71,6 +73,11 @@ pub struct RequestRow {
     pub confidence: String,
     /// The process.
     pub pid: u32,
+    /// The agent this process is working for, if it is working for one.
+    ///
+    /// `claude` does not make requests; it spawns `node`, which spawns `git`, which makes one. This is the
+    /// answer to "who caused this", which is the question people ask and `process` does not answer.
+    pub agent: Option<String>,
     /// `out` or `in`.
     pub direction: String,
     /// `http/2` when the connection was one.
@@ -118,6 +125,23 @@ pub struct ProcessRow {
     /// Bytes those requests carried.
     pub bytes: i64,
     /// The most recent one, in seconds since the epoch.
+    pub last_seen: i64,
+}
+
+/// One agent, and what it has been doing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRow {
+    /// The agent.
+    pub agent: String,
+    /// Requests read from it or anything it started.
+    pub requests: i64,
+    /// Distinct hosts reached.
+    pub hosts: i64,
+    /// Distinct processes doing the work.
+    pub processes: i64,
+    /// Bytes those requests carried.
+    pub bytes: i64,
+    /// The most recent one.
     pub last_seen: i64,
 }
 
@@ -301,7 +325,15 @@ impl Store {
         Ok(store)
     }
 
-    /// Creates the schema, or leaves it alone if it is already the one we want.
+    /// The schema this version of the code expects.
+    const SCHEMA: i64 = 2;
+
+    /// Creates the schema, or brings an older one up to it.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` alone is not a migration: it does nothing to a table that already
+    /// exists, so a column added in a later version never appears in a database created by an earlier one.
+    /// A database written by 0.1.7 is a database somebody has a week of history in, and silently failing to
+    /// read it — or silently failing to *write* half of what it is told — is worse than refusing to open it.
     fn migrate(&self) -> Result<()> {
         self.connection.execute_batch(
             "
@@ -316,7 +348,8 @@ impl Store {
                 confidence  TEXT    NOT NULL,
                 pid         INTEGER NOT NULL,
                 destination TEXT,
-                port        INTEGER NOT NULL
+                port        INTEGER NOT NULL,
+                agent       TEXT
             );
             CREATE INDEX IF NOT EXISTS connections_at ON connections(at);
             CREATE TABLE IF NOT EXISTS requests (
@@ -333,7 +366,8 @@ impl Store {
                 status     INTEGER,
                 bytes      INTEGER NOT NULL,
                 truncated  INTEGER NOT NULL,
-                unreadable TEXT
+                unreadable TEXT,
+                agent      TEXT
             );
             CREATE INDEX IF NOT EXISTS requests_at ON requests(at);
             CREATE INDEX IF NOT EXISTS requests_process ON requests(process, at);
@@ -363,11 +397,47 @@ impl Store {
             );
             ",
         )?;
+        // Schema 1 is 0.1.5 through 0.1.7: everything above, without `agent`.
+        for (table, column) in [("requests", "agent"), ("connections", "agent")] {
+            if !self.has_column(table, column)? {
+                self.connection
+                    .execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), [])
+                    .with_context(|| format!("adding {table}.{column} to an existing database"))?;
+            }
+        }
+        // After the columns exist, not before. An index names a column, so creating it in the same batch
+        // as the tables works on a fresh database and fails on every upgraded one — which is the half
+        // nobody runs until it is in somebody's hands.
+        self.connection
+            .execute_batch("CREATE INDEX IF NOT EXISTS requests_agent ON requests(agent, at);")?;
+
         self.connection.execute(
-            "INSERT INTO meta(key, value) VALUES('schema', '1') ON CONFLICT(key) DO NOTHING",
-            [],
+            "INSERT INTO meta(key, value) VALUES('schema', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![Self::SCHEMA.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Whether a table already has a column.
+    fn has_column(&self, table: &str, column: &str) -> Result<bool> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut names = statement.query_map([], |row| row.get::<_, String>(1))?;
+        Ok(names.any(|name| name.is_ok_and(|name| name == column)))
+    }
+
+    /// What schema version the database is at.
+    pub fn schema_version(&self) -> Result<i64> {
+        Ok(self
+            .connection
+            .query_row("SELECT value FROM meta WHERE key = 'schema'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0))
     }
 
     /// Queues a connection.
@@ -397,8 +467,8 @@ impl Store {
         let transaction = self.connection.transaction()?;
         {
             let mut insert = transaction.prepare_cached(
-                "INSERT INTO connections(at, process, confidence, pid, destination, port)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO connections(at, process, confidence, pid, destination, port, agent)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for row in &self.pending_connections {
                 insert.execute(params![
@@ -407,13 +477,14 @@ impl Store {
                     row.confidence,
                     row.pid,
                     row.destination,
-                    row.port
+                    row.port,
+                    row.agent
                 ])?;
             }
             let mut insert = transaction.prepare_cached(
                 "INSERT INTO requests(at, process, confidence, pid, direction, protocol, method,
-                                      target, host, status, bytes, truncated, unreadable)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                      target, host, status, bytes, truncated, unreadable, agent)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             )?;
             for row in &self.pending_requests {
                 insert.execute(params![
@@ -429,7 +500,8 @@ impl Store {
                     row.status,
                     row.bytes,
                     row.truncated,
-                    row.unreadable
+                    row.unreadable,
+                    row.agent
                 ])?;
             }
         }
@@ -503,7 +575,7 @@ impl Store {
         self.flush()?;
         let mut statement = self.connection.prepare(
             "SELECT at, process, confidence, pid, direction, protocol, method, target, host,
-                    status, bytes, truncated, unreadable
+                    status, bytes, truncated, unreadable, agent
              FROM requests WHERE at >= ?1 ORDER BY at DESC, id DESC LIMIT ?2",
         )?;
         let rows = statement.query_map(params![since, limit as i64], |row| {
@@ -521,6 +593,7 @@ impl Store {
                 bytes: row.get(10)?,
                 truncated: row.get(11)?,
                 unreadable: row.get(12)?,
+                agent: row.get(13)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -691,6 +764,55 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Every agent something was read from, busiest first.
+    pub fn agents(&mut self, since: i64) -> Result<Vec<AgentRow>> {
+        self.flush()?;
+        let mut statement = self.connection.prepare(
+            "SELECT agent, count(*), count(DISTINCT host), count(DISTINCT process),
+                    coalesce(sum(bytes), 0), max(at)
+             FROM requests WHERE at >= ?1 AND agent IS NOT NULL
+             GROUP BY agent
+             ORDER BY count(*) DESC",
+        )?;
+        let rows = statement.query_map(params![since], |row| {
+            Ok(AgentRow {
+                agent: row.get(0)?,
+                requests: row.get(1)?,
+                hosts: row.get(2)?,
+                processes: row.get(3)?,
+                bytes: row.get(4)?,
+                last_seen: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The hosts one agent reached, busiest first.
+    ///
+    /// What the MCP comparison is made against: these are the hosts that were actually contacted, and the
+    /// configuration files say which ones were meant to be.
+    pub fn hosts_for_agent(
+        &mut self,
+        agent: &str,
+        since: i64,
+        limit: usize,
+    ) -> Result<Vec<HostRow>> {
+        self.flush()?;
+        let mut statement = self.connection.prepare(
+            "SELECT host, count(*), max(at) FROM requests
+             WHERE at >= ?1 AND agent = ?2 AND host IS NOT NULL
+             GROUP BY host ORDER BY count(*) DESC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![since, agent, limit as i64], |row| {
+            Ok(HostRow {
+                host: row.get(0)?,
+                requests: row.get(1)?,
+                last_seen: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// The hosts one process reached, busiest first.
     pub fn hosts_for(&mut self, process: &str, since: i64, limit: usize) -> Result<Vec<HostRow>> {
         self.flush()?;
@@ -756,6 +878,7 @@ mod tests {
             process: process.to_owned(),
             confidence: "path".to_owned(),
             pid: 4711,
+            agent: None,
             direction: "out".to_owned(),
             protocol: Some("http/2".to_owned()),
             method: Some("POST".to_owned()),
@@ -919,6 +1042,7 @@ mod tests {
                 process: "curl".to_owned(),
                 confidence: "path".to_owned(),
                 pid: 1,
+                agent: None,
                 destination: Some("93.184.216.34".to_owned()),
                 port: 443,
             })
@@ -957,6 +1081,7 @@ mod tests {
                     process: "gh".to_owned(),
                     confidence: "path".to_owned(),
                     pid: 1,
+                    agent: None,
                     destination: Some("140.82.121.6".to_owned()),
                     port: 443,
                 })
@@ -969,6 +1094,7 @@ mod tests {
                 process: "curl".to_owned(),
                 confidence: "path".to_owned(),
                 pid: 2,
+                agent: None,
                 destination: Some("93.184.216.34".to_owned()),
                 port: 443,
             })
@@ -1001,6 +1127,7 @@ mod tests {
                 process: "ssh".to_owned(),
                 confidence: "path".to_owned(),
                 pid: 1,
+                agent: None,
                 destination: Some("10.0.0.1".to_owned()),
                 port: 22,
             })
@@ -1021,6 +1148,7 @@ mod tests {
                 process: "gh".to_owned(),
                 confidence: "path".to_owned(),
                 pid: 1,
+                agent: None,
                 destination: None,
                 port: 443,
             })
@@ -1191,6 +1319,111 @@ mod tests {
             reader.record_note("unprobed-library", "/x", "y").is_err(),
             "the interface has no business writing"
         );
+    }
+
+    // Agents
+
+    /// `claude` does not make requests; it spawns `node`, which spawns `git`. The agent column is the
+    /// answer to "who caused this", which is the question people ask.
+    #[test]
+    fn requests_are_grouped_by_the_agent_that_caused_them() {
+        let mut store = Store::in_memory().unwrap();
+        for (process, host) in [
+            ("node", "api.anthropic.com"),
+            ("git-remote-https", "github.com"),
+            ("curl", "mcp.sentry.dev"),
+        ] {
+            let mut row = request(1_000, process, host, 100);
+            row.agent = Some("claude".to_owned());
+            store.record_request(row).unwrap();
+        }
+        // And one belonging to nobody.
+        store
+            .record_request(request(1_000, "apt", "archive.ubuntu.com", 10))
+            .unwrap();
+
+        let agents = store.agents(0).unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].agent, "claude");
+        assert_eq!(agents[0].requests, 3);
+        assert_eq!(agents[0].hosts, 3);
+        assert_eq!(agents[0].processes, 3);
+    }
+
+    #[test]
+    fn the_hosts_one_agent_reached_are_its_own() {
+        let mut store = Store::in_memory().unwrap();
+        let mut mine = request(1_000, "node", "mcp.sentry.dev", 1);
+        mine.agent = Some("claude".to_owned());
+        store.record_request(mine).unwrap();
+        let mut theirs = request(1_000, "node", "other.example", 1);
+        theirs.agent = Some("codex".to_owned());
+        store.record_request(theirs).unwrap();
+
+        let hosts = store.hosts_for_agent("claude", 0, 10).unwrap();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].host, "mcp.sentry.dev");
+    }
+
+    /// A database written by 0.1.7 is a database somebody has a week of history in. `CREATE TABLE IF NOT
+    /// EXISTS` does nothing to a table that already exists, so without a real migration the new column
+    /// would never appear and every write would fail against it.
+    #[test]
+    fn a_database_from_the_previous_version_is_brought_forward_without_losing_anything() {
+        let directory = std::env::temp_dir().join("flowlight-store-migrate");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("flowlight.db");
+
+        // Schema 1, exactly as 0.1.5 through 0.1.7 wrote it.
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE connections (id INTEGER PRIMARY KEY, at INTEGER NOT NULL,
+               process TEXT NOT NULL, confidence TEXT NOT NULL, pid INTEGER NOT NULL,
+               destination TEXT, port INTEGER NOT NULL);
+             CREATE TABLE requests (id INTEGER PRIMARY KEY, at INTEGER NOT NULL,
+               process TEXT NOT NULL, confidence TEXT NOT NULL, pid INTEGER NOT NULL,
+               direction TEXT NOT NULL, protocol TEXT, method TEXT, target TEXT, host TEXT,
+               status INTEGER, bytes INTEGER NOT NULL, truncated INTEGER NOT NULL, unreadable TEXT);
+             INSERT INTO meta(key, value) VALUES('schema', '1');
+             INSERT INTO requests(at, process, confidence, pid, direction, bytes, truncated)
+               VALUES (1000, 'claude', 'path', 7, 'out', 42, 0);",
+        )
+        .unwrap();
+        drop(old);
+
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 2);
+
+        // The old row is still there, and reads back with no agent rather than failing.
+        let rows = store.requests_since(0, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].process, "claude");
+        assert_eq!(rows[0].agent, None);
+
+        // And a new row with an agent can be written into the same table.
+        let mut fresh = request(2_000, "node", "api.anthropic.com", 1);
+        fresh.agent = Some("claude".to_owned());
+        store.record_request(fresh).unwrap();
+        store.flush().unwrap();
+        assert_eq!(
+            store.requests_since(1_500, 10).unwrap()[0].agent.as_deref(),
+            Some("claude")
+        );
+    }
+
+    /// Opening twice must not try to migrate twice.
+    #[test]
+    fn migrating_an_already_current_database_changes_nothing() {
+        let directory = std::env::temp_dir().join("flowlight-store-migrate-twice");
+        let _ = std::fs::remove_dir_all(&directory);
+        let path = directory.join("flowlight.db");
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 2);
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 2);
     }
 
     /// This file holds every host every process on the machine reached. On a shared machine that is a list

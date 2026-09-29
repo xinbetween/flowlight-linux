@@ -26,6 +26,9 @@ pub struct Record {
     pub executable_replaced: bool,
     /// The process.
     pub pid: u32,
+    /// The agent this process is working for, filled in after the fact from the process tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// The thread that called `connect()`, which is the process itself more often than not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread: Option<u32>,
@@ -59,6 +62,7 @@ impl Record {
             name_may_be_truncated: identity.may_be_truncated(),
             executable_replaced: exe.is_some_and(executable_was_replaced),
             pid: event.tgid,
+            agent: None,
             thread: (event.pid != event.tgid).then_some(event.pid),
             // Redundant when it matches the name, and the one thing worth keeping when it does not.
             comm: comm
@@ -69,6 +73,16 @@ impl Record {
         }
     }
 
+    /// The name column: the agent and the process, when they are not the same thing.
+    ///
+    /// `claude/node` rather than `node`, because `node` is true and answers nobody's question.
+    pub fn who(&self) -> String {
+        match &self.agent {
+            Some(agent) if *agent != self.process => format!("{agent}/{}", self.process),
+            _ => self.process.clone(),
+        }
+    }
+
     /// The same thing, in the shape the database keeps.
     pub fn stored(&self, at: i64) -> ConnectionRow {
         ConnectionRow {
@@ -76,6 +90,7 @@ impl Record {
             process: self.process.clone(),
             confidence: self.confidence.to_owned(),
             pid: self.pid,
+            agent: self.agent.clone(),
             destination: self.destination.clone(),
             port: self.port,
         }
@@ -100,7 +115,9 @@ impl Record {
         };
         format!(
             "{:<24} pid {:<8} → {destination}{separator}{}{note}",
-            self.process, self.pid, self.port
+            self.who(),
+            self.pid,
+            self.port
         )
     }
 }

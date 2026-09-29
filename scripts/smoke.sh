@@ -17,8 +17,17 @@ log=$(mktemp)
 stored=$(mktemp)
 reported=$(mktemp)
 coverage_json=$(mktemp)
+agents_json=$(mktemp)
+fake_agent=$(mktemp -d)/claude
 database=$(mktemp -d)/flowlight.db
-trap 'rm -f "$output" "$log" "$stored" "$reported" "$coverage_json"; sudo rm -rf "$(dirname "$database")"' EXIT
+cleanup() {
+    rm -f "$output" "$log" "$stored" "$reported" "$coverage_json" "$agents_json"
+    rm -rf "$(dirname "$fake_agent")"
+    [ "${agent_tested:-no}" = yes ] && rm -f "$agent_config"
+    sudo rm -rf "$(dirname "$database")"
+    return 0
+}
+trap cleanup EXIT
 
 echo "Watching for 20 seconds..."
 sudo "$binary" --json --seconds 25 --database "$database" --ui 127.0.0.1:0 >"$output" 2>"$log" &
@@ -82,6 +91,23 @@ if command -v gnutls-cli >/dev/null; then
     echo "Connecting with gnutls-cli, which uses GnuTLS by definition..."
     printf 'GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$target_host" \
         | timeout 15 gnutls-cli --no-ca-verification "$target_host:443" >/dev/null 2>&1 || true
+fi
+
+# An agent, and a request made by something it started. `claude` does not make requests: it spawns things
+# that do, and attributing those to `curl` is true and useless. A copy of /bin/sh named `claude` is an agent
+# as far as Flowlight is concerned -- the name of the executable is the identity everywhere else, and
+# inventing a stricter rule here would mean two screens disagreeing about what a thing is called.
+agent_home=$(getent passwd "$(id -un)" | cut -d: -f6)
+agent_config="$agent_home/.claude.json"
+agent_tested=no
+if [ -n "$agent_home" ] && [ -d "$agent_home" ] && ! [ -e "$agent_config" ]; then
+    agent_tested=yes
+    printf '{"mcpServers":{"smoke":{"type":"http","url":"https://%s/mcp"}}}' "$target_host" >"$agent_config"
+    cp /bin/sh "$fake_agent"
+    echo "Making a request from a process named claude..."
+    # `; :` rather than a bare command, so the shell does not exec curl in place and vanish -- the process
+    # tree is the whole point of the test.
+    "$fake_agent" -c "curl -sS --http1.1 --max-time 10 https://$target_host/ -o /dev/null; :"
 fi
 
 # A Go program, whose TLS is written in Go and linked into its own binary. Flowlight probes libraries, so it
@@ -211,6 +237,30 @@ if [ "$go_tested" = yes ]; then
     echo "OK: Coverage named the Go program whose traffic could not be read"
 else
     echo "SKIP: gh or its token is unavailable, so the unreadable-process case was not exercised"
+fi
+
+if [ "$agent_tested" = yes ]; then
+    if ! jq -s -e 'map(select(.agent == "claude" and .process == "curl")) | length > 0' "$stored" >/dev/null; then
+        echo "FAIL: a request made by a process an agent started was not attributed to the agent." >&2
+        exit 1
+    fi
+    echo "OK: a request from an agent's child was attributed to the agent"
+
+    echo "--- what each agent reached, against what it was configured to reach:"
+    sudo "$binary" --database "$database" agents --since 10m | tee /dev/stderr
+    sudo "$binary" --database "$database" --json agents --since 10m > "$agents_json"
+    if ! jq -s -e "map(select(.agent == \"claude\")) | length > 0" "$agents_json" >/dev/null; then
+        echo "FAIL: the agent was not listed." >&2
+        exit 1
+    fi
+    if ! jq -s -e "[.[] | select(.agent == \"claude\") | .domains[] | select(.host == \"$target_host\" and .standing == \"used\")] | length > 0" "$agents_json" >/dev/null; then
+        echo "FAIL: a configured MCP host that was reached was not reported as used." >&2
+        cat "$agents_json" >&2
+        exit 1
+    fi
+    echo "OK: a configured MCP server that was reached is reported as used"
+else
+    echo "SKIP: a home directory without an existing ~/.claude.json was not available"
 fi
 
 mode=$(sudo stat -c '%a' "$database")

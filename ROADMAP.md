@@ -28,7 +28,7 @@ release where nobody can tell which one broke something.
 | **0.1.5** | **Storage and retention** | SQLite, the rollup tiers, and a retention policy that is stated rather than assumed. | [released](https://github.com/xinbetween/flowlight-linux/releases/tag/v0.1.5) |
 | **0.1.6** | **Coverage** | What was not seen, and why: a TLS library with no probe, a container in another namespace, a process that exited before attribution landed. The screen that makes the rest trustworthy. | [released](https://github.com/xinbetween/flowlight-linux/releases/tag/v0.1.6) |
 | **0.1.7** | **The local interface** | A web UI on loopback. Live, processes, and Coverage, behind a token because loopback is not a permission boundary. | [released](https://github.com/xinbetween/flowlight-linux/releases/tag/v0.1.7) |
-| **0.1.8** | **Agent attribution** | Which agent a process works for, MCP servers from their configuration files, tool calls read out of the payloads already being captured. | |
+| **0.1.8** | **Agent attribution** | Which agent a process works for, from the process tree. MCP servers read out of the agents' own configuration files, compared with the hosts they actually reached. | [released](https://github.com/xinbetween/flowlight-linux/releases/tag/v0.1.8) |
 
 ## 0.2.x — parity with the macOS build
 

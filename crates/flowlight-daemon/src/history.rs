@@ -5,9 +5,10 @@
 
 use crate::Command;
 use anyhow::{Context as _, bail};
+use flowlight_agents::mcp;
 use flowlight_store::{RequestRow, Store};
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Answers one question and exits.
@@ -48,6 +49,41 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
                     writeln!(out, "{}", request_json(&row))?;
                 } else {
                     writeln!(out, "{}", request_line(&row))?;
+                }
+            }
+        }
+        Command::Agents { since } => {
+            let window = parse_window(since)
+                .with_context(|| format!("reading `{since}` as a length of time"))?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs() as i64);
+            let agents = store.agents(now - window)?;
+            if agents.is_empty() {
+                eprintln!(
+                    "No agent has been seen in the last {since}. Flowlight recognises an agent by the name \
+                     of its executable and attributes anything it starts to it; a tool it does not \
+                     recognise appears under its own name instead."
+                );
+                return Ok(());
+            }
+            let configured = configured_servers();
+            for agent in agents {
+                let contacted: Vec<(String, i64)> = store
+                    .hosts_for_agent(&agent.agent, now - window, 200)?
+                    .into_iter()
+                    .map(|host| (host.host, host.requests))
+                    .collect();
+                let mine: Vec<mcp::Server> = configured
+                    .iter()
+                    .filter(|server| server.agent == agent.agent)
+                    .cloned()
+                    .collect();
+                let domains = mcp::merge(&mine, &contacted, mcp::endpoints_for(&agent.agent));
+                if json {
+                    writeln!(out, "{}", agent_json(&agent, &mine, &domains))?;
+                } else {
+                    write!(out, "{}", agent_report(&agent, &mine, &domains))?;
                 }
             }
         }
@@ -95,6 +131,140 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
         }
     }
     Ok(())
+}
+
+/// Every MCP server configured anywhere on the machine.
+///
+/// Home directories rather than one: this daemon runs as root and watches the whole machine, and the agents
+/// on it belong to users. Reading only root's configuration would find nothing on every machine anyone
+/// actually uses.
+pub fn configured_servers() -> Vec<mcp::Server> {
+    let mut homes = vec![PathBuf::from("/root")];
+    if let Ok(entries) = std::fs::read_dir("/home") {
+        homes.extend(entries.flatten().map(|entry| entry.path()));
+    }
+    mcp::configuration_files(&homes)
+        .iter()
+        .flat_map(|(agent, path)| mcp::read(agent, path))
+        .collect()
+}
+
+/// One agent, as prose.
+fn agent_report(
+    agent: &flowlight_store::AgentRow,
+    configured: &[mcp::Server],
+    domains: &[mcp::Domain],
+) -> String {
+    let mut out = format!(
+        "\n{}\n  {} request(s) from {} process(es), {} host(s), last {} seconds ago\n",
+        agent.agent,
+        agent.requests,
+        agent.processes,
+        agent.hosts,
+        seconds_ago(agent.last_seen)
+    );
+
+    let local: Vec<&mcp::Server> = configured
+        .iter()
+        .filter(|server| !server.transport.crosses_the_network())
+        .collect();
+    if !local.is_empty() {
+        // Said rather than omitted. A server that talks over a pipe is a server nothing here can ever see,
+        // and leaving it off the screen invites the conclusion that Flowlight looked and found nothing.
+        out.push_str(&format!(
+            "\n  {} MCP server(s) run locally and never touch the network, so nothing here can see them: {}\n",
+            local.len(),
+            local
+                .iter()
+                .map(|server| server.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    if domains.is_empty() {
+        out.push_str("\n  No hosts reached, and none configured.\n");
+        return out;
+    }
+
+    out.push_str("\n  Hosts, against what this agent was configured to reach:\n\n");
+    for domain in domains {
+        let servers = if domain.servers.is_empty() {
+            String::new()
+        } else {
+            format!("  ({})", domain.servers.join(", "))
+        };
+        out.push_str(&format!(
+            "    {:<11} {:<44} {:>6} request(s){servers}\n",
+            domain.standing.as_str(),
+            domain.host,
+            domain.requests
+        ));
+    }
+    out.push_str(
+        "\n    unexpected  reached, and in no configuration — the one worth a second look\n\
+         \x20   unused      configured, and not reached\n\
+         \x20   used        configured, and reached\n\
+         \x20   endpoint    the agent's own service, which is neither MCP nor a surprise\n",
+    );
+    out
+}
+
+/// One agent, as JSON.
+fn agent_json(
+    agent: &flowlight_store::AgentRow,
+    configured: &[mcp::Server],
+    domains: &[mcp::Domain],
+) -> String {
+    let servers: Vec<String> = configured
+        .iter()
+        .map(|server| {
+            format!(
+                "{{\"name\":{},\"transport\":{},\"host\":{},\"source\":{}}}",
+                quote(&server.name),
+                quote(server.transport.as_str()),
+                server.host.as_deref().map_or("null".to_owned(), quote),
+                quote(&server.source)
+            )
+        })
+        .collect();
+    let hosts: Vec<String> = domains
+        .iter()
+        .map(|domain| {
+            format!(
+                "{{\"host\":{},\"standing\":{},\"requests\":{},\"servers\":[{}]}}",
+                quote(&domain.host),
+                quote(domain.standing.as_str()),
+                domain.requests,
+                domain
+                    .servers
+                    .iter()
+                    .map(|name| quote(name))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+        .collect();
+    format!(
+        "{{\"agent\":{},\"requests\":{},\"processes\":{},\"hosts\":{},\"bytes\":{},\
+         \"last_seen\":{},\"configured\":[{}],\"domains\":[{}]}}",
+        quote(&agent.agent),
+        agent.requests,
+        agent.processes,
+        agent.hosts,
+        agent.bytes,
+        agent.last_seen,
+        servers.join(","),
+        hosts.join(",")
+    )
+}
+
+/// How long ago, in seconds, without pulling in a date library for one number.
+fn seconds_ago(at: i64) -> i64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64);
+    (now - at).max(0)
 }
 
 /// Coverage, as prose.
@@ -358,6 +528,64 @@ mod tests {
         );
         assert!(report.contains("0 record(s) were lost"), "{report}");
         assert!(report.contains("0 call(s) carried more than"), "{report}");
+    }
+
+    /// `node` is true and answers nobody's question. The report leads with the agent.
+    #[test]
+    fn an_agents_report_names_what_it_reached_and_what_it_did_not() {
+        let agent = flowlight_store::AgentRow {
+            agent: "claude".to_owned(),
+            requests: 42,
+            hosts: 3,
+            processes: 4,
+            bytes: 1_000,
+            last_seen: 0,
+        };
+        let configured = [mcp::Server {
+            name: "sentry".to_owned(),
+            agent: "claude".to_owned(),
+            source: "~/.claude.json".to_owned(),
+            transport: mcp::Transport::Http,
+            host: Some("mcp.sentry.dev".to_owned()),
+            command: None,
+        }];
+        let contacted = [
+            ("mcp.sentry.dev".to_owned(), 12),
+            ("telemetry.example".to_owned(), 3),
+            ("api.anthropic.com".to_owned(), 27),
+        ];
+        let domains = mcp::merge(&configured, &contacted, mcp::endpoints_for("claude"));
+        let report = agent_report(&agent, &configured, &domains);
+
+        assert!(report.contains("claude"), "{report}");
+        assert!(report.contains("unexpected  telemetry.example"), "{report}");
+        assert!(report.contains("used        mcp.sentry.dev"), "{report}");
+        assert!(report.contains("endpoint    api.anthropic.com"), "{report}");
+    }
+
+    /// A server that talks over a pipe is a server nothing here can ever see. Leaving it off the screen
+    /// invites the conclusion that Flowlight looked and found nothing.
+    #[test]
+    fn a_local_mcp_server_is_said_to_be_invisible_rather_than_omitted() {
+        let agent = flowlight_store::AgentRow {
+            agent: "claude".to_owned(),
+            requests: 0,
+            hosts: 0,
+            processes: 0,
+            bytes: 0,
+            last_seen: 0,
+        };
+        let configured = [mcp::Server {
+            name: "filesystem".to_owned(),
+            agent: "claude".to_owned(),
+            source: "~/.claude.json".to_owned(),
+            transport: mcp::Transport::Stdio,
+            host: None,
+            command: Some("npx".to_owned()),
+        }];
+        let report = agent_report(&agent, &configured, &[]);
+        assert!(report.contains("never touch the network"), "{report}");
+        assert!(report.contains("filesystem"), "{report}");
     }
 
     #[test]

@@ -58,6 +58,14 @@
   }
   .tag.warn { color: var(--warn); border-color: var(--warn); }
   .status-2 { color: var(--ok); } .status-4, .status-5 { color: var(--accent); }
+  .standing { font-size: 11px; padding: 1px 7px; border-radius: 4px; border: 1px solid var(--line);
+              color: var(--dim); white-space: nowrap; }
+  .standing.unexpected { color: var(--accent); border-color: var(--accent); }
+  .standing.unused { color: var(--warn); border-color: var(--warn); }
+  .standing.used { color: var(--ok); border-color: var(--ok); }
+  .agent { font-weight: 600; }
+  .agent-block { margin-bottom: 28px; }
+  .agent-block h2 { font-size: 16px; margin: 0 0 2px; }
   .clickable { cursor: pointer; }
   .cards { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
@@ -90,7 +98,8 @@
   </select>
   <nav>
     <button data-tab="live" aria-current="true">Live</button>
-    <button data-tab="agents">Processes</button>
+    <button data-tab="agents">Agents</button>
+    <button data-tab="processes">Processes</button>
     <button data-tab="coverage">Coverage</button>
   </nav>
 </header>
@@ -98,6 +107,7 @@
 <main>
   <section id="live"></section>
   <section id="agents" hidden></section>
+  <section id="processes" hidden></section>
   <section id="coverage" hidden></section>
 </main>
 
@@ -147,6 +157,46 @@ const confidenceTag = (confidence) =>
           : 'No name was available. This identity is a process id and does not outlive it.'
       }">${escapeHtml(confidence)}</span>`;
 
+// `node` is true and answers nobody's question. The agent is what caused the request.
+const who = (row) =>
+  row.agent && row.agent !== row.process
+    ? `<span class="agent">${escapeHtml(row.agent)}</span><span class="dim">/${escapeHtml(row.process)}</span>`
+    : escapeHtml(row.process);
+
+function renderAgentTab(rows) {
+  if (!rows.length) {
+    return `<p class="empty">No agent has been seen in this window. Flowlight recognises an agent by the name
+      of its executable and attributes anything it starts to it; a tool it does not recognise appears under
+      its own name on the <a href="#" data-goto="processes">Processes</a> tab instead.</p>`;
+  }
+  return rows.map((agent) => {
+    const local = agent.local.length
+      ? `<p class="note">${agent.local.length} MCP server${agent.local.length === 1 ? '' : 's'} configured here
+         run locally and never touch the network, so nothing here can see them:
+         <span class="mono">${agent.local.map(escapeHtml).join(', ')}</span>.</p>`
+      : '';
+    const domains = agent.domains.length
+      ? `<table><thead><tr><th></th><th>Host</th><th>Configured as</th>
+          <th class="num">Requests</th></tr></thead><tbody>${agent.domains.map((d) => `<tr>
+          <td style="width:1%"><span class="standing ${escapeHtml(d.standing)}" title="${
+            { unexpected: 'Reached, and in no configuration. The one worth a second look.',
+              unused: 'Configured, and not reached in this window.',
+              used: 'Configured, and reached.',
+              endpoint: 'This agent&#39;s own service. Neither MCP nor a surprise.' }[d.standing] || ''
+          }">${escapeHtml(d.standing)}</span></td>
+          <td class="target">${escapeHtml(d.host)}</td>
+          <td class="dim mono">${d.servers.map(escapeHtml).join(', ')}</td>
+          <td class="num">${d.requests}</td></tr>`).join('')}</tbody></table>`
+      : `<p class="empty">No hosts reached, and none configured.</p>`;
+    return `<div class="agent-block">
+      <h2>${escapeHtml(agent.agent)}</h2>
+      <p class="note">${agent.requests} request${agent.requests === 1 ? '' : 's'} from
+        ${agent.processes} process${agent.processes === 1 ? '' : 'es'}, ${agent.hosts} host${agent.hosts === 1 ? '' : 's'},
+        ${size(agent.bytes)}, last ${ago(agent.last_seen)} ago.</p>
+      ${local}${domains}</div>`;
+  }).join('');
+}
+
 function renderLive(rows) {
   if (!rows.length) {
     return `<p class="empty">Nothing read in this window. That is not the same as nothing happening —
@@ -163,7 +213,7 @@ function renderLive(rows) {
     return `<tr>
       <td class="dim num" style="width:1%">${ago(row.at)}</td>
       <td style="width:1%">${row.direction === 'out' ? '→' : '←'}</td>
-      <td class="mono" style="width:1%; white-space:nowrap">${escapeHtml(row.process)}${confidenceTag(row.confidence)}</td>
+      <td class="mono" style="width:1%; white-space:nowrap">${who(row)}${confidenceTag(row.confidence)}</td>
       <td>${what}${row.truncated ? ' <span class="tag warn" title="The call carried more than four kilobytes; the rest was not captured.">truncated</span>' : ''}</td>
       <td class="dim num hide-narrow" style="width:1%">${escapeHtml(row.protocol || 'http/1')}</td>
     </tr>`;
@@ -240,9 +290,11 @@ async function refresh() {
     if (tab === 'live') {
       $('live').innerHTML = renderLive(await api('/api/requests', { limit: '300' }));
     } else if (tab === 'agents') {
+      $('agents').innerHTML = renderAgentTab(await api('/api/agents'));
+    } else if (tab === 'processes') {
       const rows = await api('/api/processes');
       const hosts = openProcess ? await api('/api/hosts', { process: openProcess }) : [];
-      $('agents').innerHTML = renderAgents(rows, hosts);
+      $('processes').innerHTML = renderAgents(rows, hosts);
     } else {
       $('coverage').innerHTML = renderCoverage(await api('/api/coverage'));
     }
@@ -273,7 +325,7 @@ function show(next) {
   for (const button of document.querySelectorAll('nav button')) {
     button.setAttribute('aria-current', String(button.dataset.tab === tab));
   }
-  for (const id of ['live', 'agents', 'coverage']) $(id).hidden = id !== tab;
+  for (const id of ['live', 'agents', 'processes', 'coverage']) $(id).hidden = id !== tab;
   refresh();
 }
 

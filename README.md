@@ -6,11 +6,10 @@ Early, and already doing the thing the design note argues for: **reading HTTPS i
 terminating it, installing a certificate, or defeating anything.**
 
 ```text
-curl                     pid 18422    → 93.184.216.34:443
 curl                     pid 18422    → GET example.com/
-curl                     pid 18422    ← 200  1256 bytes
-claude                   pid 17903    → POST api.anthropic.com/v1/messages
-claude                   pid 17903    ← 200  8214 bytes
+claude/node              pid 17903    → POST api.anthropic.com/v1/messages
+claude/node              pid 17903    ← 200  8214 bytes
+claude/git-remote-https  pid 18055    → POST github.com/xinbetween/flowlight.git/git-upload-pack
 ```
 
 [docs/DESIGN.md](docs/DESIGN.md) is the design note behind it: what was researched, what was measured, and
@@ -130,8 +129,8 @@ Useful flags:
 | `--retention-days N` | days of individual requests. Default 7 |
 | `--summary-days N` | days of the daily summary. Default 90 |
 
-And three subcommands that read the database rather than the kernel: `history --since 6h`, `summary`, and
-`coverage --since 24h`. `--json` works on all of them.
+And four subcommands that read the database rather than the kernel: `history --since 6h`, `agents`,
+`summary`, and `coverage --since 24h`. `--json` works on all of them.
 
 If it refuses to start, the message says why — an unmounted tracefs, a kernel built without the tracepoint,
 and a policy that forbids loading programs are three different problems and it will not conflate them.
@@ -187,10 +186,46 @@ model name, a UUID, a page number — are left alone.
 claude    pid 17903    → PUT productionresultssa17.blob.core.windows.net/…/logs.txt?se=2026-09-29T08%3A31%3A14Z&sig=…&sp=cw
 ```
 
+### Agents
+
+`claude` does not make requests. It spawns `node`, which spawns `bash`, which spawns `git`, which spawns
+`git-remote-https`, which makes the request. Attributing that to `git-remote-https` is true and useless — so
+every record carries the agent that caused it, found by walking up the process tree and stopping at the first
+one Flowlight recognises.
+
+```sh
+sudo ./target/release/flowlightd agents --since 24h
+```
+
+```text
+claude
+  142 request(s) from 4 process(es), 6 host(s), last 12 seconds ago
+
+  2 MCP server(s) run locally and never touch the network, so nothing here can see them: filesystem, git
+
+  Hosts, against what this agent was configured to reach:
+
+    unexpected  telemetry.example.com                            18 request(s)
+    used        mcp.sentry.dev                                   12 request(s)  (sentry)
+    unused      mcp.linear.app                                    0 request(s)  (linear)
+    endpoint    api.anthropic.com                               340 request(s)
+```
+
+The standings are the point. **unexpected** is reached and in no configuration — the one worth a second look.
+**unused** is configured and never reached: clutter, or something that stopped working. **endpoint** is the
+agent's own service, which is neither MCP nor a surprise; without that distinction every agent's model API
+would read as unexpected, which is the fastest possible way to teach somebody to ignore this screen.
+
+Configured servers are read from the agents' own files — `~/.claude.json`, `~/.codex/config.toml`,
+`~/.cursor/mcp.json`, `~/.gemini/settings.json` and the rest — across every home directory on the machine,
+because the daemon runs as root and the agents belong to users. A server that runs locally over a pipe is
+listed as invisible rather than omitted: nothing here can ever see it, and leaving it off the screen invites
+the conclusion that Flowlight looked and found nothing.
+
 ### The interface
 
-A page on `127.0.0.1`, because a daemon with no window is a daemon nobody looks at. Three tabs — **Live**,
-**Processes**, **Coverage** — and a window selector from fifteen minutes to seven days.
+A page on `127.0.0.1`, because a daemon with no window is a daemon nobody looks at. Four tabs — **Live**,
+**Agents**, **Processes**, **Coverage** — and a window selector from fifteen minutes to seven days.
 
 The awkward part, said here rather than left to be discovered: this daemon runs as root, and what it knows is
 every host every process on the machine reached. **Loopback is not a permission boundary** — anything served

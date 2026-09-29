@@ -10,6 +10,7 @@
 //!
 //! Needs root, or `CAP_BPF` and `CAP_PERFMON`. There is no version of loading a probe that does not.
 
+mod agent;
 mod history;
 mod http2;
 mod libraries;
@@ -18,6 +19,7 @@ mod record;
 mod tracefs;
 mod ui;
 
+use agent::Agents;
 use anyhow::{Context as _, anyhow, bail};
 use aya::Ebpf;
 use aya::maps::perf::{PerfEvent, PerfEventArrayBuffer};
@@ -160,6 +162,12 @@ enum Command {
         /// At most this many rows.
         #[arg(long, default_value_t = 100)]
         limit: usize,
+    },
+    /// Which agents have been running, and what each one reached against what it was configured to reach.
+    Agents {
+        /// How far back to look: `30m`, `6h`, `2d`, or a number of seconds.
+        #[arg(long, value_name = "WINDOW", default_value = "24h")]
+        since: String,
     },
     /// What was seen, and — more usefully — what was not.
     Coverage {
@@ -361,6 +369,7 @@ fn run(
         .seconds
         .map(|seconds| Instant::now() + Duration::from_secs(seconds));
     let mut stdout = std::io::stdout().lock();
+    let mut agents = Agents::new();
     let mut payloads = Payloads::new();
     let mut probed = BTreeSet::new();
     let mut next_scan = Instant::now();
@@ -420,7 +429,8 @@ fn run(
             }
             Ok(Message::Connection(event)) => {
                 let exe = executable_of(event.tgid);
-                let record = Record::describe(&event, exe.as_deref());
+                let mut record = Record::describe(&event, exe.as_deref());
+                record.agent = agents.of(event.tgid);
                 if let Some(store) = store.as_deref_mut() {
                     keep(store.record_connection(record.stored(now())));
                 }
@@ -428,12 +438,17 @@ fn run(
             }
             Ok(Message::Payload(chunk)) => {
                 let exe = executable_of(chunk.tgid);
-                let records = payloads.observe(&chunk, exe.as_deref());
+                let agent = agents.of(chunk.tgid);
+                let mut records = payloads.observe(&chunk, exe.as_deref());
+                for record in &mut records {
+                    record.agent.clone_from(&agent);
+                }
                 if records.is_empty() {
                     if !args.all {
                         continue;
                     }
-                    let plain = Payloads::plain(&chunk, exe.as_deref());
+                    let mut plain = Payloads::plain(&chunk, exe.as_deref());
+                    plain.agent = agent;
                     render(&mut stdout, args.json, &plain, &plain.human())?;
                 } else {
                     for record in &records {
