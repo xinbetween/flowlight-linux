@@ -20,7 +20,7 @@ use aya_ebpf::{
     maps::{HashMap, PerfEventArray},
     programs::SockAddrContext,
 };
-use flowlight_common::block::{ANY_PORT, BlockEvent, BlockKey, EVERYONE};
+use flowlight_common::block::{BlockEvent, BlockKey, EVERYONE};
 use flowlight_common::connection::{AF_INET, AF_INET6};
 
 /// Allow the connection.
@@ -98,6 +98,3 @@ fn decide(ctx: &SockAddrContext, family: u16) -> i32 {
     BLOCK_EVENTS.output(ctx, &event, 0);
     REFUSE
 }
-
-/// Silences the unused-constant warning for a value the map's key type needs and this file does not name.
-const _: u16 = ANY_PORT;

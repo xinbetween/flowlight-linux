@@ -15,9 +15,8 @@
 //! names are re-resolved on a timer; and a block on a shared address is a block on everything at that
 //! address. Neither is solvable at this layer, and pretending otherwise would be worse than saying so.
 
-use anyhow::Result;
 use aya::maps::{HashMap as BpfHashMap, MapData};
-use flowlight_common::block::{ANY_PORT, BlockKey, EVERYONE};
+use flowlight_common::block::{BlockKey, EVERYONE};
 use flowlight_common::connection::{AF_INET, AF_INET6, ipv4_bytes};
 use flowlight_store::RuleRow;
 use std::collections::{BTreeSet, HashMap};
@@ -156,6 +155,7 @@ pub fn key_for(address: IpAddr, port: u16) -> BlockKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flowlight_common::block::ANY_PORT;
 
     #[test]
     fn a_literal_address_is_not_looked_up() {
