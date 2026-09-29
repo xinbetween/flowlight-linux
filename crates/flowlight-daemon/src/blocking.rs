@@ -58,6 +58,23 @@ impl Report {
     }
 }
 
+/// What the fork tracepoint has been doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Propagation {
+    /// Forks the kernel saw.
+    pub forks: u64,
+    /// Marks carried to a child.
+    pub copied: u64,
+    /// Forks that had a layout to read, which is every fork once the daemon has written one.
+    pub layout_ready: u64,
+    /// The last parent identifier read out of a fork record.
+    pub last_parent: u64,
+    /// The last parent identifier that turned out to be marked.
+    pub last_parent_found: u64,
+    /// Processes the kernel currently holds a mark for.
+    pub held: usize,
+}
+
 /// Keeps the kernel's table matching the rules, and its marks matching the processes.
 pub struct Blocking {
     verdicts: BpfHashMap<MapData, BlockKey, u8>,
@@ -126,9 +143,16 @@ impl Blocking {
     ///
     /// The only way to tell an agent that was never recognised from a propagation that never ran — and,
     /// with the last identifier, a read that returned nothing from a lookup that missed.
-    pub fn propagation(&self) -> (u64, u64, u64, u64) {
+    pub fn propagation(&self) -> Propagation {
         let at = |index| self.counts.get(&index, 0).unwrap_or(0);
-        (at(0), at(1), at(2), at(3))
+        Propagation {
+            forks: at(0),
+            copied: at(1),
+            layout_ready: at(2),
+            last_parent: at(3),
+            last_parent_found: at(4),
+            held: self.marked(),
+        }
     }
 
     /// How many processes the kernel currently has a mark for.

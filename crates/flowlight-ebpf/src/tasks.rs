@@ -37,7 +37,7 @@ static TASK_LAYOUT: Array<TaskLayout> = Array::with_max_entries(1, 0);
 /// an agent-scoped rule failed to bite because the agent was not recognised, or because the propagation
 /// that is supposed to reach its children never ran. Without them the two look identical from outside.
 #[map]
-pub static FORK_COUNTS: Array<u64> = Array::with_max_entries(4, 0);
+pub static FORK_COUNTS: Array<u64> = Array::with_max_entries(5, 0);
 
 /// Index of the count of forks seen.
 pub const FORKS_SEEN: u32 = 0;
@@ -50,6 +50,11 @@ pub const LAYOUT_READY: u32 = 2;
 /// Not a count. A number that should look like a process identifier, so that "the reads are wrong" and
 /// "the lookup missed" can be told apart without another round trip.
 pub const LAST_PARENT: u32 = 3;
+/// Index of the last parent identifier that was found to be marked.
+///
+/// Zero forever means no fork ever had a marked parent, which is a different problem from the reads being
+/// wrong — and the two are indistinguishable without it.
+pub const LAST_PARENT_FOUND: u32 = 4;
 
 /// Adds one to a counter, as far as the verifier is concerned safely.
 fn bump(index: u32) {
@@ -91,6 +96,7 @@ fn on_fork(ctx: &TracePointContext) -> Result<(), i64> {
     record(LAST_PARENT, u64::from(parent));
     // SAFETY: the value is a `u32` and the reference does not outlive the lookup.
     let agent = unsafe { PID_AGENT.get(&parent) }.copied().ok_or(0_i64)?;
+    record(LAST_PARENT_FOUND, u64::from(parent));
     // A full map means this child goes unmarked, which means an agent-scoped rule does not reach it. That
     // is a hole, and 0.2.x's Coverage is where holes are reported rather than papered over.
     let _ = PID_AGENT.insert(&child, &agent, 0);

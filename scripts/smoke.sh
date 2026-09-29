@@ -34,6 +34,9 @@ trap cleanup EXIT
 # waste of everybody's afternoon.
 fail() {
     echo "FAIL: $1" >&2
+    # The daemon reports on a timer, so the line describing the moment this failed has usually not been
+    # written yet. Waiting for one more round of it costs two seconds and saves a round trip through CI.
+    sleep 3
     echo "--- what the daemon said:" >&2
     cat "$log" >&2
     exit 1

@@ -465,7 +465,7 @@ fn run(
     let mut next_flush = Instant::now() + FLUSH;
     let mut next_rules = Instant::now();
     let mut next_agent_scan = Instant::now();
-    let mut last_propagation = (0_u64, 0_u64, 0_u64, 0_u64);
+    let mut last_propagation = blocking::Propagation::default();
     let mut seen = 0_u64;
     let mut lost = 0_u64;
 
@@ -498,26 +498,28 @@ fn run(
             // Printed when it moves, not on a timer: the numbers answer a question that only comes up
             // when a rule scoped to an agent does not appear to bite, and the answer has to already be in
             // the log by the time anybody asks.
-            // Every number moving is worth a line. Reporting only one of them hid whether the others
-            // were moving at all, which was the whole question.
-            let propagation = enforcing.propagation();
-            if propagation != last_propagation {
-                eprintln!(
-                    "forks {}, layout ready {}, marks copied {}, last parent {}, marks held {}",
-                    propagation.0,
-                    propagation.2,
-                    propagation.1,
-                    propagation.3,
-                    enforcing.marked()
-                );
-                last_propagation = propagation;
-            }
             for (pid, agent) in enforcing.mark_all(&agent::running_agents()) {
                 // Which processes are treated as agents decides which rules reach them, and a rule that
                 // appears to do nothing is usually a process nobody recognised as the thing it names.
                 eprintln!(
                     "marking {agent} (pid {pid}); rules scoped to it now reach anything it starts"
                 );
+            }
+            // After the marking, not before it. Printed first, this described the state of a moment that
+            // had already passed, which cost a round trip to notice.
+            let propagation = enforcing.propagation();
+            if propagation != last_propagation {
+                eprintln!(
+                    "forks {}, layout ready {}, marks copied {}, last parent {}, last marked parent {}, \
+                     marks held {}",
+                    propagation.forks,
+                    propagation.layout_ready,
+                    propagation.copied,
+                    propagation.last_parent,
+                    propagation.last_parent_found,
+                    propagation.held
+                );
+                last_propagation = propagation;
             }
             next_agent_scan = Instant::now() + AGENT_SCAN;
         }
@@ -653,10 +655,10 @@ fn run(
     }
 
     if let Some(enforcing) = enforcing {
-        let (forks, copied, ready, last) = enforcing.propagation();
+        let propagation = enforcing.propagation();
         eprintln!(
-            "the kernel saw {forks} fork(s), had a layout for {ready} of them, carried a mark to {copied} \
-             child process(es); last parent seen was {last}"
+            "the kernel saw {} fork(s) and carried a mark to {} child process(es)",
+            propagation.forks, propagation.copied
         );
     }
 
