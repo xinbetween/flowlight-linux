@@ -15,8 +15,10 @@ target_host=${2:-example.com}
 output=$(mktemp)
 log=$(mktemp)
 stored=$(mktemp)
+reported=$(mktemp)
+coverage_json=$(mktemp)
 database=$(mktemp -d)/flowlight.db
-trap 'rm -f "$output" "$log" "$stored"; sudo rm -rf "$(dirname "$database")"' EXIT
+trap 'rm -f "$output" "$log" "$stored" "$reported" "$coverage_json"; sudo rm -rf "$(dirname "$database")"' EXIT
 
 echo "Watching for 20 seconds..."
 sudo "$binary" --json --seconds 20 --database "$database" >"$output" 2>"$log" &
@@ -47,6 +49,16 @@ if command -v gnutls-cli >/dev/null; then
     echo "Connecting with gnutls-cli, which uses GnuTLS by definition..."
     printf 'GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$target_host" \
         | timeout 15 gnutls-cli --no-ca-verification "$target_host:443" >/dev/null 2>&1 || true
+fi
+
+# A Go program, whose TLS is written in Go and linked into its own binary. Flowlight probes libraries, so it
+# sees the connection and cannot read a byte of the traffic -- which is exactly the case Coverage exists to
+# name, and the one that otherwise looks identical to a process that did nothing.
+go_tested=no
+if command -v gh >/dev/null && [ -n "${GH_TOKEN:-}" ]; then
+    go_tested=yes
+    echo "Making a request from gh, which is written in Go..."
+    gh api rate_limit >/dev/null 2>&1 || true
 fi
 
 wait "$watcher"
@@ -133,6 +145,26 @@ if grep -q "$secret" "$stored"; then
     exit 1
 fi
 echo "OK: the credential was not stored either"
+
+echo "--- what Flowlight says it could not see:"
+sudo "$binary" --database "$database" coverage --since 10m | tee "$reported"
+sudo "$binary" --database "$database" --json coverage --since 10m > "$coverage_json"
+
+if ! grep -q "0 record(s) were lost by the kernel" "$reported"; then
+    echo "FAIL: the kernel dropped records, or the line that would say so is missing." >&2
+    exit 1
+fi
+echo "OK: nothing was dropped, and the report says so rather than staying quiet"
+
+if [ "$go_tested" = yes ]; then
+    if ! jq -e '[.unread[] | select(.process == "gh")] | length > 0' "$coverage_json" >/dev/null; then
+        echo "FAIL: gh opened HTTPS connections that were not read, and Coverage did not say so." >&2
+        exit 1
+    fi
+    echo "OK: Coverage named the Go program whose traffic could not be read"
+else
+    echo "SKIP: gh or its token is unavailable, so the unreadable-process case was not exercised"
+fi
 
 mode=$(sudo stat -c '%a' "$database")
 if [ "$mode" != "600" ]; then

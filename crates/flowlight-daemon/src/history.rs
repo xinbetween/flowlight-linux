@@ -51,6 +51,19 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
                 }
             }
         }
+        Command::Coverage { since } => {
+            let window = parse_window(since)
+                .with_context(|| format!("reading `{since}` as a length of time"))?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs() as i64);
+            let coverage = store.coverage(now - window)?;
+            if json {
+                writeln!(out, "{}", coverage_json(&coverage))?;
+            } else {
+                write!(out, "{}", coverage_report(&coverage, since))?;
+            }
+        }
         Command::Summary { limit } => {
             let rows = store.summary(*limit)?;
             if rows.is_empty() {
@@ -82,6 +95,112 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
         }
     }
     Ok(())
+}
+
+/// Coverage, as prose.
+///
+/// Zeroes are printed rather than omitted. The whole point of this screen is that it accounts for the gap
+/// between what happened and what was recorded, and a line that disappears when it reads zero turns "nothing
+/// was dropped" into "nobody checked".
+fn coverage_report(coverage: &flowlight_store::Coverage, window: &str) -> String {
+    let mut out = format!("Coverage for the last {window}\n\n");
+    out.push_str(&format!(
+        "  Read          {} request(s) from {} process(es), over {} connection(s)\n",
+        coverage.requests, coverage.processes_read, coverage.connections
+    ));
+
+    if coverage.unread.is_empty() {
+        out.push_str(
+            "  Not read      nothing: every process that opened an HTTPS connection was read\n",
+        );
+    } else {
+        out.push_str("  Not read\n");
+        for unread in &coverage.unread {
+            out.push_str(&format!(
+                "                {:<24} {} connection(s), nothing read\n",
+                unread.process, unread.connections
+            ));
+        }
+        out.push_str(
+            "\n                A process that opened HTTPS connections and had nothing read from them is\n\
+             \x20               using a TLS implementation there is no probe for. Go links its own into the\n\
+             \x20               binary, and so does Chrome. Both need symbols resolved per binary rather\n\
+             \x20               than per library, which Flowlight does not do yet.\n\n",
+        );
+    }
+
+    out.push_str(&format!(
+        "  Truncated     {} call(s) carried more than four kilobytes; the rest was not captured\n",
+        coverage.truncated
+    ));
+    out.push_str(&format!(
+        "  Undecodable   {} HTTP/2 connection(s) could not be followed\n",
+        coverage.undecodable
+    ));
+    out.push_str(&format!(
+        "  Named weakly  {} record(s) name a process by its comm, which the kernel cuts at fifteen\n\
+         \x20               characters; {} have no name at all\n",
+        coverage.named_by_comm, coverage.named_by_pid
+    ));
+    out.push_str(&format!(
+        "  Dropped       {} record(s) were lost by the kernel before Flowlight read them\n",
+        coverage.dropped
+    ));
+
+    if !coverage.unprobed.is_empty() {
+        out.push_str("\n  Unprobed\n");
+        for note in &coverage.unprobed {
+            out.push_str(&format!("                {}\n", note.subject));
+            out.push_str(&format!("                  {}\n", note.detail));
+        }
+    }
+
+    out.push_str(
+        "\n  Inbound connections are never attributed, and UDP and QUIC are not watched at all. Those are\n\
+         \x20 design decisions rather than gaps, and they are in the README.\n",
+    );
+    out
+}
+
+/// Coverage, as one JSON object.
+fn coverage_json(coverage: &flowlight_store::Coverage) -> String {
+    let unread: Vec<String> = coverage
+        .unread
+        .iter()
+        .map(|unread| {
+            format!(
+                "{{\"process\":{},\"connections\":{}}}",
+                quote(&unread.process),
+                unread.connections
+            )
+        })
+        .collect();
+    let unprobed: Vec<String> = coverage
+        .unprobed
+        .iter()
+        .map(|note| {
+            format!(
+                "{{\"path\":{},\"reason\":{}}}",
+                quote(&note.subject),
+                quote(&note.detail)
+            )
+        })
+        .collect();
+    format!(
+        "{{\"requests\":{},\"processes_read\":{},\"connections\":{},\"truncated\":{},\
+         \"undecodable\":{},\"named_by_comm\":{},\"named_by_pid\":{},\"dropped\":{},\
+         \"unread\":[{}],\"unprobed\":[{}]}}",
+        coverage.requests,
+        coverage.processes_read,
+        coverage.connections,
+        coverage.truncated,
+        coverage.undecodable,
+        coverage.named_by_comm,
+        coverage.named_by_pid,
+        coverage.dropped,
+        unread.join(","),
+        unprobed.join(",")
+    )
 }
 
 /// One stored request, as a line.
@@ -204,6 +323,41 @@ mod tests {
         assert!(parse_window("h").is_err());
         assert!(parse_window("-1h").is_err());
         assert!(parse_window("1 h").is_err());
+    }
+
+    /// The line that matters most on this screen is the one naming a process nothing was read from, and it
+    /// has to name it rather than summarise it away.
+    #[test]
+    fn an_unread_process_is_named_in_the_report() {
+        let coverage = flowlight_store::Coverage {
+            requests: 12,
+            processes_read: 2,
+            connections: 30,
+            unread: vec![flowlight_store::Unread {
+                process: "gh".to_owned(),
+                connections: 18,
+            }],
+            ..flowlight_store::Coverage::default()
+        };
+        let report = coverage_report(&coverage, "24h");
+        assert!(report.contains("gh"), "{report}");
+        assert!(
+            report.contains("18 connection(s), nothing read"),
+            "{report}"
+        );
+        assert!(report.contains("Go links its own"), "{report}");
+    }
+
+    /// A line that disappears when it reads zero turns "nothing was dropped" into "nobody checked".
+    #[test]
+    fn a_clean_window_still_says_so_rather_than_saying_nothing() {
+        let report = coverage_report(&flowlight_store::Coverage::default(), "24h");
+        assert!(
+            report.contains("every process that opened an HTTPS connection was read"),
+            "{report}"
+        );
+        assert!(report.contains("0 record(s) were lost"), "{report}");
+        assert!(report.contains("0 call(s) carried more than"), "{report}");
     }
 
     #[test]

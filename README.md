@@ -83,6 +83,7 @@ Then ask it afterwards:
 ```sh
 sudo ./target/release/flowlightd history --since 6h
 sudo ./target/release/flowlightd summary
+sudo ./target/release/flowlightd coverage
 ```
 
 The name column is what the process is called. When a fourth column appears on a connection line — `[comm]`
@@ -122,6 +123,9 @@ Useful flags:
 | `--no-store` | keep nothing; watch the terminal and let it scroll |
 | `--retention-days N` | days of individual requests. Default 7 |
 | `--summary-days N` | days of the daily summary. Default 90 |
+
+And three subcommands that read the database rather than the kernel: `history --since 6h`, `summary`, and
+`coverage --since 24h`. `--json` works on all of them.
 
 If it refuses to start, the message says why — an unmounted tracefs, a kernel built without the tracepoint,
 and a policy that forbids loading programs are three different problems and it will not conflate them.
@@ -176,6 +180,32 @@ model name, a UUID, a page number — are left alone.
 ```text
 claude    pid 17903    → PUT productionresultssa17.blob.core.windows.net/…/logs.txt?se=2026-09-29T08%3A31%3A14Z&sig=…&sp=cw
 ```
+
+### Coverage: what was *not* seen
+
+The screen that makes the rest worth trusting. An empty result means "this agent made no requests" and "this
+agent made four hundred requests nothing could read" equally well, and only one of those is worth knowing.
+
+```text
+Coverage for the last 24h
+
+  Read          1284 request(s) from 7 process(es), over 1901 connection(s)
+  Not read
+                gh                       412 connection(s), nothing read
+
+                A process that opened HTTPS connections and had nothing read from them is
+                using a TLS implementation there is no probe for. Go links its own into the
+                binary, and so does Chrome.
+
+  Truncated     18 call(s) carried more than four kilobytes; the rest was not captured
+  Undecodable   2 HTTP/2 connection(s) could not be followed
+  Named weakly  31 record(s) name a process by its comm, which the kernel cuts at fifteen
+                characters; 0 have no name at all
+  Dropped       0 record(s) were lost by the kernel before Flowlight read them
+```
+
+Zeroes are printed rather than omitted. A line that disappears when it reads zero turns "nothing was dropped"
+into "nobody checked".
 
 ### What it does not see yet
 ### What it does not see yet

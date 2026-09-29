@@ -141,6 +141,12 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
+    /// What was seen, and — more usefully — what was not.
+    Coverage {
+        /// How far back to look: `30m`, `6h`, `2d`, or a number of seconds.
+        #[arg(long, value_name = "WINDOW", default_value = "24h")]
+        since: String,
+    },
 }
 
 impl Args {
@@ -316,7 +322,7 @@ fn run(
 
     loop {
         if !args.no_payloads && Instant::now() >= next_scan {
-            attach_new_libraries(ebpf, &mut probed, &args.libssl);
+            attach_new_libraries(ebpf, &mut probed, &args.libssl, store.as_deref_mut());
             next_scan = Instant::now() + RESCAN;
         }
 
@@ -347,6 +353,11 @@ fn run(
         match receiver.recv_timeout(timeout) {
             Ok(Message::Lost(count)) => {
                 lost += count;
+                // Kept as well as counted. A drop is the one hole in this tool's account of a machine that
+                // nothing else can reveal afterwards, so it outlives the session that saw it.
+                if let Some(store) = store.as_deref_mut() {
+                    keep(store.record_drop(count));
+                }
                 continue;
             }
             Ok(Message::Connection(event)) => {
@@ -425,7 +436,12 @@ fn render<T: serde::Serialize>(
 ///
 /// Failures are reported once and then forgotten about: a library whose symbols are stripped will never
 /// resolve, and saying so every five seconds would be the only thing on the screen.
-fn attach_new_libraries(ebpf: &mut Ebpf, probed: &mut BTreeSet<PathBuf>, extra: &[PathBuf]) {
+fn attach_new_libraries(
+    ebpf: &mut Ebpf,
+    probed: &mut BTreeSet<PathBuf>,
+    extra: &[PathBuf],
+    mut store: Option<&mut Store>,
+) {
     for (path, library) in libraries::discover(extra) {
         if !probed.insert(path.clone()) {
             continue;
@@ -437,10 +453,21 @@ fn attach_new_libraries(ebpf: &mut Ebpf, probed: &mut BTreeSet<PathBuf>, extra: 
                 path.display(),
                 symbols.join(", ")
             ),
-            Err(err) => eprintln!(
-                "not reading {}: {err:#}. Traffic through this library will be invisible.",
-                path.display()
-            ),
+            Err(err) => {
+                eprintln!(
+                    "not reading {}: {err:#}. Traffic through this library will be invisible.",
+                    path.display()
+                );
+                // Written down, because by the time anyone asks why an application seems silent this line
+                // has scrolled away and the answer is in it.
+                if let Some(store) = store.as_deref_mut() {
+                    keep(store.record_note(
+                        "unprobed-library",
+                        &path.display().to_string(),
+                        &format!("{err:#}"),
+                    ));
+                }
+            }
         }
     }
 }
