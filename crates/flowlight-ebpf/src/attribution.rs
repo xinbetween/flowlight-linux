@@ -37,7 +37,7 @@ static EVENTS: PerfEventArray<ConnectionEvent> = PerfEventArray::new(0);
 
 /// The entry point. Its return value is ignored for tracepoints; failures are silent by design, because the
 /// alternative in this context is a kernel log line per dropped event on a machine already under load.
-#[tracepoint]
+#[tracepoint(category = "sock", name = "inet_sock_set_state")]
 pub fn inet_sock_set_state(ctx: TracePointContext) -> u32 {
     let _ = observe(&ctx);
     0

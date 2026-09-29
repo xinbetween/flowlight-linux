@@ -32,7 +32,12 @@ pub static PID_AGENT: LruHashMap<u32, u32> = LruHashMap::with_max_entries(20480,
 static TASK_LAYOUT: Array<TaskLayout> = Array::with_max_entries(1, 0);
 
 /// A process forked. The child inherits whatever the parent was working for.
-#[tracepoint]
+///
+/// The category and name are given to the macro, not just to the attach call, because without them every
+/// tracepoint program in the object is emitted into one ELF section called `tracepoint` — and three
+/// functions in one section is one program with three names. That failed exactly as quietly as it sounds:
+/// the programs loaded, attached, and ran somebody else's code.
+#[tracepoint(category = "sched", name = "sched_process_fork")]
 pub fn sched_fork(ctx: TracePointContext) -> u32 {
     let _ = on_fork(&ctx);
     0
@@ -54,7 +59,7 @@ fn on_fork(ctx: &TracePointContext) -> Result<(), i64> {
 
 /// A process exited. Its mark goes with it, because process identifiers are reused and a stale mark is a
 /// rule applied to a stranger.
-#[tracepoint]
+#[tracepoint(category = "sched", name = "sched_process_exit")]
 pub fn sched_exit(ctx: TracePointContext) -> u32 {
     let _ = on_exit(&ctx);
     0
