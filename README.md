@@ -24,6 +24,11 @@ installed. It reads QUIC, which termination cannot. And it runs on kernel 4.18 w
 
 Termination becomes a second, narrower mode that states what it costs.
 
+## Where it is going
+
+One milestone — **0.1, see everything honestly** — released a feature at a time. [ROADMAP.md](ROADMAP.md) has
+the sequence and, more usefully, what this will not do.
+
 ## Relationship to the macOS build
 
 [xinbetween/flowlight](https://github.com/xinbetween/flowlight) is the macOS application, written in Swift.

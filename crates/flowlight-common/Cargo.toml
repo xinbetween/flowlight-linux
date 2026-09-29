@@ -1,0 +1,13 @@
+[package]
+name = "flowlight-common"
+description = "Types and logic shared between the eBPF programs and the daemon, with no Linux-only dependencies so it can be tested anywhere."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
