@@ -21,12 +21,12 @@
 //! must not be stalled. A second, read-only connection to the same file costs nothing — SQLite's
 //! write-ahead log exists for this — and cannot write even by mistake.
 
+use crate::views;
 use anyhow::{Context as _, Result};
 use flowlight_store::Store;
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Response, Server};
 
 /// The page itself, compiled in. No content delivery network, no fonts fetched from anywhere: a root daemon
@@ -148,251 +148,56 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// A window in seconds, from `since`, defaulting to an hour and capped at a year.
-fn window(query: &str) -> i64 {
-    let seconds = parameter(query, "since")
+/// How far back a query asked for, in seconds, defaulting to an hour.
+fn seconds(query: &str) -> i64 {
+    parameter(query, "since")
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(3_600)
-        .clamp(0, 365 * 86_400);
-    now() - seconds
 }
 
-/// Now, in seconds since the epoch.
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs() as i64)
-}
-
-/// What the page shows for one request.
-#[derive(Serialize)]
-struct RequestView {
-    at: i64,
-    process: String,
-    agent: Option<String>,
-    confidence: String,
-    pid: u32,
-    direction: String,
-    protocol: Option<String>,
-    method: Option<String>,
-    target: Option<String>,
-    host: Option<String>,
-    status: Option<u16>,
-    bytes: u32,
-    truncated: bool,
-    unreadable: Option<String>,
-}
-
-/// What the page shows for one process.
-#[derive(Serialize)]
-struct ProcessView {
-    process: String,
-    confidence: String,
-    requests: i64,
-    hosts: i64,
-    bytes: i64,
-    last_seen: i64,
-}
-
-/// What the page shows for one host.
-#[derive(Serialize)]
-struct HostView {
-    host: String,
-    requests: i64,
-    last_seen: i64,
-}
-
-/// What the page shows for one agent, with the comparison already made.
-#[derive(Serialize)]
-struct AgentView {
-    agent: String,
-    requests: i64,
-    hosts: i64,
-    processes: i64,
-    bytes: i64,
-    last_seen: i64,
-    /// Configured servers that never touch the network, which nothing here can ever see.
-    local: Vec<String>,
-    domains: Vec<DomainView>,
-}
-
-#[derive(Serialize)]
-struct DomainView {
-    host: String,
-    standing: String,
-    requests: i64,
-    servers: Vec<String>,
-}
-
-/// What the page shows on the Coverage tab.
-#[derive(Serialize)]
-struct CoverageView {
-    requests: i64,
-    processes_read: i64,
-    connections: i64,
-    truncated: i64,
-    undecodable: i64,
-    named_by_comm: i64,
-    named_by_pid: i64,
-    refused: i64,
-    dropped: i64,
-    unread: Vec<UnreadView>,
-    unprobed: Vec<UnprobedView>,
-}
-
-#[derive(Serialize)]
-struct UnreadView {
-    process: String,
-    connections: i64,
-}
-
-#[derive(Serialize)]
-struct UnprobedView {
-    path: String,
-    reason: String,
+/// Opens the database for reading and answers one question with it.
+///
+/// The shapes come from [`crate::views`], which is also what the native interface and the subcommands use.
+/// They were three separate sets of structs once, and a column added to a row reached two of them.
+fn ask<T: Serialize>(
+    database: &Path,
+    query: &str,
+    answer: impl FnOnce(&mut Store, i64) -> Result<T>,
+) -> Result<String> {
+    let mut store = Store::open_read_only(database)?;
+    let since = views::window(views::now(), seconds(query));
+    Ok(serde_json::to_string(&answer(&mut store, since)?)?)
 }
 
 fn requests(database: &Path, query: &str) -> Result<String> {
-    let mut store = Store::open_read_only(database)?;
     let limit = parameter(query, "limit")
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(200)
-        .clamp(1, 2_000);
-    let rows: Vec<RequestView> = store
-        .requests_since(window(query), limit)?
-        .into_iter()
-        .map(|row| RequestView {
-            at: row.at,
-            process: row.process,
-            agent: row.agent,
-            confidence: row.confidence,
-            pid: row.pid,
-            direction: row.direction,
-            protocol: row.protocol,
-            method: row.method,
-            target: row.target,
-            host: row.host,
-            status: row.status,
-            bytes: row.bytes,
-            truncated: row.truncated,
-            unreadable: row.unreadable,
-        })
-        .collect();
-    Ok(serde_json::to_string(&rows)?)
+        .unwrap_or(200);
+    ask(database, query, |store, since| {
+        views::requests(store, since, limit)
+    })
 }
 
 fn processes(database: &Path, query: &str) -> Result<String> {
-    let mut store = Store::open_read_only(database)?;
-    let rows: Vec<ProcessView> = store
-        .processes(window(query))?
-        .into_iter()
-        .map(|row| ProcessView {
-            process: row.process,
-            confidence: row.confidence,
-            requests: row.requests,
-            hosts: row.hosts,
-            bytes: row.bytes,
-            last_seen: row.last_seen,
-        })
-        .collect();
-    Ok(serde_json::to_string(&rows)?)
+    ask(database, query, views::processes)
 }
 
 fn hosts(database: &Path, query: &str) -> Result<String> {
-    let mut store = Store::open_read_only(database)?;
     let process = parameter(query, "process").unwrap_or_default();
-    let rows: Vec<HostView> = store
-        .hosts_for(&process, window(query), 100)?
-        .into_iter()
-        .map(|row| HostView {
-            host: row.host,
-            requests: row.requests,
-            last_seen: row.last_seen,
-        })
-        .collect();
-    Ok(serde_json::to_string(&rows)?)
+    ask(database, query, |store, since| {
+        views::hosts(store, &process, since)
+    })
 }
 
 fn agents(database: &Path, query: &str) -> Result<String> {
-    let mut store = Store::open_read_only(database)?;
-    let since = window(query);
-    // Read per request rather than cached: they are a handful of small files, and a configuration edited
-    // while the page is open should show up on the next poll rather than the next restart.
-    let configured = crate::history::configured_servers();
-    let mut views = Vec::new();
-    for row in store.agents(since)? {
-        let contacted: Vec<(String, i64)> = store
-            .hosts_for_agent(&row.agent, since, 200)?
-            .into_iter()
-            .map(|host| (host.host, host.requests))
-            .collect();
-        let mine: Vec<flowlight_agents::mcp::Server> = configured
-            .iter()
-            .filter(|server| server.agent == row.agent)
-            .cloned()
-            .collect();
-        let domains = flowlight_agents::mcp::merge(
-            &mine,
-            &contacted,
-            flowlight_agents::mcp::endpoints_for(&row.agent),
-        );
-        views.push(AgentView {
-            agent: row.agent,
-            requests: row.requests,
-            hosts: row.hosts,
-            processes: row.processes,
-            bytes: row.bytes,
-            last_seen: row.last_seen,
-            local: mine
-                .iter()
-                .filter(|server| !server.transport.crosses_the_network())
-                .map(|server| server.name.clone())
-                .collect(),
-            domains: domains
-                .into_iter()
-                .map(|domain| DomainView {
-                    host: domain.host,
-                    standing: domain.standing.as_str().to_owned(),
-                    requests: domain.requests,
-                    servers: domain.servers,
-                })
-                .collect(),
-        });
-    }
-    Ok(serde_json::to_string(&views)?)
+    let homes = views::homes();
+    ask(database, query, |store, since| {
+        views::agents(store, since, &homes)
+    })
 }
 
 fn coverage(database: &Path, query: &str) -> Result<String> {
-    let mut store = Store::open_read_only(database)?;
-    let coverage = store.coverage(window(query))?;
-    let view = CoverageView {
-        requests: coverage.requests,
-        processes_read: coverage.processes_read,
-        connections: coverage.connections,
-        truncated: coverage.truncated,
-        undecodable: coverage.undecodable,
-        named_by_comm: coverage.named_by_comm,
-        named_by_pid: coverage.named_by_pid,
-        refused: coverage.refused,
-        dropped: coverage.dropped,
-        unread: coverage
-            .unread
-            .into_iter()
-            .map(|unread| UnreadView {
-                process: unread.process,
-                connections: unread.connections,
-            })
-            .collect(),
-        unprobed: coverage
-            .unprobed
-            .into_iter()
-            .map(|note| UnprobedView {
-                path: note.subject,
-                reason: note.detail,
-            })
-            .collect(),
-    };
-    Ok(serde_json::to_string(&view)?)
+    ask(database, query, views::coverage)
 }
 
 /// Runs a handler and turns a failure into a response rather than a panic.
@@ -524,12 +329,10 @@ mod tests {
     }
 
     #[test]
-    fn a_window_defaults_to_an_hour_and_cannot_be_absurd() {
-        let now = now();
-        assert!((now - window("")) == 3_600);
-        assert!((now - window("since=60")) == 60);
-        assert!((now - window("since=-5")) == 0);
-        assert!((now - window("since=999999999")) == 365 * 86_400);
+    fn a_window_defaults_to_an_hour() {
+        assert_eq!(seconds(""), 3_600);
+        assert_eq!(seconds("since=60"), 60);
+        assert_eq!(seconds("since=nonsense"), 3_600);
     }
 
     #[test]

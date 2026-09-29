@@ -12,6 +12,7 @@
 
 mod agent;
 mod blocking;
+mod control;
 mod history;
 mod http2;
 mod libraries;
@@ -19,6 +20,7 @@ mod payload;
 mod record;
 mod tracefs;
 mod ui;
+mod views;
 
 use agent::Agents;
 use anyhow::{Context as _, anyhow, bail};
@@ -88,8 +90,13 @@ const AGENT_SCAN: Duration = Duration::from_secs(1);
 /// is not one transaction per request.
 const FLUSH: Duration = Duration::from_secs(1);
 
-/// Where the interface listens unless told otherwise.
-const DEFAULT_UI: &str = "127.0.0.1:7890";
+/// Where the web page listens when it is asked for.
+///
+/// Not served unless asked. The native interface talks over a socket with an owner and a mode, which the
+/// kernel enforces; a page on loopback is reachable by every local user and guarded only by a token, which
+/// is a secret that leaks into shell history and screenshots. The page remains because it is the only one
+/// of the two that works over `ssh` on a machine with no desktop session.
+const DEFAULT_WEB: &str = "127.0.0.1:7890";
 
 /// Pages per CPU for each perf buffer. A [`TlsChunk`] is four kilobytes, so the two-page default would hold
 /// one and a bit of them and drop the rest of any burst.
@@ -152,13 +159,19 @@ struct Args {
     #[arg(long, value_name = "DAYS", default_value_t = flowlight_store::DEFAULT_SUMMARY_DAYS)]
     summary_days: u32,
 
-    /// Where to serve the interface. Loopback only, and refused otherwise.
-    #[arg(long, value_name = "ADDRESS", default_value = DEFAULT_UI)]
-    ui: SocketAddr,
+    /// Where the native interface connects. An owner and a mode, which the kernel enforces.
+    #[arg(long, value_name = "PATH", default_value = control::DEFAULT_SOCKET)]
+    socket: PathBuf,
 
-    /// Do not serve an interface at all.
+    /// Do not open a control socket, so no interface can connect.
     #[arg(long)]
-    no_ui: bool,
+    no_socket: bool,
+
+    /// Also serve the web page, for a machine with no desktop session.
+    ///
+    /// Loopback only, and refused otherwise. Off unless asked for: loopback is not a permission boundary.
+    #[arg(long, value_name = "ADDRESS", num_args = 0..=1, default_missing_value = DEFAULT_WEB)]
+    web: Option<SocketAddr>,
 
     /// Do not enforce rules. Nothing is refused, whatever the rules say.
     #[arg(long)]
@@ -282,12 +295,13 @@ fn main() -> anyhow::Result<()> {
     // Checked here, before anything is loaded or attached, so that a mistyped address fails in a tenth of a
     // second rather than after the probes are in the kernel. `serve` checks it too, because a guard that
     // only exists at the call site is a guard the next caller does not get.
-    if !args.no_ui && !args.ui.ip().is_loopback() {
+    if let Some(web) = args.web
+        && !web.ip().is_loopback()
+    {
         bail!(
-            "the interface may only be served on loopback; {} is not. What this knows is every host every \
-             process on the machine reached, and there is no version of publishing that which is a good \
-             idea. Use --no-ui if you meant to turn it off.",
-            args.ui
+            "the web page may only be served on loopback; {web} is not. What this knows is every host \
+             every process on the machine reached, and there is no version of publishing that which is a \
+             good idea."
         );
     }
 
@@ -385,18 +399,45 @@ fn main() -> anyhow::Result<()> {
         None => eprintln!("storing nothing"),
     }
 
-    if !args.no_ui {
+    if !args.no_socket {
         if store.is_none() {
             eprintln!(
-                "not serving an interface: it reads the database, and --no-store means there is not one."
+                "not opening a control socket: an interface reads the database, and --no-store means \
+                 there is not one."
+            );
+        } else {
+            let owner = control::intended_owner();
+            let hello = control::Hello {
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                enforcing: enforcing.is_some(),
+                storing: true,
+            };
+            match control::serve(&args.socket, args.database.clone(), owner, hello) {
+                Ok(()) => eprintln!(
+                    "interface socket at {}, owned by uid {}",
+                    args.socket.display(),
+                    owner.0
+                ),
+                // Not fatal. Having no interface is a reason to say so, not a reason to stop watching the
+                // machine.
+                Err(err) => eprintln!("no control socket: {err:#}. Still watching."),
+            }
+        }
+    }
+
+    if let Some(address) = args.web {
+        if store.is_none() {
+            eprintln!(
+                "not serving the web page: it reads the database, and --no-store means there is not one."
             );
         } else {
             let token = ui::token()?;
-            match ui::serve(args.ui, args.database.clone(), token.clone()) {
-                Ok(bound) => eprintln!("interface at http://{bound}/?token={token}"),
-                // Not fatal. The port being taken is a reason to have no page, not a reason to stop
-                // watching the machine.
-                Err(err) => eprintln!("not serving an interface: {err:#}. Still watching."),
+            match ui::serve(address, args.database.clone(), token.clone()) {
+                Ok(bound) => eprintln!(
+                    "web page at http://{bound}/?token={token} — reachable by every local user on this \
+                     machine, which the socket above is not"
+                ),
+                Err(err) => eprintln!("not serving the web page: {err:#}. Still watching."),
             }
         }
     }

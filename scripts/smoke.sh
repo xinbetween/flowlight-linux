@@ -16,6 +16,7 @@ output=$(mktemp)
 log=$(mktemp)
 stored=$(mktemp)
 reported=$(mktemp)
+socket=$(mktemp -d)/flowlight.sock
 coverage_json=$(mktemp)
 agents_json=$(mktemp)
 fake_agent=$(mktemp -d)/claude
@@ -42,8 +43,24 @@ fail() {
     exit 1
 }
 
+ask() {
+    python3 - "$socket" "$1" <<'PYTHON'
+import json, socket, sys
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+    client.connect(sys.argv[1])
+    client.sendall((sys.argv[2] + "\n").encode())
+    data = b""
+    while not data.endswith(b"\n"):
+        chunk = client.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+print(data.decode().strip())
+PYTHON
+}
+
 echo "Watching..."
-sudo "$binary" --json --seconds 70 --database "$database" --ui 127.0.0.1:0 >"$output" 2>"$log" &
+sudo "$binary" --json --seconds 70 --database "$database" --socket "$socket" --web 127.0.0.1:0 >"$output" 2>"$log" &
 watcher=$!
 
 # The probes are attached by the time the daemon prints its banner, but the banner goes to stderr and the
@@ -72,11 +89,11 @@ echo "OK: nothing is served without the right token"
 
 # Loopback is not a permission boundary, so the page must never leave it. Asked of a running daemon rather
 # than trusted to a unit test, because the flag is the thing a person actually types.
-refusal=$(sudo "$binary" --database "$database" --ui 0.0.0.0:0 --seconds 1 2>&1 || true)
+refusal=$(sudo "$binary" --database "$database" --web 0.0.0.0:0 --seconds 1 2>&1 || true)
 if printf '%s' "$refusal" | grep -q loopback; then
-    echo "OK: the interface refuses to serve on a routable address"
+    echo "OK: the web page refuses to be served on a routable address"
 else
-    echo "FAIL: the interface did not refuse a routable address. It said:" >&2
+    echo "FAIL: the web page did not refuse a routable address. It said:" >&2
     printf '%s\n' "$refusal" >&2
     exit 1
 fi
@@ -141,8 +158,11 @@ if curl -sS --max-time 8 "https://$blocked_address/" -o /dev/null 2>/dev/null; t
     # Scoped to one agent, which is the harder half: the kernel has to know, inside connect(), that the
     # process calling it is working for `claude`. Userspace marks the agent; the fork tracepoint marks
     # everything it starts, before the child can run.
-    echo "Blocking $blocked_address for the agent only..."
-    sudo "$binary" --database "$database" block "$blocked_address" --port 443 --agent claude
+    # Written over the socket, which is the path the window's "Block for this agent" button takes. The
+    # terminal's `block` subcommand writes the same row a different way, and is exercised below.
+    echo "Blocking $blocked_address for the agent only, over the interface socket..."
+    ask "{\"op\":\"write\",\"action\":\"block\",\"subject\":\"$blocked_address\",\"port\":443,\"agent\":\"claude\"}" \
+        | jq -e '.ok == "added"' >/dev/null || fail "the socket would not write a rule."
     sleep 4
 
     # Everyone else is unaffected. Without this the next check would pass for the wrong reason.
@@ -179,8 +199,10 @@ if curl -sS --max-time 8 "https://$blocked_address/" -o /dev/null 2>/dev/null; t
     echo "OK: a connection from something the agent started was refused"
 
     sudo "$binary" --database "$database" rules
-    scoped_rule=$(sudo "$binary" --database "$database" --json rules | jq -rs '.[] | select(.scope == "agent:claude") | .id')
-    sudo "$binary" --database "$database" forget "$scoped_rule"
+    scoped_rule=$(ask '{"op":"rules"}' | jq -r '.ok[] | select(.scope == "agent:claude") | .id')
+    ask "{\"op\":\"forget\",\"id\":$scoped_rule}" | jq -e '.ok == true' >/dev/null \
+        || fail "the socket would not forget a rule."
+    echo "OK: a rule can be written and forgotten over the interface socket"
 
     # And now for everyone, which is the simpler half and the one somebody will try first.
     echo "Blocking $blocked_address for everyone..."
@@ -193,6 +215,24 @@ if curl -sS --max-time 8 "https://$blocked_address/" -o /dev/null 2>/dev/null; t
 else
     echo "SKIP: $blocked_address is not reachable from here, so blocking it would prove nothing"
 fi
+
+# The native interface's socket, which is what the GTK window talks to. Exercised with a scripted client
+# rather than a window, because a window cannot be asserted about in CI and the protocol can.
+echo "--- what the interface socket says:"
+ask '{"op":"hello"}' | tee /dev/stderr | jq -e '.ok.version != null and .ok.enforcing == true' >/dev/null \
+    || fail "the socket did not greet properly."
+echo "OK: the interface socket answers, and says whether it is enforcing"
+
+mode=$(stat -c '%a' "$socket")
+[ "$mode" = 600 ] || fail "the socket is mode $mode; it decides who may ask what this machine has been doing."
+owner=$(stat -c '%U' "$socket")
+[ "$owner" = "$(id -un)" ] || fail "the socket belongs to $owner, not to whoever ran sudo."
+echo "OK: the socket is owned by the person who started the daemon, and by nobody else"
+
+ask '{"op":"requests","since":600,"limit":50}' \
+    | jq -e '[.ok[] | select(.process == "curl" and .method == "GET")] | length > 0' >/dev/null \
+    || fail "the socket does not report the request that was read."
+echo "OK: the socket reports what was read"
 
 # The interface, while it is still up. The daemon flushes a partial batch once a second, so the page sees
 # what was just read rather than what was read a batch ago.
