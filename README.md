@@ -93,7 +93,7 @@ The name column is what the process is called. When a fourth column appears on a
 or `[pid]` — it says the name is worth less than usual: `[comm]` means the process was gone by the time
 Flowlight looked it up, so the name is the one the kernel captured, which it cuts at fifteen characters.
 
-Nothing is blocked and nothing is modified.
+Nothing is modified.
 
 ### What is kept, and for how long
 
@@ -124,13 +124,15 @@ Useful flags:
 | `--tracefs PATH` | if tracefs is mounted somewhere unusual |
 | `--ui ADDRESS` | where to serve the interface. Default `127.0.0.1:7890`, loopback only |
 | `--no-ui` | do not serve an interface |
+| `--no-block` | do not enforce rules; nothing is refused whatever the rules say |
 | `--database PATH` | where to keep what is seen. Default `/var/lib/flowlight/flowlight.db` |
 | `--no-store` | keep nothing; watch the terminal and let it scroll |
 | `--retention-days N` | days of individual requests. Default 7 |
 | `--summary-days N` | days of the daily summary. Default 90 |
 
-And four subcommands that read the database rather than the kernel: `history --since 6h`, `agents`,
-`summary`, and `coverage --since 24h`. `--json` works on all of them.
+Plus subcommands that read the database rather than the kernel — `history --since 6h`, `agents`, `summary`,
+`coverage --since 24h` — and three that write rules: `block`, `allow`, `rules`. `--json` works on all of
+them.
 
 If it refuses to start, the message says why — an unmounted tracefs, a kernel built without the tracepoint,
 and a policy that forbids loading programs are three different problems and it will not conflate them.
@@ -185,6 +187,36 @@ model name, a UUID, a page number — are left alone.
 ```text
 claude    pid 17903    → PUT productionresultssa17.blob.core.windows.net/…/logs.txt?se=2026-09-29T08%3A31%3A14Z&sig=…&sp=cw
 ```
+
+### Blocking
+
+A `cgroup/connect` hook refuses a connection **before the SYN**. The application gets `EPERM` from
+`connect()` — the same answer a firewall gives, and one every network client already knows how to report.
+
+```sh
+sudo ./target/release/flowlightd block telemetry.example.com
+sudo ./target/release/flowlightd block 198.51.100.7 --port 443 --note "noisy"
+sudo ./target/release/flowlightd rules
+sudo ./target/release/flowlightd allow telemetry.example.com
+```
+
+Rules live in the database, so they survive restarts and can be written before the daemon starts. A running
+daemon picks a change up within a couple of seconds. Refusals appear in the live view and in Coverage:
+
+```text
+curl                     pid 18422    ⊘ 198.51.100.7:443
+```
+
+This is independent of everything else here. The refusal happens in the kernel at `connect()`, the reading
+happens in the TLS library, and neither needs the other — which is better than the macOS build, where
+blocking goes through the proxy and a blocked connection is one that was first accepted.
+
+**What it costs, stated plainly.** The kernel does not have a hostname at `connect()` — the name was
+resolved and thrown away before this point. So blocking `api.example.com` means resolving it here and
+refusing what it currently resolves to. That is exactly right for a host with a stable address, and
+imprecise for anything behind a large content network, where addresses rotate and are shared with everything
+else on it. Names are re-resolved every minute; a block on a shared address is a block on everything at that
+address. `--no-block` turns enforcement off entirely.
 
 ### Agents
 

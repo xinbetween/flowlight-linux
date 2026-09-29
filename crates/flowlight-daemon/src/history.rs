@@ -14,7 +14,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Answers one question and exits.
 pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()> {
-    if !database.exists() {
+    // A rule can be written before anything has been watched — that is a reasonable order to do things in,
+    // and refusing would mean telling somebody to start a daemon in order to configure it. Every other
+    // command is a question about history, and a missing database is the answer to it.
+    let writes = matches!(command, Command::Block { .. } | Command::Allow { .. });
+    if !writes && !database.exists() {
         bail!(
             "there is no database at {}. Nothing has been recorded yet, or it was recorded somewhere else \
              — `flowlightd --database PATH` names it.",
@@ -50,6 +54,74 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
                     writeln!(out, "{}", line(&RequestView::from(&row)))?;
                 } else {
                     writeln!(out, "{}", request_line(&row))?;
+                }
+            }
+        }
+        Command::Block {
+            subject,
+            port,
+            note,
+        } => {
+            if store.add_rule(subject, *port, "global", note.as_deref())? {
+                let scope = if *port == 0 {
+                    "every port".to_owned()
+                } else {
+                    format!("port {port}")
+                };
+                // Said plainly, because the command returns before the rule is in force and somebody
+                // testing it a second later deserves to know why it has not taken effect yet.
+                eprintln!(
+                    "{subject} on {scope} will be refused. A running flowlightd picks this up within a \
+                     couple of seconds; if none is running, nothing is enforcing anything."
+                );
+            } else {
+                eprintln!("{subject} was already blocked. Nothing changed.");
+            }
+        }
+        Command::Allow { subject, port } => {
+            if store.remove_rule(subject, *port, "global")? {
+                eprintln!("{subject} is no longer blocked.");
+            } else {
+                eprintln!(
+                    "There was no rule for {subject} on that port. `flowlightd rules` lists the ones \
+                     there are."
+                );
+            }
+        }
+        Command::Rules => {
+            let rules = store.rules()?;
+            if rules.is_empty() {
+                eprintln!("No rules. Nothing is being refused.");
+                return Ok(());
+            }
+            for rule in rules {
+                if json {
+                    writeln!(
+                        out,
+                        "{}",
+                        line(&RuleView {
+                            subject: &rule.subject,
+                            port: rule.port,
+                            scope: &rule.scope,
+                            note: rule.note.as_deref(),
+                            created: rule.created,
+                        })
+                    )?;
+                } else {
+                    let port = if rule.port == 0 {
+                        "any".to_owned()
+                    } else {
+                        rule.port.to_string()
+                    };
+                    writeln!(
+                        out,
+                        "block  {:<44} port {:<6} {}{}",
+                        rule.subject,
+                        port,
+                        rule.scope,
+                        rule.note
+                            .map_or(String::new(), |note| format!("  — {note}"))
+                    )?;
                 }
             }
         }
@@ -267,6 +339,10 @@ fn coverage_report(coverage: &flowlight_store::Coverage, window: &str) -> String
         coverage.named_by_comm, coverage.named_by_pid
     ));
     out.push_str(&format!(
+        "  Refused       {} connection(s) were refused before the handshake, because a rule said so\n",
+        coverage.refused
+    ));
+    out.push_str(&format!(
         "  Dropped       {} record(s) were lost by the kernel before Flowlight read them\n",
         coverage.dropped
     ));
@@ -365,6 +441,16 @@ impl<'a> From<&'a RequestRow> for RequestView<'a> {
 }
 
 #[derive(Serialize)]
+struct RuleView<'a> {
+    subject: &'a str,
+    port: u16,
+    scope: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<&'a str>,
+    created: i64,
+}
+
+#[derive(Serialize)]
 struct DailyView<'a> {
     day: &'a str,
     process: &'a str,
@@ -382,6 +468,7 @@ struct CoverageView<'a> {
     undecodable: i64,
     named_by_comm: i64,
     named_by_pid: i64,
+    refused: i64,
     dropped: i64,
     unread: Vec<UnreadView<'a>>,
     unprobed: Vec<UnprobedView<'a>>,
@@ -442,6 +529,7 @@ fn coverage_view(coverage: &flowlight_store::Coverage) -> CoverageView<'_> {
         undecodable: coverage.undecodable,
         named_by_comm: coverage.named_by_comm,
         named_by_pid: coverage.named_by_pid,
+        refused: coverage.refused,
         dropped: coverage.dropped,
         unread: coverage
             .unread

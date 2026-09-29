@@ -278,6 +278,7 @@ function renderCoverage(c) {
       ${card(c.undecodable, 'Undecodable', 'HTTP/2 connections that could not be followed')}
       ${card(c.named_by_comm, 'Named weakly', 'named from the kernel&#39;s copy, cut at fifteen characters')}
       ${card(c.named_by_pid, 'Unnamed', 'no name was available; the identity is a process id')}
+      ${card(c.refused, 'Refused', 'connections refused before the handshake, because a rule said so')}
       ${card(c.dropped, 'Dropped', 'records the kernel had nowhere to put')}
     </div>
     ${unprobed}

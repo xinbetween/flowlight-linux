@@ -30,7 +30,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "Watching for 20 seconds..."
-sudo "$binary" --json --seconds 25 --database "$database" --ui 127.0.0.1:0 >"$output" 2>"$log" &
+sudo "$binary" --json --seconds 45 --database "$database" --ui 127.0.0.1:0 >"$output" 2>"$log" &
 watcher=$!
 
 # The probes are attached by the time the daemon prints its banner, but the banner goes to stderr and the
@@ -118,6 +118,26 @@ if command -v gh >/dev/null && [ -n "${GH_TOKEN:-}" ]; then
     go_tested=yes
     echo "Making a request from gh, which is written in Go..."
     gh api rate_limit >/dev/null 2>&1 || true
+fi
+
+# Blocking. A literal address rather than a name, so that nothing here depends on what DNS says today, and
+# one that is not used by any other assertion in this file.
+blocked_address=1.1.1.1
+block_tested=no
+if curl -sS --max-time 8 "https://$blocked_address/" -o /dev/null 2>/dev/null; then
+    block_tested=yes
+    echo "Blocking $blocked_address..."
+    sudo "$binary" --database "$database" block "$blocked_address" --port 443 --note "smoke test"
+    # The daemon reads the rules back every two seconds. This is how long a rule takes to come into force,
+    # and waiting for it is part of what is being tested.
+    sleep 4
+    if curl -sS --max-time 8 "https://$blocked_address/" -o /dev/null 2>/dev/null; then
+        echo "FAIL: a blocked address was still reachable." >&2
+        exit 1
+    fi
+    echo "OK: the blocked address could not be connected to"
+else
+    echo "SKIP: $blocked_address is not reachable from here, so blocking it would prove nothing"
 fi
 
 # The interface, while it is still up. The daemon flushes a partial batch once a second, so the page sees
@@ -261,6 +281,27 @@ if [ "$agent_tested" = yes ]; then
     echo "OK: a configured MCP server that was reached is reported as used"
 else
     echo "SKIP: a home directory without an existing ~/.claude.json was not available"
+fi
+
+if [ "$block_tested" = yes ]; then
+    if ! jq -s -e "map(select(.blocked == true and .destination == \"$blocked_address\")) | length > 0" "$output" >/dev/null; then
+        echo "FAIL: a connection was refused and Flowlight did not report refusing it." >&2
+        exit 1
+    fi
+    echo "OK: the refusal was reported, with the process that was refused"
+
+    if ! grep -q "1 connection(s) were refused" "$reported"; then
+        echo "FAIL: Coverage did not account for the refused connection." >&2
+        exit 1
+    fi
+    echo "OK: Coverage accounts for what was refused"
+
+    sudo "$binary" --database "$database" allow "$blocked_address" --port 443
+    if sudo "$binary" --database "$database" rules 2>&1 | grep -q "$blocked_address"; then
+        echo "FAIL: the rule survived being removed." >&2
+        exit 1
+    fi
+    echo "OK: the rule can be taken away again"
 fi
 
 mode=$(sudo stat -c '%a' "$database")

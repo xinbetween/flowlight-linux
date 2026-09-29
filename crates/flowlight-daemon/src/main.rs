@@ -11,6 +11,7 @@
 //! Needs root, or `CAP_BPF` and `CAP_PERFMON`. There is no version of loading a probe that does not.
 
 mod agent;
+mod blocking;
 mod history;
 mod http2;
 mod libraries;
@@ -23,11 +24,13 @@ use agent::Agents;
 use anyhow::{Context as _, anyhow, bail};
 use aya::Ebpf;
 use aya::maps::perf::{PerfEvent, PerfEventArrayBuffer};
-use aya::maps::{Array, MapData, PerfEventArray};
+use aya::maps::{Array, HashMap as BpfHashMap, MapData, PerfEventArray};
 use aya::programs::uprobe::UProbeScope;
-use aya::programs::{TracePoint, UProbe};
+use aya::programs::{CgroupAttachMode, CgroupSockAddr, TracePoint, UProbe};
 use aya::util::online_cpus;
+use blocking::Blocking;
 use clap::{Parser, Subcommand};
+use flowlight_common::block::{BlockEvent, BlockKey};
 use flowlight_common::connection::{ConnectionEvent, Layout};
 use flowlight_common::procmaps::TlsLibrary;
 use flowlight_common::tls::TlsChunk;
@@ -60,6 +63,16 @@ const DEFAULT_DATABASE: &str = "/var/lib/flowlight/flowlight.db";
 
 /// How often expired detail is folded into the summary and removed.
 const SWEEP: Duration = Duration::from_secs(3600);
+
+/// How often the rules are read back and the kernel's table brought into line with them.
+///
+/// A rule is written by a separate invocation of this binary into the database, so this is how long it
+/// takes to come into force. Two seconds is short enough that `block` feels like it did something and long
+/// enough that the query is free.
+const RULES: Duration = Duration::from_secs(2);
+
+/// Where cgroup v2 is mounted on anything current.
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// How often a partial batch is written even though it is not full.
 ///
@@ -140,6 +153,10 @@ struct Args {
     #[arg(long)]
     no_ui: bool,
 
+    /// Do not enforce rules. Nothing is refused, whatever the rules say.
+    #[arg(long)]
+    no_block: bool,
+
     /// Ask the database a question instead of watching.
     #[command(subcommand)]
     command: Option<Command>,
@@ -163,6 +180,27 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
+    /// Refuse connections to a host or address, before the handshake starts.
+    Block {
+        /// A hostname, or a literal address.
+        subject: String,
+        /// Only this port. Every port by default.
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Why, for whoever reads the rules later.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Remove a rule written by `block`.
+    Allow {
+        /// The hostname or address the rule names.
+        subject: String,
+        /// The port the rule names.
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+    },
+    /// Every rule in force.
+    Rules,
     /// Which agents have been running, and what each one reached against what it was configured to reach.
     Agents {
         /// How far back to look: `30m`, `6h`, `2d`, or a number of seconds.
@@ -201,6 +239,8 @@ fn now() -> i64 {
 enum Message {
     /// A process opened a connection.
     Connection(Box<ConnectionEvent>),
+    /// A process was refused one.
+    Blocked(Box<BlockEvent>),
     /// A process wrote or read plaintext.
     Payload(Box<TlsChunk>),
     /// The kernel had something to report and nowhere to put it.
@@ -269,8 +309,23 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    let mut enforcing = None;
+    if !args.no_block {
+        match attach_blocking(&mut ebpf) {
+            Ok(map) => enforcing = Some(Blocking::new(map)),
+            // Not fatal. A kernel or a container that will not take a cgroup hook is a machine that cannot
+            // refuse connections, and that is a reason to say so rather than a reason to stop watching.
+            Err(err) => eprintln!(
+                "not enforcing rules: {err:#}. Nothing will be refused; watching continues."
+            ),
+        }
+    }
+
     let (sender, receiver) = channel();
     spawn_readers(&mut ebpf, "EVENTS", Kind::Connection, &sender)?;
+    if enforcing.is_some() {
+        spawn_readers(&mut ebpf, "BLOCK_EVENTS", Kind::Blocked, &sender)?;
+    }
     if !args.no_payloads {
         spawn_readers(&mut ebpf, "TLS_EVENTS", Kind::Payload, &sender)?;
     }
@@ -322,7 +377,13 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    run(&mut ebpf, &receiver, &args, store.as_mut())
+    run(
+        &mut ebpf,
+        &receiver,
+        &args,
+        store.as_mut(),
+        enforcing.as_mut(),
+    )
 }
 
 /// Which map a reader thread is draining, and therefore what its records are.
@@ -332,6 +393,8 @@ enum Kind {
     Connection,
     /// `TLS_EVENTS`, carrying [`TlsChunk`].
     Payload,
+    /// `BLOCK_EVENTS`, carrying [`BlockEvent`].
+    Blocked,
 }
 
 /// Opens one perf buffer per CPU and starts a thread draining each.
@@ -364,6 +427,7 @@ fn run(
     receiver: &Receiver<Message>,
     args: &Args,
     mut store: Option<&mut Store>,
+    mut enforcing: Option<&mut Blocking>,
 ) -> anyhow::Result<()> {
     let deadline = args
         .seconds
@@ -375,6 +439,7 @@ fn run(
     let mut next_scan = Instant::now();
     let mut next_sweep = Instant::now();
     let mut next_flush = Instant::now() + FLUSH;
+    let mut next_rules = Instant::now();
     let mut seen = 0_u64;
     let mut lost = 0_u64;
 
@@ -401,6 +466,29 @@ fn run(
             next_sweep = Instant::now() + SWEEP;
         }
 
+        if let (Some(store), Some(enforcing)) = (store.as_deref_mut(), enforcing.as_deref_mut())
+            && Instant::now() >= next_rules
+        {
+            match store.rules() {
+                Ok(rules) => {
+                    let report = enforcing.apply(&rules);
+                    if !report.is_quiet() {
+                        eprintln!(
+                            "rules: {} address(es) now refused, {} no longer",
+                            report.added, report.removed
+                        );
+                        for subject in &report.unresolved {
+                            eprintln!(
+                                "  {subject} could not be resolved, so the rule naming it is not in force"
+                            );
+                        }
+                    }
+                }
+                Err(err) => eprintln!("could not read the rules: {err:#}"),
+            }
+            next_rules = Instant::now() + RULES;
+        }
+
         if let Some(store) = store.as_deref_mut()
             && Instant::now() >= next_flush
         {
@@ -412,8 +500,12 @@ fn run(
 
         let until = match deadline {
             Some(deadline) if deadline <= Instant::now() => break,
-            Some(deadline) => deadline.min(next_scan).min(next_sweep).min(next_flush),
-            None => next_scan.min(next_sweep).min(next_flush),
+            Some(deadline) => deadline
+                .min(next_scan)
+                .min(next_sweep)
+                .min(next_flush)
+                .min(next_rules),
+            None => next_scan.min(next_sweep).min(next_flush).min(next_rules),
         };
         let timeout = until.saturating_duration_since(Instant::now());
 
@@ -426,6 +518,15 @@ fn run(
                     keep(store.record_drop(count));
                 }
                 continue;
+            }
+            Ok(Message::Blocked(event)) => {
+                let exe = executable_of(event.tgid);
+                let mut record = Record::refused(&event, exe.as_deref());
+                record.agent = agents.of(event.tgid);
+                if let Some(store) = store.as_deref_mut() {
+                    keep(store.record_connection(record.stored(now())));
+                }
+                render(&mut stdout, args.json, &record, &record.human())?;
             }
             Ok(Message::Connection(event)) => {
                 let exe = executable_of(event.tgid);
@@ -661,6 +762,34 @@ fn keep(result: anyhow::Result<()>) {
     }
 }
 
+/// Loads the two `connect` hooks and attaches them to the root cgroup.
+///
+/// `AllowMultiple` rather than replacing what is there: a machine may already have a cgroup program
+/// attached — systemd's own filtering, a container runtime's — and quietly displacing it would turn a
+/// monitoring tool into the reason something else stopped working.
+fn attach_blocking(ebpf: &mut Ebpf) -> anyhow::Result<BpfHashMap<MapData, BlockKey, u8>> {
+    let cgroup = std::fs::File::open(CGROUP_ROOT).with_context(|| {
+        format!(
+            "opening {CGROUP_ROOT}. Refusing connections needs cgroup v2, which every distribution has \
+             mounted there since 2019"
+        )
+    })?;
+    for name in ["connect4", "connect6"] {
+        let program: &mut CgroupSockAddr = ebpf
+            .program_mut(name)
+            .ok_or_else(|| anyhow!("the compiled program has no {name} function"))?
+            .try_into()?;
+        program.load().map_err(explain_load_failure)?;
+        program
+            .attach(&cgroup, CgroupAttachMode::AllowMultiple)
+            .with_context(|| format!("attaching {name} to {CGROUP_ROOT}"))?;
+    }
+    let map = ebpf
+        .take_map("BLOCKED")
+        .ok_or_else(|| anyhow!("the compiled program has no BLOCKED map"))?;
+    Ok(BpfHashMap::try_from(map)?)
+}
+
 /// `/proc/<pid>/exe`, if the process is still there and we may read it.
 fn executable_of(tgid: u32) -> Option<String> {
     std::fs::read_link(format!("/proc/{tgid}/exe"))
@@ -690,6 +819,8 @@ fn read_events(mut buffer: PerfEventArrayBuffer<MapData>, kind: Kind, sender: &S
                         .map(|event| Message::Connection(Box::new(event))),
                     Kind::Payload => decode::<TlsChunk>(head, tail, &mut scratch)
                         .map(|chunk| Message::Payload(Box::new(chunk))),
+                    Kind::Blocked => decode::<BlockEvent>(head, tail, &mut scratch)
+                        .map(|event| Message::Blocked(Box::new(event))),
                 },
             };
             if let Some(message) = message

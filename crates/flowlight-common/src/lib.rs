@@ -19,6 +19,7 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+pub mod block;
 pub mod connection;
 pub mod http;
 #[cfg(feature = "alloc")]
