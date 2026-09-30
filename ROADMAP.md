@@ -1,7 +1,7 @@
 # Roadmap
 
-Three milestones. **0.1 — see everything, honestly**, then **0.2 — parity with the macOS build**, then
-**0.3 — installing it without a compiler**.
+Four milestones. **0.1 — see everything, honestly**, then **0.2 — parity with the macOS build**, then
+**0.3 — installing it without a compiler**, then **0.4 — the parity the first pass missed**.
 
 ## 0.1 — see everything, honestly
 
@@ -69,6 +69,37 @@ directory.
 
 Neither is parity with anything; the macOS build ships a signed `.dmg` and a notarised app, which is the same
 problem solved by a different distribution's rules.
+
+## 0.4.x — the parity the first pass missed
+
+0.2 was built from the macOS build's *roadmap*, which lists what was planned. This milestone was built by
+reading its *source tree*, which is what exists — and there is more in the second list than in the first. None
+of it is small, and none of it was a decision to leave out; it simply was not visible from where the first
+comparison was made.
+
+Ordered by what an agent monitor is for. The first two are the ones whose absence is felt.
+
+| | | | |
+| --- | --- | --- | --- |
+| **0.4.0** | **Guardrails** | "This agent may not use that tool." The other half of the rule model, and its own idea rather than a special case of the network one: *which tools may this agent use* is a different question from *which hosts may it reach*, and answering it means reading what the agent says rather than where it connects. A guardrail names an agent, a server and a tool — any of them blank meaning all of them — and refuses it. There is no allow action, because a guardrail is subtractive by nature: it is applied to a list the agent itself declares, and "allow" would only ever mean "do not subtract this", which is what leaving it out already says. Linux can see MCP calls since 0.2.5 and can answer a single request since 0.2.8, so this is the two joined together: match the method and the tool in the proxy, and answer with a JSON-RPC error the agent will understand rather than a dropped connection it will retry. | |
+| **0.4.1** | **Alerts** | Anomalies, each carrying the arithmetic that produced it. The macOS build's list is the right one and was arrived at by use: a traffic spike against an EWMA baseline, an unusual number of destinations, first contact with a domain, a process new to the network, a non-standard port, an upload above the 99th percentile, and an agent reaching a sensitive channel. A ranked list with no numbers behind it is a horoscope, so every alert names what it compared against. The one signal that does not port is "traffic while nobody was at the keyboard": a desktop idea, and this runs on servers, so it is offered where there is a session to ask about and absent where there is not. | |
+| **0.4.2** | **Who owns an address** | An autonomous system number and its operator, for the traffic that has no hostname — which on Linux is every connection recorded at `connect()`, because the name was resolved and thrown away before the kernel saw it. Coverage already says how many connections could not be read; saying *whose* they were is the difference between a number and a lead. | |
+| **0.4.3** | **What an agent is set up to do** | 0.2.5 reads the MCP servers out of an agent's configuration and compares them with what it reached. The same files say far more: skills, subagents, commands, hooks, plugins, permissions and instructions. A hook is a program an agent runs on its own behalf, and a permission is a decision somebody made once and has not looked at since — both worth being able to list without opening a dotfile. Pure parsing, in the crate that already does the parsing. | |
+| **0.4.4** | **Reports** | What the window can show that a table cannot: traffic sliced by process, destination, address or protocol, over a window somebody picks. And the profile that goes with it — why one process's destinations stand out, with the count behind each reason: many destinations, hostless traffic, generated-looking names, mostly uploading. Every signal carries its evidence for the same reason alerts do. | |
+| **0.4.5** | **Devices** | The channels that are not the network: what is attached over USB and what is paired over Bluetooth, and when that changed. Arrivals, departures and what a thing is — never how much went through it, because neither channel accounts for throughput per process on any platform. Off until it is switched on, like the macOS build, and for the same reason: it widens what is watched, and that should be a decision rather than a surprise in an update. | |
+| **0.4.6** | **Nine languages** | The macOS build ships in German, Spanish, French, Italian, Japanese, Korean, Portuguese and simplified Chinese as well as English. This ships in English. Sentences are the interface here — the disclosures, the coverage explanations, the reason a rule did not bite — so translating it is translating most of what it says, which is why it is a release of its own and not a chore attached to another one. | |
+
+Smaller than a release each, and recorded so they are not lost: a focus mode that narrows every screen to one
+process or one destination; starter rules for the things everybody blocks first; and a demonstration mode, which
+is how a tool that watches a private machine gets screenshotted at all.
+
+### What this has that the macOS build does not
+
+Recorded in the same spirit. Blocking happens in the kernel at `connect()` rather than in the proxy, so refusing
+and inspecting are independent and a refusal costs no interception. Agent attribution is carried by the kernel
+at `fork`, so anything an agent starts is attributed before it can run. `launch` marks a process before it
+executes, which no amount of scanning can promise. And there is no built-in model: Ask runs against one you
+configure, or not at all.
 
 ## What this will not do
 
