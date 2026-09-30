@@ -455,7 +455,7 @@ checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
 name = "flowlight-agents"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "serde",
@@ -464,21 +464,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "flowlight-ask"
+version = "0.2.7"
+dependencies = [
+ "anyhow",
+ "flowlight-store",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "flowlight-common"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "aya",
 ]
 
 [[package]]
 name = "flowlight-daemon"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "aya",
  "aya-build",
  "clap",
  "flowlight-agents",
+ "flowlight-ask",
  "flowlight-common",
  "flowlight-rules",
  "flowlight-store",
@@ -492,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "flowlight-ebpf"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "aya-ebpf",
  "flowlight-common",
@@ -500,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "flowlight-gui"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -512,11 +524,11 @@ dependencies = [
 
 [[package]]
 name = "flowlight-rules"
-version = "0.2.6"
+version = "0.2.7"
 
 [[package]]
 name = "flowlight-store"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "rusqlite",

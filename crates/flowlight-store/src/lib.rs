@@ -30,9 +30,11 @@
 //! It has no Linux-only dependency, so it builds and its tests run on any machine — including the ones the
 //! daemon around it cannot be compiled on. The same reason [`flowlight_common`] is a crate of its own.
 
+pub mod ask;
 pub mod budget;
 pub mod export;
 
+pub use ask::Ask;
 pub use budget::{Budget, Paths};
 pub use export::Export;
 
@@ -276,6 +278,17 @@ pub struct Coverage {
     pub unprobed: Vec<Note>,
 }
 
+/// One bucket of a series over time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesRow {
+    /// The bucket's start, in seconds since the epoch.
+    pub at: i64,
+    /// Requests in it.
+    pub requests: i64,
+    /// Bytes they carried.
+    pub bytes: i64,
+}
+
 /// One day's traffic between one process and one host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DailyRow {
@@ -405,7 +418,7 @@ impl Store {
     }
 
     /// The schema this version of the code expects.
-    pub const SCHEMA: i64 = 7;
+    pub const SCHEMA: i64 = 8;
 
     /// Creates the schema, or brings an older one up to it.
     ///
@@ -460,6 +473,10 @@ impl Store {
                 requests INTEGER NOT NULL,
                 bytes    INTEGER NOT NULL,
                 PRIMARY KEY (day, process, host)
+            );
+            CREATE TABLE IF NOT EXISTS ask (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS export (
                 key   TEXT PRIMARY KEY,
@@ -1142,6 +1159,101 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// The busiest hosts, across everything or for one process.
+    pub fn hosts(
+        &mut self,
+        process: Option<&str>,
+        since: i64,
+        limit: usize,
+    ) -> Result<Vec<HostRow>> {
+        self.flush()?;
+        // One statement with a parameter that means "every process" rather than two statements, because two
+        // drift: the first bug this shape prevents is a filter added to one of them.
+        let mut statement = self.connection.prepare(
+            "SELECT host, count(*), max(at) FROM requests
+             WHERE at >= ?1 AND host IS NOT NULL AND host != ''
+               AND (?2 IS NULL OR process = ?2)
+             GROUP BY host ORDER BY count(*) DESC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![since, process, limit as i64], |row| {
+            Ok(HostRow {
+                host: row.get(0)?,
+                requests: row.get(1)?,
+                last_seen: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Hosts reached in this window that had never been reached before it.
+    ///
+    /// The most useful shape of question anybody asks of a history: not what an agent talks to, which is a
+    /// long list nobody reads, but what it started talking to today.
+    pub fn new_hosts(
+        &mut self,
+        process: Option<&str>,
+        since: i64,
+        limit: usize,
+    ) -> Result<Vec<HostRow>> {
+        self.flush()?;
+        let mut statement = self.connection.prepare(
+            "SELECT host, count(*), max(at) FROM requests
+             WHERE at >= ?1 AND host IS NOT NULL AND host != ''
+               AND (?2 IS NULL OR process = ?2)
+               AND host NOT IN (
+                   SELECT host FROM requests WHERE at < ?1 AND host IS NOT NULL
+                   UNION SELECT host FROM daily_requests WHERE host != ''
+               )
+             GROUP BY host ORDER BY count(*) DESC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![since, process, limit as i64], |row| {
+            Ok(HostRow {
+                host: row.get(0)?,
+                requests: row.get(1)?,
+                last_seen: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Requests and bytes per bucket across a window, for "when did it happen".
+    ///
+    /// Buckets are aligned to the epoch rather than to the start of the window, so the same question asked
+    /// twice a minute apart gives buckets that line up instead of two series nobody can compare.
+    pub fn series(
+        &mut self,
+        process: Option<&str>,
+        since: i64,
+        until: i64,
+        bucket: i64,
+    ) -> Result<Vec<SeriesRow>> {
+        self.flush()?;
+        let bucket = bucket.max(1);
+        let mut statement = self.connection.prepare(
+            "SELECT (at / ?4) * ?4 AS bucket, count(*), coalesce(sum(bytes), 0) FROM requests
+             WHERE at >= ?1 AND at < ?2 AND (?3 IS NULL OR process = ?3)
+             GROUP BY bucket ORDER BY bucket",
+        )?;
+        let rows = statement.query_map(params![since, until, process, bucket], |row| {
+            Ok(SeriesRow {
+                at: row.get(0)?,
+                requests: row.get(1)?,
+                bytes: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// How Flowlight is set up, for a question about the tool rather than about the traffic.
+    pub fn ask(&self) -> Result<Ask> {
+        ask::read(&self.connection)
+    }
+
+    /// Writes the Ask configuration.
+    pub fn set_ask(&mut self, configuration: &Ask) -> Result<()> {
+        ask::write(&self.connection, configuration)
+    }
+
     /// The hosts one process reached, busiest first.
     pub fn hosts_for(&mut self, process: &str, since: i64, limit: usize) -> Result<Vec<HostRow>> {
         self.flush()?;
@@ -1760,6 +1872,102 @@ mod tests {
         drop(store);
         let store = Store::open(&path).unwrap();
         assert_eq!(store.schema_version().unwrap(), Store::SCHEMA);
+    }
+
+    // Ask
+
+    #[test]
+    fn an_ask_that_was_never_configured_is_off() {
+        let store = Store::in_memory().unwrap();
+        let ask = store.ask().unwrap();
+        assert!(!ask.enabled);
+        assert!(!ask.ready(true));
+    }
+
+    #[test]
+    fn an_ask_written_is_an_ask_read_back() {
+        let mut store = Store::in_memory().unwrap();
+        let wanted = Ask {
+            enabled: true,
+            kind: crate::ask::Kind::Anthropic,
+            endpoint: Some("https://api.anthropic.com/v1/messages".to_owned()),
+            model: Some("claude-sonnet-5".to_owned()),
+        };
+        store.set_ask(&wanted).unwrap();
+        assert_eq!(store.ask().unwrap(), wanted);
+    }
+
+    /// Not what a process talks to, which is a long list nobody reads, but what it started talking to.
+    #[test]
+    fn a_host_is_new_only_if_it_was_never_reached_before_the_window() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .record_request(request(1_000, "curl", "old.example", 10))
+            .unwrap();
+        store
+            .record_request(request(5_000, "curl", "old.example", 10))
+            .unwrap();
+        store
+            .record_request(request(5_000, "curl", "new.example", 10))
+            .unwrap();
+
+        let new = store.new_hosts(None, 4_000, 10).unwrap();
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].host, "new.example");
+
+        // Every host is new when the window covers everything.
+        assert_eq!(store.new_hosts(None, 0, 10).unwrap().len(), 2);
+        // And the busiest-hosts query is not the same question.
+        assert_eq!(store.hosts(None, 4_000, 10).unwrap().len(), 2);
+        assert_eq!(store.hosts(Some("curl"), 4_000, 10).unwrap().len(), 2);
+        assert!(store.hosts(Some("wget"), 4_000, 10).unwrap().is_empty());
+    }
+
+    /// A host that only survives in the daily summary has still been reached before, or every host becomes
+    /// new again the day its detail expires.
+    #[test]
+    fn a_host_remembered_only_in_the_summary_is_not_new() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .record_request(request(1_000, "curl", "old.example", 10))
+            .unwrap();
+        store
+            .record_request(request(500_000, "curl", "old.example", 10))
+            .unwrap();
+        // Fold the old detail away, which is what retention does every hour.
+        store
+            .sweep(
+                500_000,
+                Retention {
+                    detail_days: 1,
+                    summary_days: 30,
+                },
+            )
+            .unwrap();
+        assert!(store.new_hosts(None, 400_000, 10).unwrap().is_empty());
+    }
+
+    /// Buckets align to the epoch, so the same question asked twice a minute apart gives series that line
+    /// up rather than two nobody can compare.
+    #[test]
+    fn a_series_buckets_by_the_clock_and_not_by_the_question() {
+        let mut store = Store::in_memory().unwrap();
+        for at in [3_600, 3_700, 7_300] {
+            store
+                .record_request(request(at, "curl", "example.com", 100))
+                .unwrap();
+        }
+        let series = store.series(None, 0, 10_000, 3_600).unwrap();
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0].at, 3_600);
+        assert_eq!(series[0].requests, 2);
+        assert_eq!(series[0].bytes, 200);
+        assert_eq!(series[1].at, 7_200);
+        assert_eq!(series[1].requests, 1);
+
+        // Asked again from a different start, the buckets are the same buckets.
+        let again = store.series(None, 1_000, 10_000, 3_600).unwrap();
+        assert_eq!(again[0].at, 3_600);
     }
 
     // Export

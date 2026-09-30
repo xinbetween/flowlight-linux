@@ -344,6 +344,166 @@ pub fn set_export(store: &mut Store, change: &ExportChange) -> Result<ExportView
     Ok(describe_export(&export, revoked))
 }
 
+/// Which model answers questions, and what asking one would mean.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AskView {
+    /// Whether the feature is on.
+    pub enabled: bool,
+    /// Whether a question could be asked right now, which is the only one of these that decides anything.
+    pub ready: bool,
+    /// `local`, `compatible`, `anthropic` or `gemini`.
+    pub kind: String,
+    /// Every kind there is, so an interface can offer them without carrying its own copy of the list.
+    pub every_kind: Vec<String>,
+    /// Where the model is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Which model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Whether this kind needs a key at all.
+    pub needs_key: bool,
+    /// Whether there is one on file. Never the key.
+    pub key_on_file: bool,
+    /// Whether asking sends anything off this machine.
+    pub sends_off_the_machine: bool,
+    /// Why a question cannot be asked, when it cannot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why_not: Option<String>,
+    /// What asking would mean, in sentences.
+    pub disclosure: Vec<String>,
+}
+
+/// What one request may change about which model answers.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct AskChange {
+    /// `local`, `compatible`, `anthropic` or `gemini`.
+    pub kind: Option<String>,
+    /// Where the model is.
+    pub endpoint: Option<String>,
+    /// Which model to name in the request.
+    pub model: Option<String>,
+    /// Turn it off, keeping what is configured.
+    #[serde(default)]
+    pub off: bool,
+}
+
+/// Which model answers, described.
+pub fn ask(store: &mut Store, key_on_file: bool) -> Result<AskView> {
+    Ok(describe_ask(&store.ask()?, key_on_file))
+}
+
+/// Turns an Ask configuration into what an interface shows.
+fn describe_ask(configuration: &flowlight_store::Ask, key_on_file: bool) -> AskView {
+    AskView {
+        enabled: configuration.enabled,
+        ready: configuration.ready(key_on_file),
+        kind: configuration.kind.as_str().to_owned(),
+        every_kind: flowlight_store::ask::EVERY_KIND
+            .iter()
+            .map(|kind| kind.as_str().to_owned())
+            .collect(),
+        endpoint: configuration.endpoint.clone(),
+        model: configuration.model.clone(),
+        needs_key: configuration.kind.needs_key(),
+        key_on_file,
+        sends_off_the_machine: configuration.kind.sends_off_the_machine(),
+        why_not: configuration.why_not(key_on_file),
+        disclosure: configuration.disclose(),
+    }
+}
+
+/// Changes which model answers, and says what is now configured.
+///
+/// The key is not here. It is a file, written by whoever called this, because a secret and a setting have
+/// different lifetimes and different permissions and putting them in one struct loses that.
+pub fn set_ask(store: &mut Store, change: &AskChange, key_on_file: bool) -> Result<AskView> {
+    use anyhow::{Context as _, bail};
+    let mut configuration = store.ask()?;
+    if let Some(named) = &change.kind {
+        let kind = flowlight_store::ask::Kind::parse(named).with_context(|| {
+            format!(
+                "`{named}` is not one of: {}",
+                flowlight_store::ask::EVERY_KIND
+                    .iter()
+                    .map(|kind| kind.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+        // A kind's suggested endpoint, when changing kind has left the old one pointing at the wrong
+        // provider. Only when there is an obvious one, and never for a kind that means "somebody's own
+        // server": guessing at its address would be guessing at whose.
+        if kind != configuration.kind {
+            configuration.endpoint = kind.suggested_endpoint().map(str::to_owned);
+        }
+        configuration.kind = kind;
+    }
+    if let Some(endpoint) = &change.endpoint {
+        match flowlight_store::ask::Safety::of(endpoint, configuration.kind) {
+            flowlight_store::ask::Safety::Fine => {}
+            refused => bail!("{}", refused.describe(endpoint)),
+        }
+        configuration.endpoint = Some(endpoint.clone());
+    }
+    if let Some(model) = &change.model {
+        configuration.model = Some(model.trim().to_owned()).filter(|model| !model.is_empty());
+    }
+    // Configuring a model is asking for the feature. Turning it off is a separate thing somebody says.
+    configuration.enabled = !change.off;
+    store.set_ask(&configuration)?;
+    Ok(describe_ask(&configuration, key_on_file))
+}
+
+/// A question, its answer, and the work behind it.
+///
+/// The queries are part of the answer rather than a debugging aid. An answer with no queries under it is a
+/// sentence a model made up, and the only way to tell the two apart is to show what ran.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AnsweredView {
+    /// What was asked.
+    pub question: String,
+    /// What the model said.
+    pub answer: String,
+    /// Which queries ran.
+    pub calls: Vec<RanView>,
+    /// The exact bodies that left this machine, if any did. Empty for a model on this machine.
+    pub sent: Vec<String>,
+}
+
+/// One query a model asked for.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RanView {
+    /// Which query, as the model named it.
+    pub query: String,
+    /// What it filled in.
+    pub arguments: std::collections::BTreeMap<String, String>,
+    /// The sentence describing what came back, when there is one.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+    /// Whether the call was refused, and the model told so.
+    pub failed: bool,
+}
+
+/// Turns what a model said into what an interface shows.
+pub fn answered(question: &str, answered: &flowlight_ask::Answered) -> AnsweredView {
+    AnsweredView {
+        question: question.to_owned(),
+        answer: answered.answer.clone(),
+        calls: answered
+            .calls
+            .iter()
+            .map(|ran| RanView {
+                query: ran.query.clone(),
+                arguments: ran.arguments.clone(),
+                summary: ran.summary.clone(),
+                failed: ran.failed,
+            })
+            .collect(),
+        sent: answered.sent.clone(),
+    }
+}
+
 /// One thing a candidate rule would change.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ChangeView {

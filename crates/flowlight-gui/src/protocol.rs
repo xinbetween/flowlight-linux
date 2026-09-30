@@ -163,6 +163,60 @@ pub struct Export {
     pub disclosure: Vec<String>,
 }
 
+/// Which model answers questions, and what asking one would mean.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct Ask {
+    /// Whether the feature is on.
+    pub enabled: bool,
+    /// Whether a question could be asked right now.
+    pub ready: bool,
+    /// `local`, `compatible`, `anthropic` or `gemini`.
+    pub kind: String,
+    /// Every kind there is.
+    pub every_kind: Vec<String>,
+    /// Where the model is.
+    pub endpoint: Option<String>,
+    /// Which model.
+    pub model: Option<String>,
+    /// Whether this kind needs a key.
+    pub needs_key: bool,
+    /// Whether there is one on file. Never the key.
+    pub key_on_file: bool,
+    /// Whether asking sends anything off this machine.
+    pub sends_off_the_machine: bool,
+    /// Why a question cannot be asked, when it cannot.
+    pub why_not: Option<String>,
+    /// What asking would mean, in sentences.
+    pub disclosure: Vec<String>,
+}
+
+/// A question, its answer, and the work behind it.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct Answered {
+    /// What was asked.
+    pub question: String,
+    /// What the model said.
+    pub answer: String,
+    /// Which queries ran.
+    pub calls: Vec<Ran>,
+    /// The exact bodies that left this machine, if any did.
+    pub sent: Vec<String>,
+}
+
+/// One query a model asked for.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct Ran {
+    /// Which query.
+    pub query: String,
+    /// What it filled in.
+    pub arguments: std::collections::BTreeMap<String, String>,
+    /// What came back, when there is a sentence for it.
+    #[serde(default)]
+    pub summary: String,
+    /// Whether it was refused.
+    pub failed: bool,
+}
+
 /// One thing a candidate rule would change.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Change {
@@ -336,6 +390,17 @@ pub fn set_budget(field: &str, value: &str) -> String {
 /// The value is JSON, so a caller decides between a string, a list and a boolean.
 pub fn set_export(field: &str, value: &str) -> String {
     format!(r#"{{"op":"set-export","{field}":{value}}}"#)
+}
+
+/// Builds the request that changes which model answers.
+pub fn set_model(field: &str, value: &str) -> String {
+    format!(r#"{{"op":"set-model","{field}":{value}}}"#)
+}
+
+/// Builds the request that asks a question.
+pub fn question(asked: &str) -> String {
+    let asked = serde_json::to_string(asked).unwrap_or_else(|_| "\"\"".to_owned());
+    format!(r#"{{"op":"question","question":{asked}}}"#)
 }
 
 /// Builds the request that asks what a rule would change without writing it.

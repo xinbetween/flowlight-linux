@@ -25,6 +25,7 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
             | Command::Forget { .. }
             | Command::Budget { .. }
             | Command::Export { .. }
+            | Command::Model { .. }
     );
     if !writes && !database.exists() {
         bail!(
@@ -178,6 +179,136 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
                 writeln!(out, "\nFields available: {}", view.every_field.join(", "))?;
                 if asked {
                     eprintln!("\nA running flowlightd picks this up within a few seconds.");
+                }
+            }
+        }
+        Command::Model {
+            kind,
+            endpoint,
+            model,
+            key_file,
+            forget_key,
+            off,
+        } => {
+            // The key first, so that what is reported afterwards is the state including it. Reported the
+            // other way round, `--key-file` and `--kind anthropic` in one command would print "no key on
+            // file" about a command that had just put one there.
+            if *forget_key {
+                crate::asking::set_key(database, "")?;
+            }
+            if let Some(path) = key_file {
+                let key = crate::asking::key_from(path)?;
+                crate::asking::set_key(database, &key)?;
+            }
+            let key_on_file = crate::asking::have_key(database);
+            let asked = kind.is_some() || endpoint.is_some() || model.is_some() || *off;
+
+            let view = if asked {
+                crate::views::set_ask(
+                    &mut store,
+                    &crate::views::AskChange {
+                        kind: kind.clone(),
+                        endpoint: endpoint.clone(),
+                        model: model.clone(),
+                        off: *off,
+                    },
+                    key_on_file,
+                )?
+            } else {
+                crate::views::ask(&mut store, key_on_file)?
+            };
+
+            if json {
+                writeln!(out, "{}", line(&view))?;
+            } else {
+                for sentence in &view.disclosure {
+                    writeln!(out, "{sentence}")?;
+                }
+                match &view.why_not {
+                    Some(reason) => writeln!(out, "\nNot ready: {reason}")?,
+                    None => writeln!(
+                        out,
+                        "\nReady. `flowlightd query \"…\"` asks {} a question.",
+                        view.model.as_deref().unwrap_or("it")
+                    )?,
+                }
+                if view.needs_key && !view.key_on_file {
+                    writeln!(
+                        out,
+                        "A key goes in a file: `flowlightd model --key-file PATH`. Not on a command line, \
+                         where it would be in the shell's history and in every process listing on the \
+                         machine."
+                    )?;
+                }
+            }
+        }
+        Command::Query {
+            question,
+            show_work,
+        } => {
+            let asked = question.join(" ");
+            if asked.trim().is_empty() {
+                bail!("nothing was asked. `flowlightd query \"what did claude reach today?\"`");
+            }
+            let configuration = store.ask()?;
+            let key_on_file = crate::asking::have_key(database);
+            if let Some(reason) = configuration.why_not(key_on_file) {
+                bail!("{reason}");
+            }
+            let key = crate::asking::key(database)?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs() as i64);
+
+            // Printed as it goes, not afterwards, and only when asked for: a body containing a question
+            // about somebody's machine is not something to put on a terminal they did not ask to see it on.
+            let mut sent = Vec::new();
+            let answered = flowlight_ask::provider::ask(
+                &configuration,
+                &key,
+                &flowlight_ask::Question {
+                    question: asked.clone(),
+                    instructions: flowlight_ask::query::instructions(
+                        &flowlight_ask::window::clock(now),
+                    ),
+                },
+                &mut |call| {
+                    flowlight_ask::runner::run(call, &mut store, now).map(|produced| produced.json)
+                },
+                &mut |body| sent.push(body.to_owned()),
+            )?;
+
+            if json {
+                writeln!(out, "{}", line(&crate::views::answered(&asked, &answered)))?;
+            } else {
+                if *show_work {
+                    for body in &sent {
+                        writeln!(out, "--- sent to {}:", configuration.kind.described())?;
+                        writeln!(out, "{body}")?;
+                    }
+                    for ran in &answered.calls {
+                        writeln!(
+                            out,
+                            "--- {} {:?}{}",
+                            ran.query,
+                            ran.arguments,
+                            if ran.failed { " (refused)" } else { "" }
+                        )?;
+                        if !ran.summary.is_empty() {
+                            writeln!(out, "    {}", ran.summary)?;
+                        }
+                    }
+                }
+                writeln!(out, "{}", answered.answer)?;
+                // Always, and after the answer: which queries produced it is the only way to tell an answer
+                // from a plausible sentence.
+                if !answered.calls.is_empty() && !*show_work {
+                    let names: Vec<&str> = answered
+                        .calls
+                        .iter()
+                        .map(|ran| ran.query.as_str())
+                        .collect();
+                    writeln!(out, "\n(from {})", names.join(", "))?;
                 }
             }
         }
