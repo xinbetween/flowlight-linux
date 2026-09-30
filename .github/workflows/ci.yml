@@ -92,6 +92,24 @@ jobs:
       - name: Build the daemon and the interface
         run: cargo build --release --package flowlight-daemon --package flowlight-gui
 
+      # And the daemon again, statically linked, which is the one that ships. A binary linked against this
+      # runner's glibc is a binary that does not start on Debian 12 or RHEL 9, and the package it went into
+      # said `Depends: libc6` with no version — so it installed there and then failed.
+      - name: Build the daemon with no libc requirement
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --target x86_64-unknown-linux-musl --package flowlight-daemon
+          static=target/x86_64-unknown-linux-musl/release/flowlightd
+          file "$static"
+          # The assertion, rather than the description: `ldd` naming a shared object means something would
+          # have to be installed for this to run, which is the whole thing being avoided.
+          if ldd "$static" 2>&1 | grep -q '=>'; then
+            echo "the daemon is dynamically linked after all:"; ldd "$static"; exit 1
+          fi
+          "$static" --version
+
       # The part that cannot be faked. Loads the programs into a real kernel, attaches them, makes real
       # requests, and insists on finding them: the connection with the right process and port, and the
       # request itself in the clear.
@@ -100,8 +118,18 @@ jobs:
       - name: Build the packages and install them
         run: |
           set -euo pipefail
-          ./packaging/deb/build.sh 0.0.0-ci amd64
+          # The static daemon and the dynamic interface in one directory, because that is what a package
+          # carries: the window needs GTK at runtime and the daemon needs nothing at all.
+          mkdir -p target/packaged
+          install -m 755 target/x86_64-unknown-linux-musl/release/flowlightd target/packaged/flowlightd
+          install -m 755 target/release/flowlight target/packaged/flowlight
+          ./packaging/deb/build.sh 0.0.0-ci amd64 target/packaged
           ls -l target/deb
+          # `Depends` on the daemon at all would mean something has to be installed for it to run.
+          if ar p target/deb/flowlight_0.0.0-ci_amd64.deb control.tar.gz | tar -xzO ./control \
+              | grep -q '^Depends:'; then
+            echo "the daemon package declares a dependency it does not have"; exit 1
+          fi
           sudo apt-get install -y -qq ./target/deb/flowlight_0.0.0-ci_amd64.deb
           # Installed and not running, which is the whole point of shipping the unit disabled.
           test -x /usr/sbin/flowlightd
@@ -141,4 +169,6 @@ jobs:
           # A client that uses GnuTLS by definition, so the GnuTLS probes are exercised rather than assumed.
           # The runner's own curl and wget are both OpenSSL, which would test the same path three times.
           sudo apt-get install -y -qq gnutls-bin
-          ./scripts/smoke.sh target/release/flowlightd
+          # The binary that ships, rather than the one that happens to be easiest to build: if the static
+          # daemon cannot load a probe, nobody wants to find that out from a release.
+          ./scripts/smoke.sh target/x86_64-unknown-linux-musl/release/flowlightd

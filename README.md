@@ -33,19 +33,28 @@ installed. It reads QUIC, which termination cannot. And it runs on kernel 4.18 w
 
 Termination becomes a second, narrower mode that states what it costs.
 
-## Running it on Ubuntu
+## Running it on Linux
 
-Tested on Ubuntu 24.04. Needs root, because loading an eBPF program does — there is no version of this that
-does not.
+Needs root, because loading an eBPF program does — there is no version of this that does not. Needs a kernel of
+4.18 or later, and nothing else: **the daemon is linked statically, so it has no libc requirement at all** and
+the eBPF programs are compiled into it rather than built against the running kernel.
+
+Tested on Ubuntu 24.04, which is where CI runs it against a real kernel. The packaging is Debian and Ubuntu so
+far; an `.rpm`, an Arch package, a tarball, and the same tests run inside other distributions' userlands are the
+[0.5 milestone](ROADMAP.md).
+
+One thing the static link costs, said here rather than discovered: a hostname in a rule is resolved by musl's
+resolver, which reads DNS and `/etc/hosts` and does not consult NSS. On a machine that resolves names through
+sssd or mDNS, a rule's subject resolves differently from the rest of the machine.
 
 The quickest way in is the package from the [latest release](https://github.com/xinbetween/flowlight-linux/releases/latest):
 
 ```sh
 # The daemon. amd64 or arm64.
-sudo apt-get install ./flowlight_0.4.8_amd64.deb
+sudo apt-get install ./flowlight_0.5.0_amd64.deb
 
 # And the window, if this machine has a desktop. Needs Ubuntu 24.04 or later for libadwaita 1.5.
-sudo apt-get install ./flowlight-gui_0.4.8_amd64.deb
+sudo apt-get install ./flowlight-gui_0.5.0_amd64.deb
 ```
 
 There is also an apt repository, so that a machine is told about a new version rather than not:
@@ -73,7 +82,8 @@ want it: `sudo systemctl enable --now flowlightd`.
 
 Nothing is compiled on the machine that runs it — the eBPF programs are compiled *into* the binary by
 `aya-build` rather than built against the running kernel, so there are no kernel headers to match, no DKMS, and
-nothing to rebuild when the kernel is upgraded. Removing the package leaves the database alone; `purge` removes
+nothing to rebuild when the kernel is upgraded. The daemon package declares **no dependencies**, because a
+statically linked binary has none; the window's package declares GTK 4 and libadwaita, because it does. Removing the package leaves the database alone; `purge` removes
 it and says so.
 
 Building from source is the other way, and the nightly toolchain below is a build-time requirement rather than a

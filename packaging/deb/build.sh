@@ -41,12 +41,17 @@ Version: $version
 Architecture: $architecture
 Maintainer: xinbetween <https://github.com/xinbetween>
 Installed-Size: $size
-Depends: $depends
 Section: net
 Priority: optional
 Homepage: https://github.com/xinbetween/flowlight-linux
 Description: $described
 CONTROL
+
+    # A package with nothing to depend on says nothing rather than saying `Depends:` with an empty value.
+    # The daemon is statically linked and depends on the kernel, which is not a package.
+    if [ -n "$depends" ]; then
+        sed -i "/^Installed-Size:/a Depends: $depends" "$root/DEBIAN/control"
+    fi
 
     # The daemon brings a unit file, shipped disabled.
     if [ "$name" = flowlight ]; then
@@ -75,7 +80,10 @@ CONTROL
     echo "$file"
 }
 
-package flowlight flowlightd /usr/sbin "libc6" \
+# No dependencies, because there are none: the daemon is linked statically against musl. The previous
+# `Depends: libc6` was worse than useless — unversioned, it let the package install on Debian 12 and RHEL 9,
+# where the binary then failed to start because it had been linked against Ubuntu 24.04's glibc 2.39.
+package flowlight flowlightd /usr/sbin "" \
     "Watch what every process says on the network, before encryption
  Flowlight reads HTTPS as an application hands it to its TLS library, so no
  certificate is installed anywhere and certificate pinning is not involved. It
@@ -85,7 +93,10 @@ package flowlight flowlightd /usr/sbin "libc6" \
  .
  The daemon needs root, because loading an eBPF program does. Its systemd unit
  ships disabled: a tool that reads every HTTPS request on a machine should not
- start doing it because somebody installed it."
+ start doing it because somebody installed it.
+ .
+ Statically linked, so it has no libc requirement and runs on any distribution
+ with a kernel of 4.18 or later."
 
 package flowlight-gui flowlight /usr/bin "libc6, libgtk-4-1 (>= 4.14), libadwaita-1-0 (>= 1.5), flowlight (= $version)" \
     "The window for Flowlight
