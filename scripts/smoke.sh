@@ -496,22 +496,25 @@ echo "OK: a focus narrows what is shown, says so, and refuses the slice it canno
 sudo "$binary" --database "$database" --certificates "$certificates" --json starters \
     | jq -e 'length >= 4 and ([.[] | select(.action == "allow")] | length == 0)' >/dev/null \
     || fail "the starters are missing, or one of them allows something."
-before=$(sudo "$binary" --database "$database" --certificates "$certificates" --json rules | jq 'length')
+# `rules --json` is one object per line rather than an array, so every count of it is slurped. Counting the
+# lines of `jq length` instead gives the number of keys in each rule, which is a number that looks plausible
+# and means nothing.
+before=$(sudo "$binary" --database "$database" --certificates "$certificates" --json rules | jq -s 'length')
 sudo "$binary" --database "$database" --certificates "$certificates" starters >/dev/null
-after=$(sudo "$binary" --database "$database" --certificates "$certificates" --json rules | jq 'length')
+after=$(sudo "$binary" --database "$database" --certificates "$certificates" --json rules | jq -s 'length')
 [ "$before" = "$after" ] || fail "listing the starters wrote a rule."
 
 applied=$(sudo "$binary" --database "$database" --certificates "$certificates" --json starters --apply metadata)
 printf '%s' "$applied" | jq -e '.added | length >= 3' >/dev/null || fail "applying a starter wrote nothing."
 sudo "$binary" --database "$database" --certificates "$certificates" --json rules \
-    | jq -e '[.[] | select(.subject == "169.254.169.254" and .action == "block")] | length == 1' >/dev/null \
-    || fail "the metadata service is not blocked after applying the starter that blocks it."
+    | jq -s -e '[.[] | select(.subject == "169.254.169.254" and .action == "block")] | length == 1' \
+    >/dev/null || fail "the metadata service is not blocked after applying the starter that blocks it."
 sudo "$binary" --database "$database" --certificates "$certificates" --json starters --apply metadata \
     | jq -e '(.added | length == 0) and (.unchanged | length >= 3)' >/dev/null \
     || fail "applying the same starter twice wrote it again."
 for subject in $(printf '%s' "$applied" | jq -r '.added[]'); do
     sudo "$binary" --database "$database" --certificates "$certificates" --json rules \
-        | jq -e --arg s "$subject" '[.[] | select(.subject == $s)] | length == 1' >/dev/null \
+        | jq -s -e --arg s "$subject" '[.[] | select(.subject == $s)] | length == 1' >/dev/null \
         || fail "the starter left more than one rule for $subject."
 done
 echo "OK: the starters are written when they are asked for, once, and not before"
