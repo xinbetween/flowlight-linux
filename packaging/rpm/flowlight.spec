@@ -1,4 +1,4 @@
-# The daemon, as an RPM. Built from a binary that already exists rather than from source in `%build`:
+# The daemon, as an RPM. Built from a binary that already exists rather than from source in a %%build section:
 # the binary is statically linked, so the machine that compiles it has nothing to do with the machine that
 # runs it, and compiling it again inside a Fedora container would only prove that Fedora has a Rust compiler.
 #
@@ -7,8 +7,17 @@
 # shipping a package that installs and does not start, which is the exact bug v0.5.0 exists to have fixed.
 # Building it inside each distribution is its own piece of work and is on the roadmap as one.
 #
-# `Release: 1` with no `%{?dist}`, deliberately. This package is not Fedora's or openSUSE's — it is the same
+# `Release: 1` with no dist tag, deliberately. This package is not Fedora's or openSUSE's — it is the same
 # file for both, and a `.fc41` in the name would claim otherwise.
+
+# `_unitdir` comes from `systemd-rpm-macros` and `_licensedir` from the distribution's rpm configuration,
+# and this needs neither for anything else — so `build.sh` defines both. Their values are the same on every
+# distribution this is built for, and a build that fails because a macro package is missing is a build that
+# fails for a reason that has nothing to do with Flowlight.
+#
+# The changelog is in the release notes, where somebody can read it before installing anything, so there is no
+# `%%changelog` section here and nothing for rpm to take a date from.
+%global source_date_epoch_from_changelog 0
 
 Name:           flowlight
 Version:        %{version}
@@ -49,7 +58,7 @@ install -D -m 644 %{licence} %{buildroot}%{_licensedir}/%{name}/COPYING
 %config(noreplace) %{_unitdir}/flowlightd.service
 %{_licensedir}/%{name}/COPYING
 
-# Plain shell rather than the `%systemd_post` macros, for two reasons: those macros apply the distribution's
+# Plain shell rather than the %%systemd_post macros, for two reasons: those macros apply the distribution's
 # presets, and a preset that enabled this would start reading every request on the machine because somebody
 # installed a package. And they are a build dependency this does not otherwise need.
 %post
@@ -83,7 +92,3 @@ fi
 # The database stays. Somebody removing a package is usually not asking for the record of what their machine
 # has been doing to be deleted, and RPM has no `purge` to mean that they were. `rm -rf /var/lib/flowlight`
 # is one command and it is theirs to type.
-
-%changelog
-# Deliberately empty. The changelog lives in the release notes, where it can be read by somebody who has not
-# installed the package yet.

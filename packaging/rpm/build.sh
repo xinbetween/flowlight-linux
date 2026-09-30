@@ -42,6 +42,8 @@ rpmbuild -bb "$here/flowlight.spec" \
     --define "unit $here/../deb/flowlightd.service" \
     --define "licence $root/LICENSE" \
     --define "_build_id_links none" \
+    --define "_unitdir /usr/lib/systemd/system" \
+    --define "_licensedir /usr/share/licenses" \
     --target "$architecture"
 
 find "$work/RPMS" -name '*.rpm' -exec install -m 644 {} "$out/" \;
