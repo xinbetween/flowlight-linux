@@ -42,11 +42,30 @@ The quickest way in is the package from the [latest release](https://github.com/
 
 ```sh
 # The daemon. amd64 or arm64.
-sudo apt-get install ./flowlight_0.4.5_amd64.deb
+sudo apt-get install ./flowlight_0.4.8_amd64.deb
 
 # And the window, if this machine has a desktop. Needs Ubuntu 24.04 or later for libadwaita 1.5.
-sudo apt-get install ./flowlight-gui_0.4.5_amd64.deb
+sudo apt-get install ./flowlight-gui_0.4.8_amd64.deb
 ```
+
+There is also an apt repository, so that a machine is told about a new version rather than not:
+
+```sh
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://xinbetween.github.io/flowlight-linux/flowlight-archive-keyring.asc \
+  | sudo tee /etc/apt/keyrings/flowlight.asc >/dev/null
+echo "deb [signed-by=/etc/apt/keyrings/flowlight.asc] https://xinbetween.github.io/flowlight-linux stable main" \
+  | sudo tee /etc/apt/sources.list.d/flowlight.list >/dev/null
+sudo apt-get update && sudo apt-get install flowlight
+```
+
+Adding it trusts whoever holds that key on every `apt-get update`, for every package it offers, for as long as
+the line is in your sources — a larger thing to agree to than downloading one file and checking it once. So the
+`.deb` above stays a first-class way to install, and `signed-by` is not optional: it binds the key to this
+archive rather than to every repository on the machine. The archive is built and verified on every release,
+including an installation from it with a throwaway key, and goes live once a signing key is published —
+[`packaging/apt/README.md`](packaging/apt/README.md) says why that key is not something this code can create for
+you. Until it is, the commands above have nothing to answer them.
 
 **It installs and does not start.** A tool that reads every HTTPS request on a machine should not begin doing
 that because somebody installed a package, so the systemd unit ships disabled and `apt` says as much. When you
