@@ -1,7 +1,8 @@
 # Roadmap
 
-Four milestones. **0.1 — see everything, honestly**, then **0.2 — parity with the macOS build**, then
-**0.3 — installing it without a compiler**, then **0.4 — the parity the first pass missed**.
+Five milestones. **0.1 — see everything, honestly**, then **0.2 — parity with the macOS build**, then
+**0.3 — installing it without a compiler**, then **0.4 — the parity the first pass missed**, then
+**0.5 — the other distributions**.
 
 ## 0.1 — see everything, honestly
 
@@ -109,6 +110,29 @@ and inspecting are independent and a refusal costs no interception. Agent attrib
 at `fork`, so anything an agent starts is attributed before it can run. `launch` marks a process before it
 executes, which no amount of scanning can promise. And there is no built-in model: Ask runs against one you
 configure, or not at all.
+
+## 0.5.x — the other distributions
+
+`apt install flowlight` is Ubuntu and Debian. Everything else is told to clone it and build it, which is a
+reasonable thing to ask of somebody trying it out and an unreasonable thing to ask of anybody else.
+
+The good news, and it is most of the work: **the watching is already portable.** The eBPF programs are compiled
+into the binary, so there are no kernel headers to match on any distribution; the TLS libraries are found by
+reading `/proc/<pid>/maps` and every directory a distribution is known to use, so Fedora's `/usr/lib64` and a
+Nix store path and a virtualenv's own copy are all found the same way; `tracefs` is looked for where it is on
+current kernels and where it was on older ones. What is Ubuntu-specific is the *packaging*, and one binary
+decision inside it.
+
+| | | | |
+| --- | --- | --- | --- |
+| **0.5.0** | **A binary that runs where it was not built** | The published daemon was linked against the glibc of the machine that built it — 2.39, from Ubuntu 24.04 — and the package said `Depends: libc6` with no version. On Debian 12 or RHEL 9 that package installed cleanly and then did not start. Statically linked against musl instead: no glibc requirement at all, one binary from Alpine to RHEL. It costs one thing and the release says so — a hostname in a rule is then resolved by musl's resolver, which reads DNS and `/etc/hosts` and does not consult NSS, so a machine that resolves names through sssd or mDNS resolves rule subjects differently from the rest of itself. | [released](https://github.com/xinbetween/flowlight-linux/releases/tag/v0.5.0) |
+| **0.5.1** | **Proof on other distributions** | The smoke test, inside privileged Debian, Fedora, Arch and openSUSE containers against the runner's own kernel. "It should work on Fedora" is a belief; a probe attached and a request read inside a Fedora userland is evidence. This is where the remaining surprises are, and it is deliberately before the packaging that would claim to support them. | |
+| **0.5.2** | **An `.rpm`** | Fedora, RHEL and its rebuilds, openSUSE. Built with `rpmbuild` in a container of the distribution it is for, rather than by writing the format out by hand: a `.deb` is an `ar` archive of three members and an `.rpm` is not, and the distribution's own tool is the thing that knows. Installed in that container too, because a package that unpacks is not a package that installs. | |
+| **0.5.3** | **Arch, and a tarball for everything else** | A `PKGBUILD` for the AUR, and a plain tarball with an install script for the distributions nobody has packaged: the same two binaries, the same unit file, the same refusal to start itself. | |
+| **0.5.4** | **What this machine can and cannot do** | `flowlightd check`: the kernel, whether BPF program loading is permitted, whether the cgroup hierarchy is unified (blocking needs cgroup v2, and `CGROUP_ROOT` is currently hard-coded to the unified path — a hybrid hierarchy puts it at `/sys/fs/cgroup/unified` and the attach fails), where `tracefs` is, what SELinux is doing, which TLS libraries were found, and what each missing thing costs. Written last because it is a report about everything above. | |
+
+Not a target: a distribution whose kernel forbids loading BPF programs. The answer there is to say so, which is
+what 0.5.4 is for.
 
 ## What this will not do
 

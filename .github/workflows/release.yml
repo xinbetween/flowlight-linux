@@ -33,12 +33,14 @@ jobs:
           - runner: ubuntu-24.04
             architecture: amd64
             target: x86_64-unknown-linux-musl
+            daemon: x86_64-unknown-linux-musl
             # The linker's own published binary, with its hash. It turns our code into the bytecode the
             # kernel's verifier judges, so a substitution here is a substitution in what the kernel runs.
             linker_sha256: e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8
           - runner: ubuntu-24.04-arm
             architecture: arm64
             target: aarch64-unknown-linux-musl
+            daemon: aarch64-unknown-linux-musl
             linker_sha256: 341ec1c595496877cae2b073544c2226d78a922739632b5732dbaa48507f1380
     runs-on: ${{ matrix.runner }}
     steps:
@@ -74,15 +76,31 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/bpf-linker" --version
 
+      # The daemon statically against musl and the window dynamically against the system's GTK. The daemon
+      # is the one people download onto a machine that is not this one, and a static binary is the difference
+      # between "any kernel of 4.18 or later" and "any distribution whose glibc is at least as new as the one
+      # that built it".
       - name: Build
-        run: cargo build --release --package flowlight-daemon --package flowlight-gui
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq musl-tools
+          rustup target add ${{ matrix.daemon }}
+          cargo build --release --target ${{ matrix.daemon }} --package flowlight-daemon
+          cargo build --release --package flowlight-gui
+          static=target/${{ matrix.daemon }}/release/flowlightd
+          if ldd "$static" 2>&1 | grep -q '=>'; then
+            echo "the daemon is dynamically linked after all:"; ldd "$static"; exit 1
+          fi
+          mkdir -p target/packaged
+          install -m 755 "$static" target/packaged/flowlightd
+          install -m 755 target/release/flowlight target/packaged/flowlight
 
       - name: Build the packages
         id: build
         run: |
           set -euo pipefail
           version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          ./packaging/deb/build.sh "$version" "${{ matrix.architecture }}"
+          ./packaging/deb/build.sh "$version" "${{ matrix.architecture }}" target/packaged
           ls -l target/deb
           echo "version=$version" >>"$GITHUB_OUTPUT"
 
