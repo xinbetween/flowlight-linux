@@ -215,6 +215,22 @@ enum Command {
     Ask(RuleArgs),
     /// Every rule, with the identifiers `forget` takes.
     Rules,
+    /// What a rule would change, without writing it.
+    ///
+    /// The answer is a claim about the past: every piece of traffic in the window is decided twice, once
+    /// with the rules as they are and once with this one added, and only the answers that move are
+    /// reported.
+    Simulate {
+        /// `allow`, `ask` or `block`.
+        #[arg(value_parser = ["allow", "ask", "block"])]
+        action: String,
+        /// What the rule would be about, as `block` takes it.
+        #[command(flatten)]
+        rule: RuleArgs,
+        /// How far back to judge it against: `30m`, `6h`, `2d`, or a number of seconds.
+        #[arg(long, value_name = "WINDOW", default_value = "24h")]
+        since: String,
+    },
     /// Remove a rule.
     Forget {
         /// The identifier, as `rules` prints it.

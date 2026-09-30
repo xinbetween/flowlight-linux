@@ -92,6 +92,23 @@ pub struct Domain {
     pub servers: Vec<String>,
 }
 
+/// One thing a candidate rule would change.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Change {
+    /// The host or address this is about.
+    pub subject: String,
+    /// The agent, if the traffic belonged to one.
+    pub agent: Option<String>,
+    /// The port, when the history recorded one.
+    pub port: Option<u16>,
+    /// What happens today.
+    pub before: String,
+    /// What would happen with the rule in place.
+    pub after: String,
+    /// How many times this traffic occurred.
+    pub occurrences: i64,
+}
+
 /// One rule.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Rule {
@@ -235,6 +252,24 @@ pub fn write_rule(action: &str, subject: &str, port: u16, agent: Option<&str>) -
     )
 }
 
+/// Builds the request that asks what a rule would change without writing it.
+pub fn simulate(
+    action: &str,
+    subject: &str,
+    port: u16,
+    agent: Option<&str>,
+    seconds: i64,
+) -> String {
+    let agent = agent.map_or_else(
+        || "null".to_owned(),
+        |agent| serde_json::to_string(agent).unwrap_or_else(|_| "null".to_owned()),
+    );
+    let subject = serde_json::to_string(subject).unwrap_or_else(|_| "\"\"".to_owned());
+    format!(
+        r#"{{"op":"simulate","action":"{action}","subject":{subject},"port":{port},"agent":{agent},"since":{seconds}}}"#
+    )
+}
+
 /// Builds the request that removes a rule.
 pub fn forget(id: i64) -> String {
     format!(r#"{{"op":"forget","id":{id}}}"#)
@@ -281,6 +316,18 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&forget(7)).unwrap();
         assert_eq!(parsed["op"], "forget");
         assert_eq!(parsed["id"], 7);
+    }
+
+    #[test]
+    fn asking_what_a_rule_would_change_is_not_asking_to_write_it() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(&simulate("block", "a.example", 443, Some("claude"), 3_600))
+                .unwrap();
+        assert_eq!(parsed["op"], "simulate");
+        assert_eq!(parsed["action"], "block");
+        assert_eq!(parsed["subject"], "a.example");
+        assert_eq!(parsed["agent"], "claude");
+        assert_eq!(parsed["since"], 3_600);
     }
 
     /// The three ways connecting fails are three different problems, and "connection refused" teaches none

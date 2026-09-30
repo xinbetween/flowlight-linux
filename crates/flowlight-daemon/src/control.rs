@@ -93,6 +93,22 @@ pub enum Request {
         #[serde(default)]
         note: Option<String>,
     },
+    /// What a rule would change, without writing it.
+    Simulate {
+        /// `allow`, `ask` or `block`.
+        action: String,
+        /// A host, a pattern, an address or `*`.
+        subject: String,
+        /// The port, or zero for any.
+        #[serde(default)]
+        port: u16,
+        /// One agent, or everyone.
+        #[serde(default)]
+        agent: Option<String>,
+        /// How far back to judge it against, in seconds.
+        #[serde(default = "a_day")]
+        since: i64,
+    },
     /// Remove a rule.
     Forget {
         /// Its identifier.
@@ -278,6 +294,20 @@ fn handle(line: &str, database: &Path, hello: &Hello) -> Result<String> {
             crate::views::window(now, since),
         )?)?,
         Request::Rules => serde_json::to_string(&crate::views::rules(&mut store)?)?,
+        Request::Simulate {
+            action,
+            subject,
+            port,
+            agent,
+            since,
+        } => serde_json::to_string(&crate::views::simulate(
+            &mut store,
+            &action,
+            &subject,
+            port,
+            agent.as_deref(),
+            crate::views::window(now, since),
+        )?)?,
         Request::Write {
             action,
             subject,
@@ -409,6 +439,50 @@ mod tests {
         let reply = answer(r#"{"op":"rules"}"#, &database, &hello());
         assert!(reply.contains("error"), "{reply}");
         assert!(!database.exists());
+    }
+
+    /// Asked before writing, which is what makes a rule something somebody will enable.
+    #[test]
+    fn a_rule_can_be_tried_before_it_is_written() {
+        let directory = std::env::temp_dir().join("flowlight-control-simulate");
+        let _ = std::fs::remove_dir_all(&directory);
+        let database = directory.join("flowlight.db");
+
+        // Some history to judge against.
+        {
+            let mut store = Store::open(&database).unwrap();
+            store
+                .record_request(flowlight_store::RequestRow {
+                    at: crate::views::now(),
+                    process: "node".to_owned(),
+                    confidence: "path".to_owned(),
+                    pid: 1,
+                    agent: Some("claude".to_owned()),
+                    direction: "out".to_owned(),
+                    protocol: None,
+                    method: Some("GET".to_owned()),
+                    target: Some("/".to_owned()),
+                    host: Some("telemetry.example".to_owned()),
+                    status: None,
+                    bytes: 10,
+                    truncated: false,
+                    unreadable: None,
+                })
+                .unwrap();
+            store.flush().unwrap();
+        }
+
+        let reply = answer(
+            r#"{"op":"simulate","action":"block","subject":"telemetry.example"}"#,
+            &database,
+            &hello(),
+        );
+        assert!(reply.contains(r#""after":"block""#), "{reply}");
+        assert!(reply.contains(r#""occurrences":1"#), "{reply}");
+
+        // And asking does not write it.
+        let mut store = Store::open(&database).unwrap();
+        assert!(store.rules().unwrap().is_empty());
     }
 
     /// The defaults matter: an interface that asks for "requests" without saying how far back should get

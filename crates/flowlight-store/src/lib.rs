@@ -130,6 +130,26 @@ pub struct ProcessRow {
     pub last_seen: i64,
 }
 
+/// Traffic that happened, grouped so that a rule can be tried against it.
+///
+/// Two sources, and they know different things. A stored request knows the host and not the port, because
+/// a probe on a TLS library never sees one. A stored connection knows the address and the port and not the
+/// host, because at `connect()` the name has already been resolved and thrown away. Both are real traffic
+/// and a rule has to be judged against both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrafficRow {
+    /// The agent that caused it, if any.
+    pub agent: Option<String>,
+    /// The host, for a row that came from a request.
+    pub host: Option<String>,
+    /// The address, for a row that came from a connection.
+    pub address: Option<String>,
+    /// The port, for a row that came from a connection.
+    pub port: Option<u16>,
+    /// How many times.
+    pub occurrences: i64,
+}
+
 /// A rule: what to do about something a process tries to reach.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleRow {
@@ -821,6 +841,34 @@ impl Store {
                 hosts: row.get(3)?,
                 bytes: row.get(4)?,
                 last_seen: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every distinct piece of traffic in a window, with how often it happened.
+    ///
+    /// Grouped in the database rather than replayed row by row: a day is thousands of rows and a handful of
+    /// distinct answers, and a simulation only needs the answers.
+    pub fn traffic_since(&mut self, since: i64) -> Result<Vec<TrafficRow>> {
+        self.flush()?;
+        let mut statement = self.connection.prepare(
+            "SELECT agent, host, NULL, NULL, count(*) FROM requests
+             WHERE at >= ?1 AND host IS NOT NULL AND host != ''
+             GROUP BY agent, host
+             UNION ALL
+             SELECT agent, NULL, destination, port, count(*) FROM connections
+             WHERE at >= ?1 AND destination IS NOT NULL
+             GROUP BY agent, destination, port
+             ORDER BY 5 DESC",
+        )?;
+        let rows = statement.query_map(params![since], |row| {
+            Ok(TrafficRow {
+                agent: row.get(0)?,
+                host: row.get(1)?,
+                address: row.get(2)?,
+                port: row.get(3)?,
+                occurrences: row.get(4)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1564,6 +1612,63 @@ mod tests {
         drop(store);
         let store = Store::open(&path).unwrap();
         assert_eq!(store.schema_version().unwrap(), Store::SCHEMA);
+    }
+
+    // Traffic, for trying a rule against
+
+    /// Two sources that know different things, both of which a rule has to be judged against.
+    #[test]
+    fn traffic_comes_from_both_what_was_read_and_what_was_connected_to() {
+        let mut store = Store::in_memory().unwrap();
+        let mut request = request(1_000, "node", "api.anthropic.com", 100);
+        request.agent = Some("claude".to_owned());
+        store.record_request(request.clone()).unwrap();
+        store.record_request(request).unwrap();
+        store
+            .record_connection(ConnectionRow {
+                at: 1_000,
+                process: "node".to_owned(),
+                confidence: "path".to_owned(),
+                pid: 1,
+                agent: Some("claude".to_owned()),
+                destination: Some("160.79.104.10".to_owned()),
+                port: 443,
+                blocked: false,
+            })
+            .unwrap();
+
+        let traffic = store.traffic_since(0).unwrap();
+        assert_eq!(traffic.len(), 2);
+
+        let by_request = traffic.iter().find(|row| row.host.is_some()).unwrap();
+        assert_eq!(by_request.host.as_deref(), Some("api.anthropic.com"));
+        assert_eq!(by_request.occurrences, 2);
+        // A request knows no port, and saying it did would let a rule claim changes it cannot make.
+        assert_eq!(by_request.port, None);
+
+        let by_connection = traffic.iter().find(|row| row.address.is_some()).unwrap();
+        assert_eq!(by_connection.address.as_deref(), Some("160.79.104.10"));
+        assert_eq!(by_connection.port, Some(443));
+        assert_eq!(by_connection.agent.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn traffic_outside_the_window_is_not_traffic() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .record_request(request(100, "curl", "example.com", 1))
+            .unwrap();
+        assert!(store.traffic_since(500).unwrap().is_empty());
+    }
+
+    /// A request with no host cannot be judged by name and would group into a row describing nothing.
+    #[test]
+    fn a_request_with_no_host_is_not_offered_as_traffic() {
+        let mut store = Store::in_memory().unwrap();
+        let mut row = request(1_000, "node", "", 1);
+        row.host = None;
+        store.record_request(row).unwrap();
+        assert!(store.traffic_since(0).unwrap().is_empty());
     }
 
     // Rules

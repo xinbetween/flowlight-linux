@@ -158,6 +158,20 @@ if curl -sS --max-time 8 "https://$blocked_address/" -o /dev/null 2>/dev/null; t
     # Scoped to one agent, which is the harder half: the kernel has to know, inside connect(), that the
     # process calling it is working for `claude`. Userspace marks the agent; the fork tracepoint marks
     # everything it starts, before the child can run.
+    # Asked before it is written, which is the path the window's button takes: it shows what the rule would
+    # have changed and only writes it if somebody says yes.
+    simulated=$(ask "{\"op\":\"simulate\",\"action\":\"block\",\"subject\":\"$target_host\",\"since\":600}")
+    echo "$simulated"
+    printf '%s' "$simulated" \
+        | jq -e '[.ok[] | select(.after == "block" and .before == "allow")] | length > 0' >/dev/null \
+        || fail "simulating a rule against traffic that happened reported no change."
+    echo "OK: a rule can be tried against real history before it is written"
+
+    # And asking must not have written it.
+    ask '{"op":"rules"}' | jq -e '.ok | length == 0' >/dev/null \
+        || fail "asking what a rule would change wrote the rule."
+    echo "OK: asking what a rule would change does not write it"
+
     # Written over the socket, which is the path the window's "Block for this agent" button takes. The
     # terminal's `block` subcommand writes the same row a different way, and is exercised below.
     echo "Blocking $blocked_address for the agent only, over the interface socket..."

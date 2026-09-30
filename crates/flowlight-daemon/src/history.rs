@@ -63,6 +63,64 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
         Command::Block(rule) => write_rule(&mut store, "block", rule)?,
         Command::Allow(rule) => write_rule(&mut store, "allow", rule)?,
         Command::Ask(rule) => write_rule(&mut store, "ask", rule)?,
+        Command::Simulate {
+            action,
+            rule,
+            since,
+        } => {
+            let window = parse_window(since)
+                .with_context(|| format!("reading `{since}` as a length of time"))?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs() as i64);
+            let changes = crate::views::simulate(
+                &mut store,
+                action,
+                &rule.subject,
+                rule.port,
+                rule.agent.as_deref(),
+                now - window,
+            )?;
+            if changes.is_empty() {
+                // The commonest answer, and the whole value of asking first.
+                eprintln!(
+                    "Nothing in the last {since} would have been decided differently. That is not \
+                     nothing: it means the rule is either already covered by one you have, or about \
+                     traffic this machine has not seen."
+                );
+                return Ok(());
+            }
+            let total: i64 = changes.iter().map(|change| change.occurrences).sum();
+            eprintln!(
+                "{total} request(s) or connection(s) in the last {since} would have been decided \
+                 differently:\n"
+            );
+            for change in changes {
+                if json {
+                    writeln!(out, "{}", line(&change))?;
+                } else {
+                    let who = change
+                        .agent
+                        .as_deref()
+                        .map_or_else(String::new, |agent| format!("  ({agent})"));
+                    let port = change
+                        .port
+                        .map_or_else(String::new, |port| format!(":{port}"));
+                    writeln!(
+                        out,
+                        "  {:>8} → {:<8} {:<44} {:>7}{who}",
+                        change.before,
+                        change.after,
+                        format!("{}{port}", change.subject),
+                        change.occurrences
+                    )?;
+                }
+            }
+            eprintln!(
+                "\nThis is a claim about the past, not a promise about the future. A host that was not \
+                 reached in this window does not appear here."
+            );
+        }
         Command::Forget { id } => {
             if store.forget_rule(*id)? {
                 eprintln!("Rule {id} is gone.");

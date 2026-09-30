@@ -467,10 +467,13 @@ fn render_agents(state: &Rc<State>, seconds: i64, column: &gtk::Box, rows: &[Age
     }
 }
 
-/// A button that writes one rule and forgets about it.
+/// A button that asks what a rule would do, and writes it only if somebody says so.
+///
+/// Asking first is the point. The macOS build learned it the long way: a rule nobody can preview is a rule
+/// nobody enables, and the commonest answer — "this would change nothing" — is the most useful one.
 fn block_button(
     state: &Rc<State>,
-    _seconds: i64,
+    seconds: i64,
     tooltip: &str,
     host: &str,
     agent: Option<&str>,
@@ -486,19 +489,67 @@ fn block_button(
         .build();
     button.add_css_class("flat");
 
-    let socket = state.socket.clone();
-    let request = protocol::write_rule("block", host, 0, agent);
     let state = Rc::clone(state);
+    let host = host.to_owned();
+    let agent = agent.map(str::to_owned);
+    let heading = tooltip.to_owned();
     button.connect_clicked(move |button| {
-        button.set_sensitive(false);
-        let socket = socket.clone();
-        let request = request.clone();
         let state = Rc::clone(&state);
+        let host = host.clone();
+        let agent = agent.clone();
+        let heading = heading.clone();
+        let root = button.root().and_downcast::<gtk::Window>();
         glib::spawn_future_local(async move {
-            let _: Result<String, String> = fetch(socket, request).await;
+            let changes: Result<Vec<protocol::Change>, String> = fetch(
+                state.socket.clone(),
+                protocol::simulate("block", &host, 0, agent.as_deref(), seconds),
+            )
+            .await;
+            let body = match &changes {
+                Ok(changes) if changes.is_empty() => format!(
+                    "Nothing in this window would have been decided differently. Either a rule you \
+                     already have covers {host}, or this machine has not reached it."
+                ),
+                Ok(changes) => {
+                    let total: i64 = changes.iter().map(|change| change.occurrences).sum();
+                    let mut lines = format!(
+                        "{total} request(s) or connection(s) in this window would have been refused:\n"
+                    );
+                    for change in changes.iter().take(8) {
+                        lines.push_str(&format!("\n  {}  ×{}", change.subject, change.occurrences));
+                    }
+                    if changes.len() > 8 {
+                        lines.push_str(&format!("\n  … and {} more", changes.len() - 8));
+                    }
+                    lines.push_str(
+                        "\n\nThis is a claim about the past, not a promise about the future.",
+                    );
+                    lines
+                }
+                Err(err) => format!("What this would change could not be worked out: {err}"),
+            };
+
+            let dialog = adw::AlertDialog::builder()
+                .heading(&heading)
+                .body(&body)
+                .build();
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("block", "Block");
+            dialog.set_response_appearance("block", adw::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+
+            let answer = dialog.choose_future(root.as_ref()).await;
+            if answer != "block" {
+                return;
+            }
+            let _: Result<String, String> = fetch(
+                state.socket.clone(),
+                protocol::write_rule("block", &host, 0, agent.as_deref()),
+            )
+            .await;
             // Whatever happened, what is on screen no longer reflects the rules.
-            *state.drawn.borrow_mut() =
-                [String::new(), String::new(), String::new(), String::new()];
+            *state.drawn.borrow_mut() = [String::new(), String::new(), String::new(), String::new()];
         });
     });
     button
