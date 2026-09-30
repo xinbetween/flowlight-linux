@@ -123,10 +123,50 @@ jobs:
           test -x /usr/bin/flowlight
           echo "both packages install, and nothing started itself"
 
+      # The daemon's `.rpm`, built in a container of a distribution that has an `rpmbuild`. Only the daemon:
+      # the window is linked against the system's GTK and the system's glibc, so one built here does not run
+      # on a distribution whose glibc is older, and shipping it anyway would be shipping a package that
+      # installs and does not start.
+      - name: Build the rpm
+        run: |
+          set -euo pipefail
+          version=${{ steps.build.outputs.version }}
+          case "${{ matrix.architecture }}" in
+              amd64) rpm_architecture=x86_64 ;;
+              arm64) rpm_architecture=aarch64 ;;
+              *) echo "no rpm architecture for ${{ matrix.architecture }}"; exit 1 ;;
+          esac
+          docker run --rm -v "$PWD:/work" -w /work "fedora:41" bash -c "
+            set -euo pipefail
+            dnf install -y -q rpm-build >/dev/null
+            ./packaging/rpm/build.sh '$version' '$rpm_architecture' target/packaged target/rpm"
+          sudo chown -R "$(id -u):$(id -g)" target/rpm
+          ls -l target/rpm
+
+      - name: Check the rpm installs where it is for
+        run: |
+          set -euo pipefail
+          package=$(ls target/rpm/flowlight-*.rpm | head -1)
+          # On both, because one `.rpm` that installs on Fedora is not one that installs on openSUSE until
+          # it has. Only where the runner's architecture matches the package's.
+          for image in fedora:41 opensuse/leap:15.6; do
+            docker run --rm -v "$PWD:/work" -w /work "$image" ./scripts/install-an-rpm.sh "$package"
+          done
+
+      # Into one flat directory before uploading. Two globs under different parents make an artifact that
+      # keeps those parents, and the job that attaches them would then be looking in the wrong place — which
+      # is a thing to notice here rather than on a release page with half its files.
+      - name: Gather what will be attached
+        run: |
+          set -euo pipefail
+          mkdir -p target/assets
+          install -m 644 target/deb/*.deb target/rpm/*.rpm target/assets/
+          ls -l target/assets
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: packages-${{ matrix.architecture }}
-          path: target/deb/*.deb
+          path: target/assets/*
           if-no-files-found: error
 
   attach:
@@ -151,5 +191,5 @@ jobs:
           ls -l packages
           # `--clobber` so that re-running this for a tag replaces what is there rather than failing, which is
           # what somebody wants when a release had to be built twice.
-          gh release upload "$TAG" packages/*.deb --clobber --repo "$GITHUB_REPOSITORY"
+          gh release upload "$TAG" packages/*.deb packages/*.rpm --clobber --repo "$GITHUB_REPOSITORY"
           echo "attached to $TAG"

@@ -39,9 +39,18 @@ Needs root, because loading an eBPF program does — there is no version of this
 4.18 or later, and nothing else: **the daemon is linked statically, so it has no libc requirement at all** and
 the eBPF programs are compiled into it rather than built against the running kernel.
 
-Tested on Ubuntu 24.04, which is where CI runs it against a real kernel. The packaging is Debian and Ubuntu so
-far; an `.rpm`, an Arch package, a tarball, and the same tests run inside other distributions' userlands are the
-[0.5 milestone](ROADMAP.md).
+Every push runs it against a real kernel on Ubuntu 24.04, and then inside **Debian 12, Fedora 41, Arch and
+openSUSE Leap 15.6** — where it has to find that distribution's own OpenSSL, wherever it keeps it, and read a
+request made by that distribution's own `curl`.
+
+```sh
+# Fedora, RHEL and its rebuilds, openSUSE: the daemon, from the release page.
+sudo rpm -i flowlight-0.5.2-1.x86_64.rpm
+```
+
+The `.rpm` carries the daemon alone. The window links against the system's GTK *and* the system's glibc, so one
+built anywhere does not run everywhere — building it inside each distribution is on the
+[roadmap](ROADMAP.md) rather than pretended at here. Arch and a plain tarball are the next items.
 
 One thing the static link costs, said here rather than discovered: a hostname in a rule is resolved by musl's
 resolver, which reads DNS and `/etc/hosts` and does not consult NSS. On a machine that resolves names through
