@@ -1,0 +1,124 @@
+# Builds the packages for a tag and attaches them to its release.
+#
+# Separate from CI because it does something CI must not: it publishes. CI proves a change works; this hands
+# somebody a file they will install as root, which is a different act and deserves its own workflow with its own
+# permissions.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The tag to build and attach to
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  BPF_LINKER_VERSION: v0.11.1
+  BPF_LINKER_SHA256: 5cfcd0ba5f1cd9d44fc6bbeb5e1a19c22b0e97ff0f6b1e0d4ad0bd5e9f2ae56f
+
+jobs:
+  packages:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Pinned runners rather than `-latest`, for the same reason CI pins: a toolchain change arriving on
+          # somebody else's schedule is what this project cannot absorb quietly.
+          - runner: ubuntu-24.04
+            architecture: amd64
+          - runner: ubuntu-24.04-arm
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install the interface's libraries
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev
+
+      - name: Install the toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup toolchain install nightly --profile minimal --component rust-src
+
+      - name: Install bpf-linker
+        run: |
+          set -euo pipefail
+          # From source on this one: the prebuilt binary is published for x86_64 only, and this also runs on
+          # arm64. It costs minutes rather than seconds, which a release can afford and CI cannot.
+          cargo install bpf-linker --version 0.11.1 --locked
+
+      - name: Build
+        run: cargo build --release --package flowlight-daemon --package flowlight-gui
+
+      - name: Build the packages
+        id: build
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          ./packaging/deb/build.sh "$version" "${{ matrix.architecture }}"
+          ls -l target/deb
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+      # Installed on the machine that built it, because a package that unpacks is not a package that installs.
+      - name: Install what was built
+        run: |
+          set -euo pipefail
+          version=${{ steps.build.outputs.version }}
+          sudo apt-get install -y -qq "./target/deb/flowlight_${version}_${{ matrix.architecture }}.deb"
+          test -x /usr/sbin/flowlightd
+          /usr/sbin/flowlightd --version
+          # Shipped disabled, and that is the whole point of shipping it disabled.
+          if systemctl is-enabled flowlightd >/dev/null 2>&1; then
+            echo "the unit is enabled; it must not be"; exit 1
+          fi
+          if systemctl is-active flowlightd >/dev/null 2>&1; then
+            echo "the daemon is running; it must not be"; exit 1
+          fi
+          sudo apt-get install -y -qq "./target/deb/flowlight-gui_${version}_${{ matrix.architecture }}.deb"
+          test -x /usr/bin/flowlight
+          echo "both packages install, and nothing started itself"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: packages-${{ matrix.architecture }}
+          path: target/deb/*.deb
+          if-no-files-found: error
+
+  attach:
+    needs: packages
+    runs-on: ubuntu-24.04
+    permissions:
+      # The one job that writes anything, and it writes only to the release for this tag.
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: packages
+
+      - name: Attach them to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          ls -l packages
+          # `--clobber` so that re-running this for a tag replaces what is there rather than failing, which is
+          # what somebody wants when a release had to be built twice.
+          gh release upload "$TAG" packages/*.deb --clobber --repo "$GITHUB_REPOSITORY"
+          echo "attached to $TAG"

@@ -64,7 +64,7 @@ directory.
 
 | | | | |
 | --- | --- | --- | --- |
-| **0.3.0** | **A `.deb`** | `flowlightd` and a systemd unit, `amd64` and `arm64`, attached to each release. The unit ships **disabled**: a tool that reads every HTTPS request on a machine must not start doing it because somebody installed it. Two packages, not one — `flowlight` for the daemon, `flowlight-gui` for the window — because a server has no reason to pull in GTK 4 and libadwaita, and the window needs libadwaita 1.5 (Ubuntu 24.04 and later) while the daemon needs only a kernel of 4.18. | |
+| **0.3.0** | **A `.deb`** | `flowlightd` and a systemd unit, `amd64` and `arm64`, attached to each release. The unit ships **disabled**: a tool that reads every HTTPS request on a machine must not start doing it because somebody installed it. Two packages, not one — `flowlight` for the daemon, `flowlight-gui` for the window — because a server has no reason to pull in GTK 4 and libadwaita, and the window needs libadwaita 1.5 (Ubuntu 24.04 and later) while the daemon needs only a kernel of 4.18. | [released as v0.4.5](https://github.com/xinbetween/flowlight-linux/releases/tag/v0.4.5) |
 | **0.3.1** | **An apt repository** | A signed archive so `apt-get update` finds new versions: an `InRelease` signed with a key published beside it, served as static files. Adding a third-party repository is a decision to trust whoever holds that key for as long as it is in your sources, which is a larger thing to ask than downloading one file — so the `.deb` comes first and stays a first-class way to install. | |
 
 Neither is parity with anything; the macOS build ships a signed `.dmg` and a notarised app, which is the same

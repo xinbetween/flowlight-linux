@@ -1,0 +1,22 @@
+#!/bin/sh
+# Registers the unit and says what to do next. Deliberately does not start anything.
+set -e
+
+if [ "$1" = configure ]; then
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    cat <<'SAID'
+
+Flowlight is installed and is not running.
+
+That is on purpose: it reads every HTTPS request on this machine, and starting
+that because somebody installed a package would be the wrong way round.
+
+  sudo flowlightd                     watch, in this terminal
+  sudo systemctl enable --now flowlightd   watch from now on
+  flowlightd budget                   what it is allowed to read, and for how long
+  flowlight                           the window, run as yourself and not as root
+
+SAID
+fi

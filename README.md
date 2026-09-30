@@ -38,10 +38,27 @@ Termination becomes a second, narrower mode that states what it costs.
 Tested on Ubuntu 24.04. Needs root, because loading an eBPF program does — there is no version of this that
 does not.
 
-There is no `.deb` yet, so this is the way in: clone it and build it. A package and an apt repository are
-[0.3 on the roadmap](ROADMAP.md) — worth saying that nothing has to be compiled on the machine that *runs*
-Flowlight even now, because the eBPF programs are compiled into the binary rather than built against the
-running kernel. The nightly toolchain below is a build-time requirement, not a runtime one.
+The quickest way in is the package from the [latest release](https://github.com/xinbetween/flowlight-linux/releases/latest):
+
+```sh
+# The daemon. amd64 or arm64.
+sudo apt-get install ./flowlight_0.4.5_amd64.deb
+
+# And the window, if this machine has a desktop. Needs Ubuntu 24.04 or later for libadwaita 1.5.
+sudo apt-get install ./flowlight-gui_0.4.5_amd64.deb
+```
+
+**It installs and does not start.** A tool that reads every HTTPS request on a machine should not begin doing
+that because somebody installed a package, so the systemd unit ships disabled and `apt` says as much. When you
+want it: `sudo systemctl enable --now flowlightd`.
+
+Nothing is compiled on the machine that runs it — the eBPF programs are compiled *into* the binary by
+`aya-build` rather than built against the running kernel, so there are no kernel headers to match, no DKMS, and
+nothing to rebuild when the kernel is upgraded. Removing the package leaves the database alone; `purge` removes
+it and says so.
+
+Building from source is the other way, and the nightly toolchain below is a build-time requirement rather than a
+runtime one:
 
 ```sh
 sudo apt-get install -y build-essential curl jq zstd git libgtk-4-dev libadwaita-1-dev

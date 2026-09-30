@@ -1,0 +1,30 @@
+# Flowlight's daemon, shipped disabled.
+#
+# A tool that reads every HTTPS request on a machine must not start doing it because somebody installed it, so
+# nothing here is enabled by the package. `systemctl enable --now flowlightd` is a decision somebody makes.
+[Unit]
+Description=Flowlight: what every process on this machine says on the network
+Documentation=https://github.com/xinbetween/flowlight-linux
+After=network.target
+
+[Service]
+Type=simple
+# Root, because loading an eBPF program needs it. There is no version of this that does not.
+ExecStart=/usr/sbin/flowlightd
+Restart=on-failure
+RestartSec=5
+
+# The database and the interception keys live here, and it is root's alone.
+StateDirectory=flowlight
+StateDirectoryMode=0700
+# The certificate anything must trust is published here instead, because an agent runs as a person.
+ConfigurationDirectory=flowlight
+
+# It needs to load programs, read /proc and attach to a cgroup. It does not need anything else.
+NoNewPrivileges=false
+ProtectHome=read-only
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
