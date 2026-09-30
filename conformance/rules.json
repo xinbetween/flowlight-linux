@@ -1,0 +1,810 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "nothing is refused unless a rule says so",
+      "why": "The default is allow. A tool that watches a machine must not start refusing things because it was installed.",
+      "rules": [],
+      "facts": {
+        "host": "example.com",
+        "address": null,
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "allow",
+        "rule": null
+      }
+    },
+    {
+      "name": "a rule naming a host decides about that host",
+      "why": "The simplest case there is, and the one everybody tries first.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "example.com",
+          "port": 0,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": "example.com",
+        "address": null,
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "block",
+        "rule": 1
+      }
+    },
+    {
+      "name": "a rule naming a host decides about nothing else",
+      "why": "A rule is about what it names, and nothing near it.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "example.com",
+          "port": 0,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": "other.example",
+        "address": null,
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "allow",
+        "rule": null
+      }
+    },
+    {
+      "name": "a host is matched without regard to case",
+      "why": "A name is a name however it was typed.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "Example.COM",
+          "port": 0,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": "example.com",
+        "address": null,
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "block",
+        "rule": 1
+      }
+    },
+    {
+      "name": "a trailing dot is the same host",
+      "why": "A fully qualified name ends in a dot, and a resolver may hand one over that way.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "example.com",
+          "port": 0,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": "example.com.",
+        "address": null,
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "block",
+        "rule": 1
+      }
+    },
+    {
+      "name": "a subdomain pattern covers a subdomain",
+      "why": "What the pattern is for.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "*.example.com",
+          "port": 0,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": "api.example.com",
+        "address": null,
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "block",
+        "rule": 1
+      }
+    },
+    {
+      "name": "a subdomain pattern covers a deeper subdomain",
+      "why": "One label or five, it is still under the domain.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "*.example.com",
+          "port": 0,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": "a.b.example.com",
+        "address": null,
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "block",
+        "rule": 1
+      }
+    },
+    {
+      "name": "a subdomain pattern does not cover the apex",
+      "why": "A choice, and the predictable one: if it did, `block *.example.com` and `allow example.com` would be a contradiction nobody wrote.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "*.example.com",
+          "port": 0,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": "example.com",
+        "address": null,
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "allow",
+        "rule": null
+      }
+    },
+    {
+      "name": "a subdomain pattern does not cover a name that merely ends the same way",
+      "why": "`notexample.com` is not under `example.com`, and a suffix comparison that forgot the dot would say it was.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "*.example.com",
+          "port": 0,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": "notexample.com",
+        "address": null,
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "allow",
+        "rule": null
+      }
+    },
+    {
+      "name": "anything covers everything",
+      "why": "`*` is how somebody says deny by default, and it has to reach everything or it is not that.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "*",
+          "port": 0,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": "example.com",
+        "address": null,
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "block",
+        "rule": 1
+      }
+    },
+    {
+      "name": "a named host beats anything",
+      "why": "Precedence by subject: the more specific rule decides, whichever way it points.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "*",
+          "port": 0,
+          "scope": "everyone"
+        },
+        {
+          "id": 2,
+          "action": "allow",
+          "subject": "example.com",
+          "port": 0,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": "example.com",
+        "address": null,
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "allow",
+        "rule": 2
+      }
+    },
+    {
+      "name": "a named host beats a subdomain pattern",
+      "why": "Still precedence by subject, one step down.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "*.example.com",
+          "port": 0,
+          "scope": "everyone"
+        },
+        {
+          "id": 2,
+          "action": "allow",
+          "subject": "api.example.com",
+          "port": 0,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": "api.example.com",
+        "address": null,
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "allow",
+        "rule": 2
+      }
+    },
+    {
+      "name": "a rule naming a port beats one that does not",
+      "why": "Precedence by port, once the subjects are equally specific.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "example.com",
+          "port": 0,
+          "scope": "everyone"
+        },
+        {
+          "id": 2,
+          "action": "allow",
+          "subject": "example.com",
+          "port": 443,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": "example.com",
+        "address": null,
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "allow",
+        "rule": 2
+      }
+    },
+    {
+      "name": "a rule naming a port does not apply to another port",
+      "why": "It names a port, so it is about that port. A rule that applied to every port would be a rule nobody could narrow.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "example.com",
+          "port": 8443,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": "example.com",
+        "address": null,
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "allow",
+        "rule": null
+      }
+    },
+    {
+      "name": "a rule naming a port does not apply where there is no port to compare",
+      "why": "A stored request records the host and not the port, because a probe on a TLS library never sees one. Judging a port rule against it would be inventing the comparison.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "example.com",
+          "port": 443,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": "example.com",
+        "address": null,
+        "port": null,
+        "agent": null
+      },
+      "expect": {
+        "action": "allow",
+        "rule": null
+      }
+    },
+    {
+      "name": "a rule naming no port applies where there is no port",
+      "why": "The other half of the one above.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "example.com",
+          "port": 0,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": "example.com",
+        "address": null,
+        "port": null,
+        "agent": null
+      },
+      "expect": {
+        "action": "block",
+        "rule": 1
+      }
+    },
+    {
+      "name": "a rule scoped to an agent applies to that agent",
+      "why": "Scope is who is asking.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "example.com",
+          "port": 0,
+          "scope": "agent:claude"
+        }
+      ],
+      "facts": {
+        "host": "example.com",
+        "address": null,
+        "port": 443,
+        "agent": "claude"
+      },
+      "expect": {
+        "action": "block",
+        "rule": 1
+      }
+    },
+    {
+      "name": "a rule scoped to an agent does not apply to another agent",
+      "why": "Scope is who is asking.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "example.com",
+          "port": 0,
+          "scope": "agent:claude"
+        }
+      ],
+      "facts": {
+        "host": "example.com",
+        "address": null,
+        "port": 443,
+        "agent": "cursor"
+      },
+      "expect": {
+        "action": "allow",
+        "rule": null
+      }
+    },
+    {
+      "name": "a rule scoped to an agent does not apply to traffic belonging to no agent",
+      "why": "Scope is who is asking, and nobody is not somebody.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "example.com",
+          "port": 0,
+          "scope": "agent:claude"
+        }
+      ],
+      "facts": {
+        "host": "example.com",
+        "address": null,
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "allow",
+        "rule": null
+      }
+    },
+    {
+      "name": "a rule scoped to an agent beats one scoped to everyone",
+      "why": "Precedence by scope, once subject and port are equal. A statement about who is asking is more specific than a statement about everybody.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "example.com",
+          "port": 0,
+          "scope": "everyone"
+        },
+        {
+          "id": 2,
+          "action": "allow",
+          "subject": "example.com",
+          "port": 0,
+          "scope": "agent:claude"
+        }
+      ],
+      "facts": {
+        "host": "example.com",
+        "address": null,
+        "port": 443,
+        "agent": "claude"
+      },
+      "expect": {
+        "action": "allow",
+        "rule": 2
+      }
+    },
+    {
+      "name": "subject beats scope",
+      "why": "The ordering is subject, then port, then scope — not the other way round. A rule about a host is a statement about what is being reached, which is stronger than one about who is reaching it.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "api.example.com",
+          "port": 0,
+          "scope": "everyone"
+        },
+        {
+          "id": 2,
+          "action": "allow",
+          "subject": "*.example.com",
+          "port": 0,
+          "scope": "agent:claude"
+        }
+      ],
+      "facts": {
+        "host": "api.example.com",
+        "address": null,
+        "port": 443,
+        "agent": "claude"
+      },
+      "expect": {
+        "action": "block",
+        "rule": 1
+      }
+    },
+    {
+      "name": "port beats scope",
+      "why": "The middle of the same ordering.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "example.com",
+          "port": 443,
+          "scope": "everyone"
+        },
+        {
+          "id": 2,
+          "action": "allow",
+          "subject": "example.com",
+          "port": 0,
+          "scope": "agent:claude"
+        }
+      ],
+      "facts": {
+        "host": "example.com",
+        "address": null,
+        "port": 443,
+        "agent": "claude"
+      },
+      "expect": {
+        "action": "block",
+        "rule": 1
+      }
+    },
+    {
+      "name": "the stricter action wins a tie",
+      "why": "Two rules of equal specificity disagreeing is a contradiction nobody wrote, and it is resolved conservatively rather than by which was typed first.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "allow",
+          "subject": "example.com",
+          "port": 0,
+          "scope": "everyone"
+        },
+        {
+          "id": 2,
+          "action": "block",
+          "subject": "example.com",
+          "port": 0,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": "example.com",
+        "address": null,
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "block",
+        "rule": 2
+      }
+    },
+    {
+      "name": "ask beats allow in a tie",
+      "why": "The same ordering: allow, then ask, then block.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "allow",
+          "subject": "example.com",
+          "port": 0,
+          "scope": "everyone"
+        },
+        {
+          "id": 2,
+          "action": "ask",
+          "subject": "example.com",
+          "port": 0,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": "example.com",
+        "address": null,
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "ask",
+        "rule": 2
+      }
+    },
+    {
+      "name": "an allow of equal specificity to a block is still a tie the block wins",
+      "why": "An exception has to be more specific than what it is an exception to. This is the case people expect to work and it does not, so it is written down.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "*.example.com",
+          "port": 0,
+          "scope": "everyone"
+        },
+        {
+          "id": 2,
+          "action": "allow",
+          "subject": "*.example.com",
+          "port": 0,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": "api.example.com",
+        "address": null,
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "block",
+        "rule": 1
+      }
+    },
+    {
+      "name": "a literal address is decided about as itself",
+      "why": "At connect() the kernel has an address and no name, so a rule about an address is the only kind that can be enforced there.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "1.2.3.4",
+          "port": 0,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": null,
+        "address": "1.2.3.4",
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "block",
+        "rule": 1
+      }
+    },
+    {
+      "name": "a rule about a host does not decide about an address",
+      "why": "A host is a set of addresses that was true when it was looked up. Deciding about an address because a rule named a host would be claiming a resolution nobody performed.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "example.com",
+          "port": 0,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": null,
+        "address": "1.2.3.4",
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "allow",
+        "rule": null
+      }
+    },
+    {
+      "name": "anything covers an address too",
+      "why": "`*` means anything, and an address is something.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "*",
+          "port": 0,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": null,
+        "address": "1.2.3.4",
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "block",
+        "rule": 1
+      }
+    },
+    {
+      "name": "an IPv6 address is decided about as itself",
+      "why": "Two families, one rule model.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "2001:db8::1",
+          "port": 0,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": null,
+        "address": "2001:db8::1",
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "block",
+        "rule": 1
+      }
+    },
+    {
+      "name": "ask is a decision and not an absence",
+      "why": "Ask refuses and records the question. It is not allow, and an implementation that treated it as one would be silently permitting what somebody asked to be asked about.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "ask",
+          "subject": "example.com",
+          "port": 0,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": "example.com",
+        "address": null,
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "ask",
+        "rule": 1
+      }
+    },
+    {
+      "name": "an exception for one agent survives a block on everyone",
+      "why": "The whole point of scope, and the case an implementation gets wrong by stopping at the first match instead of the most specific one.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "*",
+          "port": 0,
+          "scope": "everyone"
+        },
+        {
+          "id": 2,
+          "action": "allow",
+          "subject": "*",
+          "port": 0,
+          "scope": "agent:claude"
+        }
+      ],
+      "facts": {
+        "host": "example.com",
+        "address": null,
+        "port": 443,
+        "agent": "claude"
+      },
+      "expect": {
+        "action": "allow",
+        "rule": 2
+      }
+    },
+    {
+      "name": "an exception for one port survives a block on every port",
+      "why": "The same shape, one level up the ordering.",
+      "rules": [
+        {
+          "id": 1,
+          "action": "block",
+          "subject": "example.com",
+          "port": 0,
+          "scope": "everyone"
+        },
+        {
+          "id": 2,
+          "action": "allow",
+          "subject": "example.com",
+          "port": 443,
+          "scope": "everyone"
+        }
+      ],
+      "facts": {
+        "host": "example.com",
+        "address": null,
+        "port": 443,
+        "agent": null
+      },
+      "expect": {
+        "action": "allow",
+        "rule": 2
+      }
+    }
+  ]
+}
