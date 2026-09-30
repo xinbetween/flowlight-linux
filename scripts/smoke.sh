@@ -419,7 +419,11 @@ ask '{"op":"set-export","off":true}' | jq -e '.ok.enabled == false' >/dev/null \
 if sudo "$binary" --database "$database" query "what happened today?" 2>/dev/null; then
     fail "a question was answered with no model configured."
 fi
-sudo "$binary" --database "$database" query "what happened?" 2>&1 | grep -q "no model" \
+# Captured rather than piped: `pipefail` is on, the command is supposed to fail, and a pipeline that
+# reports the failure of the thing it is asserting about tells you nothing.
+refusal=$(sudo "$binary" --database "$database" query "what happened?" 2>&1 || true)
+printf '%s\n' "$refusal"
+printf '%s' "$refusal" | grep -q "no model" \
     || fail "asking with no model configured did not say that there is no model."
 echo "OK: there is no model until somebody configures one"
 
