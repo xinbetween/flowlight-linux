@@ -31,8 +31,10 @@
 //! daemon around it cannot be compiled on. The same reason [`flowlight_common`] is a crate of its own.
 
 pub mod budget;
+pub mod export;
 
 pub use budget::{Budget, Paths};
+pub use export::Export;
 
 use anyhow::{Context as _, Result};
 use rusqlite::{Connection, OptionalExtension as _, params};
@@ -403,7 +405,7 @@ impl Store {
     }
 
     /// The schema this version of the code expects.
-    pub const SCHEMA: i64 = 6;
+    pub const SCHEMA: i64 = 7;
 
     /// Creates the schema, or brings an older one up to it.
     ///
@@ -458,6 +460,10 @@ impl Store {
                 requests INTEGER NOT NULL,
                 bytes    INTEGER NOT NULL,
                 PRIMARY KEY (day, process, host)
+            );
+            CREATE TABLE IF NOT EXISTS export (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS budget (
                 key   TEXT PRIMARY KEY,
@@ -1009,6 +1015,53 @@ impl Store {
             params![since],
             |row| row.get(0),
         )?)
+    }
+
+    /// Where what was seen is sent, and what somebody agreed to.
+    pub fn export(&self) -> Result<Export> {
+        export::read(&self.connection)
+    }
+
+    /// Writes the export configuration.
+    pub fn set_export(&mut self, export: &Export) -> Result<()> {
+        export::write(&self.connection, export)
+    }
+
+    /// Requests not yet sent, oldest first, with their identifiers.
+    ///
+    /// By identifier rather than by time, because time is not a watermark: two records can share a second,
+    /// and a batch that resumed from a timestamp would send one of them twice or neither.
+    pub fn requests_after(&mut self, id: i64, limit: usize) -> Result<Vec<(i64, RequestRow)>> {
+        self.flush()?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, at, process, confidence, pid, direction, protocol, method, target, host,
+                    status, bytes, truncated, unreadable, agent, rpc_method, rpc_tool
+             FROM requests WHERE id > ?1 ORDER BY id LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![id, limit as i64], |row| {
+            Ok((
+                row.get(0)?,
+                RequestRow {
+                    at: row.get(1)?,
+                    process: row.get(2)?,
+                    confidence: row.get(3)?,
+                    pid: row.get(4)?,
+                    direction: row.get(5)?,
+                    protocol: row.get(6)?,
+                    method: row.get(7)?,
+                    target: row.get(8)?,
+                    host: row.get(9)?,
+                    status: row.get(10)?,
+                    bytes: row.get(11)?,
+                    truncated: row.get(12)?,
+                    unreadable: row.get(13)?,
+                    agent: row.get(14)?,
+                    rpc_method: row.get(15)?,
+                    rpc_tool: row.get(16)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Which MCP tools an agent has called, and how often.
@@ -1707,6 +1760,57 @@ mod tests {
         drop(store);
         let store = Store::open(&path).unwrap();
         assert_eq!(store.schema_version().unwrap(), Store::SCHEMA);
+    }
+
+    // Export
+
+    #[test]
+    fn an_export_that_was_never_configured_is_off_with_the_default_fields() {
+        let store = Store::in_memory().unwrap();
+        let export = store.export().unwrap();
+        assert!(!export.enabled);
+        assert_eq!(export.destination, None);
+        assert_eq!(export.fields.len(), crate::export::DEFAULT_FIELDS.len());
+        assert!(!export.may_send());
+    }
+
+    #[test]
+    fn an_export_written_is_an_export_read_back() {
+        let mut store = Store::in_memory().unwrap();
+        let mut wanted = Export::fresh();
+        wanted.enabled = true;
+        wanted.destination = Some("/var/log/flowlight.jsonl".to_owned());
+        wanted.fields.insert(crate::export::Field::Target);
+        wanted
+            .headers
+            .insert("authorization".to_owned(), "Bearer x".to_owned());
+        wanted.consented = Some(wanted.fingerprint());
+        wanted.sent_through = 42;
+
+        store.set_export(&wanted).unwrap();
+        let read = store.export().unwrap();
+        assert_eq!(read, wanted);
+        assert!(read.may_send());
+    }
+
+    /// By identifier rather than by time: two records can share a second, and a batch resumed from a
+    /// timestamp would send one of them twice or neither.
+    #[test]
+    fn what_has_not_been_sent_is_found_by_identifier() {
+        let mut store = Store::in_memory().unwrap();
+        for _ in 0..3 {
+            store
+                .record_request(request(1_000, "curl", "example.com", 10))
+                .unwrap();
+        }
+        let all = store.requests_after(0, 10).unwrap();
+        assert_eq!(all.len(), 3);
+        // Identifiers ascend, so a watermark works.
+        assert!(all[0].0 < all[1].0 && all[1].0 < all[2].0);
+
+        let rest = store.requests_after(all[0].0, 10).unwrap();
+        assert_eq!(rest.len(), 2);
+        assert!(store.requests_after(all[2].0, 10).unwrap().is_empty());
     }
 
     // The budget

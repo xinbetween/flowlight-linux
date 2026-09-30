@@ -25,7 +25,7 @@ const REFRESH_SECONDS: u32 = 2;
 const RECENT: usize = 300;
 
 /// How many pages the switcher has.
-const PAGES: usize = 5;
+const PAGES: usize = 6;
 
 /// The windows the picker offers, and what each means in seconds.
 const WINDOWS: &[(&str, i64)] = &[
@@ -59,6 +59,19 @@ fn socket_from_arguments() -> PathBuf {
     PathBuf::from(protocol::DEFAULT_SOCKET)
 }
 
+/// The six columns the switcher holds, one per page.
+///
+/// A struct rather than six arguments: the refresh function took eight and was about to take ten, and a
+/// parameter list that long is one where two of them get swapped.
+struct Pages {
+    live: gtk::Box,
+    agents: gtk::Box,
+    rules: gtk::Box,
+    coverage: gtk::Box,
+    budget: gtk::Box,
+    export: gtk::Box,
+}
+
 /// What the window is currently looking at.
 struct State {
     socket: PathBuf,
@@ -78,11 +91,14 @@ fn build(application: &adw::Application, socket: PathBuf) {
     let window_seconds = Rc::new(RefCell::new(state.window));
 
     let stack = adw::ViewStack::new();
-    let live = page(&stack, "live", "Live", "network-transmit-receive-symbolic");
-    let agents = page(&stack, "agents", "Agents", "system-users-symbolic");
-    let rules = page(&stack, "rules", "Rules", "security-high-symbolic");
-    let coverage = page(&stack, "coverage", "Coverage", "dialog-question-symbolic");
-    let budget = page(&stack, "budget", "Budget", "emblem-important-symbolic");
+    let pages = Pages {
+        live: page(&stack, "live", "Live", "network-transmit-receive-symbolic"),
+        agents: page(&stack, "agents", "Agents", "system-users-symbolic"),
+        rules: page(&stack, "rules", "Rules", "security-high-symbolic"),
+        coverage: page(&stack, "coverage", "Coverage", "dialog-question-symbolic"),
+        budget: page(&stack, "budget", "Budget", "emblem-important-symbolic"),
+        export: page(&stack, "export", "Export", "send-to-symbolic"),
+    };
 
     let picker =
         gtk::DropDown::from_strings(&WINDOWS.iter().map(|(label, _)| *label).collect::<Vec<_>>());
@@ -155,10 +171,7 @@ fn build(application: &adw::Application, socket: PathBuf) {
     glib::spawn_future_local(async move {
         loop {
             let seconds = *window_seconds.borrow();
-            refresh(
-                &state, seconds, &stack, &status, &live, &agents, &rules, &coverage, &budget,
-            )
-            .await;
+            refresh(&state, seconds, &stack, &status, &pages).await;
             glib::timeout_future_seconds(REFRESH_SECONDS).await;
         }
     });
@@ -189,20 +202,12 @@ fn page(stack: &adw::ViewStack, name: &str, title: &str, icon: &str) -> gtk::Box
 ///
 /// Only the visible page. There is no reason to ask four questions a second when three of the answers are
 /// behind another tab, and a machine being watched has better things to do.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one widget per page, and the two chrome widgets"
-)]
 async fn refresh(
     state: &Rc<State>,
     seconds: i64,
     stack: &adw::ViewStack,
     status: &gtk::Label,
-    live: &gtk::Box,
-    agents: &gtk::Box,
-    rules: &gtk::Box,
-    coverage: &gtk::Box,
-    budget: &gtk::Box,
+    pages: &Pages,
 ) {
     let visible = stack.visible_child_name().unwrap_or_else(|| "live".into());
     let socket = state.socket.clone();
@@ -211,7 +216,7 @@ async fn refresh(
         "agents" => {
             match fetch::<Vec<Agent>>(socket, protocol::windowed("agents", seconds)).await {
                 Ok(rows) => {
-                    draw(state, 1, &rows, agents, |column| {
+                    draw(state, 1, &rows, &pages.agents, |column| {
                         render_agents(state, seconds, column, &rows);
                     });
                     say(status, "");
@@ -221,7 +226,7 @@ async fn refresh(
         }
         "rules" => match fetch::<Vec<Rule>>(socket, r#"{"op":"rules"}"#.to_owned()).await {
             Ok(rows) => {
-                draw(state, 2, &rows, rules, |column| {
+                draw(state, 2, &rows, &pages.rules, |column| {
                     render_rules(state, column, &rows);
                 });
                 say(status, "");
@@ -231,8 +236,19 @@ async fn refresh(
         "budget" => {
             match fetch::<protocol::Budget>(socket, r#"{"op":"budget"}"#.to_owned()).await {
                 Ok(row) => {
-                    draw(state, 4, &row, budget, |column| {
+                    draw(state, 4, &row, &pages.budget, |column| {
                         render_budget(state, column, &row);
+                    });
+                    say(status, "");
+                }
+                Err(err) => say(status, &err),
+            }
+        }
+        "export" => {
+            match fetch::<protocol::Export>(socket, r#"{"op":"export"}"#.to_owned()).await {
+                Ok(row) => {
+                    draw(state, 5, &row, &pages.export, |column| {
+                        render_export(state, column, &row);
                     });
                     say(status, "");
                 }
@@ -242,7 +258,7 @@ async fn refresh(
         "coverage" => {
             match fetch::<Coverage>(socket, protocol::windowed("coverage", seconds)).await {
                 Ok(row) => {
-                    draw(state, 3, &row, coverage, |column| {
+                    draw(state, 3, &row, &pages.coverage, |column| {
                         render_coverage(column, &row)
                     });
                     say(status, "");
@@ -252,7 +268,9 @@ async fn refresh(
         }
         _ => match fetch::<Vec<Request>>(socket, protocol::recent(seconds, RECENT)).await {
             Ok(rows) => {
-                draw(state, 0, &rows, live, |column| render_live(column, &rows));
+                draw(state, 0, &rows, &pages.live, |column| {
+                    render_live(column, &rows)
+                });
                 say(status, "");
             }
             Err(err) => say(status, &err),
@@ -909,6 +927,184 @@ fn render_budget(state: &Rc<State>, column: &gtk::Box, row: &protocol::Budget) {
             .build(),
     );
     column.append(&keeping);
+}
+
+/// Export: where what was seen is sent, and what agreeing to that means.
+///
+/// The disclosure is first and the agreement is a dialog with the same sentences in it. That is deliberate
+/// duplication: a switch labelled "send my data somewhere" that somebody flicks without reading the page is
+/// exactly the consent this is built to avoid.
+fn render_export(state: &Rc<State>, column: &gtk::Box, row: &protocol::Export) {
+    let said = adw::PreferencesGroup::builder()
+        .title(if row.sending {
+            "What is being sent"
+        } else {
+            "What would be sent"
+        })
+        .build();
+    for sentence in &row.disclosure {
+        said.add(&adw::ActionRow::builder().title(sentence).build());
+    }
+    if let Some(reason) = &row.why_not {
+        said.add(
+            &adw::ActionRow::builder()
+                .title("Nothing is being sent")
+                .subtitle(reason)
+                .build(),
+        );
+    }
+    column.append(&said);
+
+    let where_to = adw::PreferencesGroup::builder()
+        .title("Where")
+        .description(
+            "An absolute path is a file on this machine and nothing crosses the network. An http(s) URL is              an OTLP collector and something does.",
+        )
+        .build();
+    let destination = adw::EntryRow::builder()
+        .title("Destination")
+        .text(row.destination.clone().unwrap_or_default())
+        .show_apply_button(true)
+        .build();
+    {
+        let state = Rc::clone(state);
+        destination.connect_apply(move |entry| {
+            let text = entry.text().to_string();
+            let value = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".to_owned());
+            change_export(&state, "destination", &value);
+        });
+    }
+    where_to.add(&destination);
+    if row.headers.is_empty() {
+        where_to.add(
+            &adw::ActionRow::builder()
+                .title("No headers")
+                .subtitle(
+                    "A collector that needs a token wants one: `flowlightd export --header                      Authorization=…`. Set here or there, the value is never shown back.",
+                )
+                .build(),
+        );
+    } else {
+        where_to.add(
+            &adw::ActionRow::builder()
+                .title("Headers")
+                // Names only. This window ends up in screenshots like any other.
+                .subtitle(row.headers.join(", "))
+                .build(),
+        );
+    }
+    column.append(&where_to);
+
+    let chosen = adw::PreferencesGroup::builder()
+        .title("What")
+        .description(
+            "Changing any of these takes away an agreement that was to something else. Nothing is sent              again until the new sentences are agreed to.",
+        )
+        .build();
+    for field in &row.every_field {
+        let switch = adw::SwitchRow::builder()
+            .title(field.replace('_', " "))
+            .active(row.fields.contains(field))
+            .build();
+        let state = Rc::clone(state);
+        let wanted = row.fields.clone();
+        let field = field.clone();
+        switch.connect_active_notify(move |switch| {
+            let mut fields: Vec<String> = wanted.clone();
+            if switch.is_active() {
+                if !fields.contains(&field) {
+                    fields.push(field.clone());
+                }
+            } else {
+                fields.retain(|candidate| candidate != &field);
+            }
+            if fields.is_empty() {
+                // A list with nothing in it would send empty records, which the daemon refuses. Refusing it
+                // here as well keeps the switch from lying about what it did.
+                switch.set_active(true);
+                return;
+            }
+            let value = serde_json::to_string(&fields).unwrap_or_else(|_| "[]".to_owned());
+            change_export(&state, "fields", &value);
+        });
+        chosen.add(&switch);
+    }
+    column.append(&chosen);
+
+    let agreement = adw::PreferencesGroup::builder().title("Agreement").build();
+    let state_of_it = adw::ActionRow::builder()
+        .title(if row.consented {
+            "Agreed to the sentences above"
+        } else {
+            "Not agreed"
+        })
+        .subtitle(if row.sent_through > 0 {
+            "Records already sent are not sent again.".to_owned()
+        } else {
+            "Everything stored and not yet sent goes in the first batch.".to_owned()
+        })
+        .build();
+    let button = gtk::Button::builder()
+        .label(if row.consented {
+            "Take it back"
+        } else {
+            "Agree"
+        })
+        .valign(gtk::Align::Center)
+        .build();
+    if row.consented {
+        button.add_css_class("destructive-action");
+    } else {
+        button.add_css_class("suggested-action");
+    }
+    {
+        let state = Rc::clone(state);
+        let consented = row.consented;
+        let sentences = row.disclosure.join("\n\n");
+        let destination = row.destination.clone();
+        button.connect_clicked(move |button| {
+            if consented {
+                change_export(&state, "off", "true");
+                return;
+            }
+            let state = Rc::clone(&state);
+            let sentences = sentences.clone();
+            let destination = destination.clone();
+            let root = button.root().and_downcast::<gtk::Window>();
+            glib::spawn_future_local(async move {
+                if destination.is_none() {
+                    return;
+                }
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Agree to this?")
+                    .body(sentences)
+                    .build();
+                dialog.add_response("cancel", "Cancel");
+                dialog.add_response("agree", "Agree");
+                dialog.set_response_appearance("agree", adw::ResponseAppearance::Suggested);
+                dialog.set_default_response(Some("cancel"));
+                dialog.set_close_response("cancel");
+                if dialog.choose_future(root.as_ref()).await != "agree" {
+                    return;
+                }
+                change_export(&state, "consent", "true");
+            });
+        });
+    }
+    state_of_it.add_suffix(&button);
+    agreement.add(&state_of_it);
+    column.append(&agreement);
+}
+
+/// Changes one field of the export configuration and lets the next refresh show the result.
+fn change_export(state: &Rc<State>, field: &str, value: &str) {
+    let socket = state.socket.clone();
+    let request = protocol::set_export(field, value);
+    let state = Rc::clone(state);
+    glib::spawn_future_local(async move {
+        let _: Result<serde_json::Value, String> = fetch(socket, request).await;
+        *state.drawn.borrow_mut() = Default::default();
+    });
 }
 
 /// Changes one field of the budget and lets the next refresh show the result.

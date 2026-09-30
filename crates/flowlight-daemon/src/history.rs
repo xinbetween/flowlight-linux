@@ -24,6 +24,7 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
             | Command::Ask(_)
             | Command::Forget { .. }
             | Command::Budget { .. }
+            | Command::Export { .. }
     );
     if !writes && !database.exists() {
         bail!(
@@ -120,6 +121,63 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
                 }
                 if asked {
                     eprintln!("\nA running flowlightd picks this up within a couple of seconds.");
+                }
+            }
+        }
+        Command::Export {
+            to,
+            fields,
+            headers,
+            consent,
+            off,
+        } => {
+            let mut set = std::collections::BTreeMap::new();
+            for header in headers {
+                let (name, value) = header
+                    .split_once('=')
+                    .with_context(|| format!("reading `{header}` as Name=value"))?;
+                set.insert(name.to_owned(), value.to_owned());
+            }
+            let asked = to.is_some() || fields.is_some() || !set.is_empty() || *consent || *off;
+
+            let view = if asked {
+                crate::views::set_export(
+                    &mut store,
+                    &crate::views::ExportChange {
+                        destination: to.clone(),
+                        fields: fields.clone(),
+                        headers: (!set.is_empty()).then_some(set),
+                        consent: *consent,
+                        off: *off,
+                    },
+                )?
+            } else {
+                crate::views::export(&mut store)?
+            };
+
+            if json {
+                writeln!(out, "{}", line(&view))?;
+            } else {
+                for sentence in &view.disclosure {
+                    writeln!(out, "{sentence}")?;
+                }
+                if view.revoked {
+                    writeln!(
+                        out,
+                        "\nThe agreement on record was to something else, so it has been taken away."
+                    )?;
+                }
+                match (view.sending, &view.why_not) {
+                    (true, _) => writeln!(
+                        out,
+                        "\nThis is in force. Records already stored and not yet sent go in the first batch."
+                    )?,
+                    (false, Some(reason)) => writeln!(out, "\nNothing is being sent: {reason}")?,
+                    (false, None) => {}
+                }
+                writeln!(out, "\nFields available: {}", view.every_field.join(", "))?;
+                if asked {
+                    eprintln!("\nA running flowlightd picks this up within a few seconds.");
                 }
             }
         }

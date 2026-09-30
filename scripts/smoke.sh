@@ -21,11 +21,14 @@ coverage_json=$(mktemp)
 agents_json=$(mktemp)
 fake_agent=$(mktemp -d)/claude
 database=$(mktemp -d)/flowlight.db
+export_dir=$(mktemp -d)
+export_file=$export_dir/exported.jsonl
+export_second=$export_dir/elsewhere.jsonl
 cleanup() {
     rm -f "$output" "$log" "$stored" "$reported" "$coverage_json" "$agents_json"
     rm -rf "$(dirname "$fake_agent")"
     [ "${agent_tested:-no}" = yes ] && rm -f "$agent_config"
-    sudo rm -rf "$(dirname "$database")"
+    sudo rm -rf "$(dirname "$database")" "$export_dir"
     return 0
 }
 trap cleanup EXIT
@@ -62,7 +65,8 @@ PYTHON
 }
 
 echo "Watching..."
-sudo "$binary" --json --seconds 70 --database "$database" --socket "$socket" --web 127.0.0.1:0 >"$output" 2>"$log" &
+sudo "$binary" --json --seconds 110 --database "$database" --socket "$socket" --web 127.0.0.1:0 \
+    --export-seconds 2 >"$output" 2>"$log" &
 watcher=$!
 
 # Wait for the daemon to say it is reading a TLS library, rather than guessing at how long that takes. A
@@ -308,6 +312,95 @@ ask '{"op":"requests","since":600,"limit":200}' \
     | jq -e '[.ok[] | select(.target == "/\u2026")] | length > 0' >/dev/null \
     || fail "the request was not recorded at all, which is not the same as keeping only its host."
 echo "OK: only the host is kept, and the request is still recorded"
+
+# Export: sending what was seen somewhere else. A file destination, so this asserts the whole mechanism --
+# the consent, the field list, the high-water mark -- without depending on a collector being reachable from
+# CI. What crosses the network is one `ureq` call away from what is asserted here.
+#
+# The order matters and is the point: configured first and sending nothing, then agreed to and sending.
+ask "{\"op\":\"set-export\",\"destination\":\"$export_file\"}" \
+    | jq -e '.ok.sending == false and .ok.consented == false and (.ok.why_not | test("agreed"))' >/dev/null \
+    || fail "naming a destination did not leave export unconsented."
+ask '{"op":"export"}' | jq -e '.ok.disclosure | length > 3' >/dev/null \
+    || fail "export does not disclose what it would send."
+echo "OK: naming a destination discloses what would be sent and sends nothing"
+
+# Longer than the ten-second export interval, so this is a claim about a daemon that had the chance.
+sleep 5
+if [ -f "$export_file" ]; then
+    fail "records were sent before anybody agreed to sending them."
+fi
+echo "OK: nothing is sent until somebody agrees"
+
+# Consent cannot be given in the same breath as changing what it is consent to. Asserted over the socket
+# because that is the path the window takes, and the window is where somebody clicks Agree.
+ask "{\"op\":\"set-export\",\"destination\":\"$export_second\",\"consent\":true}" \
+    | jq -e '.error | test("same breath")' >/dev/null \
+    || fail "consent was accepted in the same call that changed what it was consent to."
+echo "OK: agreement cannot be given to a disclosure that the same call rewrote"
+
+ask '{"op":"set-export","consent":true}' | jq -e '.ok.sending == true and .ok.consented == true' >/dev/null \
+    || fail "agreeing did not put export in force."
+
+await_file() {
+    local path=$1 seconds=${2:-30}
+    for _ in $(seq "$((seconds * 4))"); do
+        if [ -s "$path" ]; then
+            return 0
+        fi
+        sleep 0.25
+    done
+    fail "nothing was ever written to $path."
+}
+await_file "$export_file"
+echo "OK: once agreed to, what was seen is sent"
+
+sudo cat "$export_file" | jq -s -e "map(select(.process == \"curl\" and .host == \"$target_host\")) | length > 0" \
+    >/dev/null || fail "the exported records do not include the request that was read."
+echo "OK: the exported records are the records"
+
+# The property the whole module exists for: a field nobody agreed to is not in what leaves. `target` is the
+# one that matters -- it is the field most likely to carry something somebody would not choose to send.
+sudo cat "$export_file" | jq -s -e 'map(keys) | flatten | unique' >/dev/null \
+    || fail "the exported records are not objects."
+exported_keys=$(sudo cat "$export_file" | jq -s -r 'map(keys) | flatten | unique | join(",")')
+echo "exported fields: $exported_keys"
+for unagreed in target pid confidence protocol rpc_tool rpc_method; do
+    if printf '%s' "$exported_keys" | grep -qw "$unagreed"; then
+        fail "$unagreed was exported without being agreed to."
+    fi
+done
+echo "OK: only the agreed fields left the machine"
+
+# Flowlight's own traffic is not in what Flowlight sends. Left in, a record of a batch being sent is a record
+# in the next batch, for ever.
+if sudo cat "$export_file" | jq -s -e 'map(select(.process == "flowlightd")) | length > 0' >/dev/null; then
+    fail "the daemon exported its own traffic."
+fi
+echo "OK: the daemon's own traffic is not in what it exports"
+
+# Nothing is sent twice: the mark moved, so a second pass over the same records adds no lines.
+lines_before=$(sudo cat "$export_file" | wc -l)
+sleep 5
+lines_after=$(sudo cat "$export_file" | wc -l)
+[ "$lines_before" -le "$lines_after" ] || fail "the export file shrank."
+duplicates=$(sudo cat "$export_file" | jq -s 'length - (unique | length)')
+[ "$duplicates" = 0 ] || fail "$duplicates record(s) were exported more than once."
+echo "OK: a record is sent once"
+
+# And the failure the design exists to prevent: somebody agrees to one destination, and a change points it
+# at another under the same yes.
+ask "{\"op\":\"set-export\",\"destination\":\"$export_second\"}" \
+    | jq -e '.ok.revoked == true and .ok.sending == false and .ok.consented == false' >/dev/null \
+    || fail "changing the destination did not take the agreement away."
+sleep 5
+if [ -f "$export_second" ]; then
+    fail "records went to a destination nobody agreed to."
+fi
+echo "OK: changing where it goes takes the agreement with it"
+
+ask '{"op":"set-export","off":true}' | jq -e '.ok.enabled == false' >/dev/null \
+    || fail "export would not turn off."
 
 echo "Turning payload capture off..."
 before=$(ask '{"op":"requests","since":600,"limit":400}' | jq '[.ok[] | select(.process == "curl")] | length')
