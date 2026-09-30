@@ -165,7 +165,7 @@ Useful flags:
 
 Plus subcommands that read the database rather than the kernel — `history --since 6h`, `agents`, `summary`,
 `coverage --since 24h`, `budget`, `export`, `model`, `query`, `intercept`, `trust`, `mock`, `mocks`,
-`forget-mock`, `guardrail`, `guardrails`, `forget-guardrail`, `owners` — and six for rules: `block`, `allow`, `ask`,
+`forget-mock`, `guardrail`, `guardrails`, `forget-guardrail`, `owners`, `alerts` — and six for rules: `block`, `allow`, `ask`,
 `simulate`, `rules`, `forget`. `--json` works on all
 of them. One subcommand is not like the others: `launch` runs as you rather than as root, because the agent it
 starts has to.
@@ -828,6 +828,52 @@ pointer forwards, which is how a parser is made to loop for ever.
 An address nobody announces is recorded as such rather than left unknown, because otherwise it would be asked
 about again on every pass for ever. A resolver that is temporarily unreachable is a different thing and is
 *not* recorded, so it is asked again later — conflating the two would make a transient failure permanent.
+
+### Alerts
+
+Things worth saying, each carrying the arithmetic that produced it.
+
+```console
+$ flowlightd alerts --since 24h
+!!  claude sent 200.0 MB to somewhere.example and received 1.0 MB back — 200 times as much out as in
+!   node moved 400.0 MB in the hour from Tuesday 29 September 2026, 14:00 UTC — 4.2 deviations above its
+    baseline of 30.0 MB an hour, over 48 hours of history
+    curl reached telemetry.example, which nothing on this machine had reached before
+    curl was refused 1.1.1.1:443 by a rule
+```
+
+A ranked list with no numbers behind it is a horoscope, so every alert names what it compared against and what
+it found. Somebody who disagrees can go and check.
+
+Eight signals. Three are statistical — a process moving much more than it usually does in an hour, reaching many
+more hosts than usual in a day, and an agent sending far more than it receives. Five are about a single event: a
+host nothing had reached before, a process new to the network, a port nothing usually reaches, an agent reaching
+an *address* rather than a name, and a connection a rule refused.
+
+The baseline is an exponentially weighted moving average with its variance — cumulative while it is young, so an
+hour is not compared against a single earlier hour and called a spike, then weighted with about a week's memory
+so that last month does not outvote this week. It is the same arithmetic the macOS build uses, deliberately: a
+spike has to be a spike on both, or the two tools disagree about what a machine is doing, and each is confirmed
+by the other's silence.
+
+Three decisions that decide whether this is useful or noise:
+
+- **The floor under the deviation is proportional to the thing measured** — a tenth of the mean, or 64 KB,
+  whichever is larger. Without it, something perfectly steady calls its first variation infinite, and a backup
+  job that normally moves a gigabyte an hour gets an alert for moving 1.1 GB.
+- **The window in progress is never judged.** Half an hour of traffic compared against whole ones is a spike
+  every time.
+- **The same thing is not said twice within an hour.** A list that repeats itself is one nobody reads to the
+  bottom of.
+
+**Two of the macOS build's signals deliberately do not port.** "Traffic while nobody was at the keyboard" and
+"an agent was active while you were away" both rest on there being a keyboard and a session to be away from, and
+this runs on servers. They are absent rather than approximated, because a signal that fires because a machine has
+no display is not a signal.
+
+A refusal is not an anomaly — it is Flowlight doing what it was told. It is recorded because the person it
+happens to is usually the person who wrote the rule, and an hour spent on a network that appears to be broken is
+an hour nobody gets back.
 
 ### Coverage: what was *not* seen
 

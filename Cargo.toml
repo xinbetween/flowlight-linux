@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/flowlight-agents",
+    "crates/flowlight-alerts",
     "crates/flowlight-ask",
     "crates/flowlight-common",
     "crates/flowlight-daemon",
@@ -19,6 +20,7 @@ members = [
 # whole workspace explicitly, on Linux, which is the only place any of this runs.
 default-members = [
     "crates/flowlight-agents",
+    "crates/flowlight-alerts",
     "crates/flowlight-ask",
     "crates/flowlight-common",
     "crates/flowlight-owners",
@@ -28,7 +30,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/xinbetween/flowlight-linux"
@@ -36,6 +38,7 @@ repository = "https://github.com/xinbetween/flowlight-linux"
 rust-version = "1.87"
 
 [workspace.dependencies]
+flowlight-alerts = { path = "crates/flowlight-alerts" }
 flowlight-ask = { path = "crates/flowlight-ask" }
 flowlight-owners = { path = "crates/flowlight-owners" }
 flowlight-proxy = { path = "crates/flowlight-proxy" }

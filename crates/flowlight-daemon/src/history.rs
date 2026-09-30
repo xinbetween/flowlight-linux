@@ -551,6 +551,48 @@ pub fn run(
                 }
             }
         }
+        Command::Alerts {
+            since,
+            limit,
+            agents,
+        } => {
+            let window = parse_window(since)
+                .with_context(|| format!("reading `{since}` as a length of time"))?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs() as i64);
+            let rows: Vec<crate::views::AlertView> =
+                crate::views::alerts(&mut store, now - window, *limit)?
+                    .into_iter()
+                    .filter(|row| !*agents || row.about_an_agent)
+                    .collect();
+            if rows.is_empty() && !json {
+                eprintln!(
+                    "Nothing unusual in the last {since}. What counts as unusual is a process moving much \
+                     more than it usually does, a host nothing had reached before, a port nothing usually \
+                     reaches, an agent reaching an address rather than a name, and a connection a rule \
+                     refused."
+                );
+                return Ok(());
+            }
+            for row in &rows {
+                if json {
+                    writeln!(out, "{}", line(row))?;
+                } else {
+                    writeln!(
+                        out,
+                        "{} {:>6}s ago  {}",
+                        match row.severity {
+                            3 => "!!",
+                            2 => "! ",
+                            _ => "  ",
+                        },
+                        now - row.at,
+                        row.detail
+                    )?;
+                }
+            }
+        }
         Command::Owners { on, off, since } => {
             if *on {
                 store.set_owner_lookup(true)?;

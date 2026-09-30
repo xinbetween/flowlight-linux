@@ -415,6 +415,45 @@ echo "OK: changing where it goes takes the agreement with it"
 ask '{"op":"set-export","off":true}' | jq -e '.ok.enabled == false' >/dev/null \
     || fail "export would not turn off."
 
+# Alerts: things worth saying, each carrying the arithmetic behind it. The event-driven ones are assertable
+# here; the statistical ones need days of history and are unit-tested against numbers instead.
+alerts=$(sudo "$binary" --database "$database" --certificates "$certificates" --json alerts --since 3600)
+printf '%s\n' "$alerts" | jq -c '{kind, subject}' | head -8
+
+# A host nothing on this machine had reached before. This test reached one a minute ago.
+printf '%s' "$alerts" \
+    | jq -e 'select(.kind == "first contact with a host" and .subject == "'"$target_host"'")' >/dev/null \
+    || fail "reaching a host for the first time was not noticed."
+echo "OK: a host nothing had reached before was noticed"
+
+# A process that had never been on the network. `curl` is one, from this test's point of view.
+printf '%s' "$alerts" | jq -e 'select(.kind == "a process new to the network")' >/dev/null \
+    || fail "a process new to the network was not noticed."
+echo "OK: a process new to the network was noticed"
+
+# A connection a rule refused. The blocking section wrote a rule and had it bite.
+if [ "$block_tested" = yes ]; then
+    printf '%s' "$alerts" | jq -e 'select(.kind == "a connection was refused")' >/dev/null \
+        || fail "a refused connection was not recorded as worth saying."
+    echo "OK: a refusal is recorded, because the person it happens to wrote the rule"
+fi
+
+# Every alert says what it is about in a sentence, because a ranked list with no numbers is a horoscope.
+printf '%s' "$alerts" | jq -e 'select((.detail | length) < 20)' >/dev/null \
+    && fail "an alert was recorded with nothing to say for itself."
+echo "OK: every alert says what it noticed"
+
+# And the same thing is not said twice within the hour.
+repeats=$(printf '%s' "$alerts" | jq -s '[.[] | "\(.kind)/\(.subject)"] | length - (unique | length)')
+[ "$repeats" = 0 ] || fail "$repeats alert(s) repeat a kind and subject within the window."
+echo "OK: the same thing is not said twice"
+
+# Only the ones about agents, when that is what was asked for.
+sudo "$binary" --database "$database" --certificates "$certificates" --json alerts --since 3600 --agents \
+    | jq -e 'select(.about_an_agent == false)' >/dev/null \
+    && fail "--agents returned something that is not about an agent."
+echo "OK: the ones about agents can be asked for on their own"
+
 # Who operates an address. Off until it is asked for, because it is the one thing Flowlight does that tells a
 # third party anything — so the first assertion is that it is off and says what asking would mean.
 sudo "$binary" --database "$database" --certificates "$certificates" --json owners \
