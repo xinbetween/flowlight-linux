@@ -9,7 +9,7 @@
 
 use anyhow::Result;
 use flowlight_agents::mcp;
-use flowlight_store::Store;
+use flowlight_store::{Mock, Store};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -502,6 +502,240 @@ pub fn answered(question: &str, answered: &flowlight_ask::Answered) -> AnsweredV
             .collect(),
         sent: answered.sent.clone(),
     }
+}
+
+/// Whether connections are terminated, and whose.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct InterceptView {
+    /// Whether the feature is on.
+    pub enabled: bool,
+    /// Whether anything is actually being terminated.
+    pub running: bool,
+    /// Where the proxy listens.
+    pub port: u16,
+    /// The agents in scope. Empty means nobody.
+    pub agents: Vec<String>,
+    /// Hosts never terminated, whatever else says so.
+    pub never: Vec<String>,
+    /// Why nothing is being terminated, when nothing is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why_not: Option<String>,
+    /// What turning it on would mean, in sentences.
+    pub disclosure: Vec<String>,
+    /// Where the certificate anything must trust is, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<String>,
+    /// Where the bundle is, for anything that reads one rather than the machine's store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<String>,
+}
+
+/// What one request may change about interception.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct InterceptChange {
+    /// Turn it on.
+    #[serde(default)]
+    pub on: bool,
+    /// Turn it off, keeping the scope.
+    #[serde(default)]
+    pub off: bool,
+    /// The whole scope, not an addition.
+    pub agents: Option<Vec<String>>,
+    /// The whole list of hosts never terminated.
+    pub never: Option<Vec<String>>,
+}
+
+/// One canned answer.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MockView {
+    /// Its identifier, which `forget-mock` takes.
+    pub id: i64,
+    /// Whether it answers.
+    pub enabled: bool,
+    /// The host or pattern.
+    pub subject: String,
+    /// The path glob.
+    pub path: String,
+    /// The method, or empty for any.
+    pub method: String,
+    /// The status it answers with.
+    pub status: u16,
+    /// How long it waits first.
+    pub delay: u32,
+    /// Whether it calls itself a refusal.
+    pub refusal: bool,
+    /// The header names it sends. Never their values, for the same reason export never shows one.
+    pub headers: Vec<String>,
+    /// How many bytes of body it answers with.
+    pub body_bytes: usize,
+    /// Why, if whoever wrote it said.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Whether connections are terminated, described.
+pub fn intercept(store: &mut Store, paths: Option<(String, String)>) -> Result<InterceptView> {
+    Ok(describe_intercept(&store.intercept()?, paths))
+}
+
+/// Turns an interception configuration into what an interface shows.
+fn describe_intercept(
+    intercept: &flowlight_store::Intercept,
+    paths: Option<(String, String)>,
+) -> InterceptView {
+    InterceptView {
+        enabled: intercept.enabled,
+        running: intercept.running(),
+        port: intercept.port,
+        agents: intercept.agents.clone(),
+        never: intercept.never.clone(),
+        why_not: intercept.why_not(),
+        disclosure: intercept.disclose(),
+        certificate: paths.as_ref().map(|(certificate, _)| certificate.clone()),
+        bundle: paths.map(|(_, bundle)| bundle),
+    }
+}
+
+/// Changes what is intercepted, and says what it now is.
+pub fn set_intercept(
+    store: &mut Store,
+    change: &InterceptChange,
+    paths: Option<(String, String)>,
+) -> Result<InterceptView> {
+    let mut intercept = store.intercept()?;
+    if let Some(agents) = &change.agents {
+        intercept.agents = agents
+            .iter()
+            .map(|agent| agent.trim().to_owned())
+            .filter(|agent| !agent.is_empty())
+            .collect();
+    }
+    if let Some(never) = &change.never {
+        intercept.never = never
+            .iter()
+            .map(|host| host.trim().to_lowercase())
+            .filter(|host| !host.is_empty())
+            .collect();
+    }
+    // Both given, off wins. The one that changes what an application sees is the one to be careful with.
+    if change.on {
+        intercept.enabled = true;
+    }
+    if change.off {
+        intercept.enabled = false;
+    }
+    store.set_intercept(&intercept)?;
+    Ok(describe_intercept(&intercept, paths))
+}
+
+/// Every canned answer, in the order they are tried.
+pub fn mocks(store: &mut Store) -> Result<Vec<MockView>> {
+    Ok(store
+        .mocks()?
+        .into_iter()
+        .map(|mock| MockView {
+            id: mock.id,
+            enabled: mock.enabled,
+            subject: mock.subject.as_text(),
+            path: mock.path,
+            method: mock.method,
+            status: mock.status,
+            delay: mock.delay,
+            refusal: mock.refusal,
+            headers: mock.headers.into_iter().map(|(name, _)| name).collect(),
+            body_bytes: mock.body.len(),
+            note: mock.note,
+        })
+        .collect())
+}
+
+/// What one request may write as a canned answer.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct MockWrite {
+    /// The host or pattern.
+    pub subject: String,
+    /// The path glob. `*` when left out.
+    pub path: Option<String>,
+    /// The method, or empty for any.
+    pub method: Option<String>,
+    /// The status. 503 when left out, because "the API is failing" is what anybody tries first.
+    pub status: Option<u16>,
+    /// Headers, as `Name: value` per line.
+    pub headers: Option<String>,
+    /// The body.
+    pub body: Option<String>,
+    /// Seconds to wait before answering.
+    pub delay: Option<u32>,
+    /// Whether this is a refusal rather than a stand-in.
+    #[serde(default)]
+    pub refusal: bool,
+    /// Whether it answers at all.
+    pub enabled: Option<bool>,
+    /// Why.
+    pub note: Option<String>,
+}
+
+/// Writes a canned answer.
+pub fn write_mock(store: &mut Store, wanted: &MockWrite, now: i64) -> Result<&'static str> {
+    use anyhow::bail;
+    let subject = flowlight_rules::Subject::parse(&wanted.subject);
+    if matches!(subject, flowlight_rules::Subject::Anything) {
+        // Deliberately refused. A mock for `*` answers every request an agent makes with a canned reply,
+        // which is not a test of anything and is very hard to notice.
+        bail!(
+            "a canned answer has to name a host. `*` would answer every request from every agent in scope,              which is not something anybody means to leave switched on."
+        );
+    }
+    let status = wanted.status.unwrap_or(503);
+    if !(100..600).contains(&status) {
+        bail!("{status} is not an HTTP status");
+    }
+    let mock = Mock {
+        id: 0,
+        enabled: wanted.enabled.unwrap_or(true),
+        subject,
+        path: wanted
+            .path
+            .clone()
+            .map(|path| path.trim().to_owned())
+            .filter(|path| !path.is_empty())
+            .unwrap_or_else(|| "*".to_owned()),
+        method: wanted
+            .method
+            .clone()
+            .unwrap_or_default()
+            .trim()
+            .to_uppercase(),
+        status,
+        headers: wanted
+            .headers
+            .as_deref()
+            .map(parse_headers)
+            .unwrap_or_default(),
+        body: wanted.body.clone().unwrap_or_default(),
+        delay: wanted.delay.unwrap_or(0).min(600),
+        refusal: wanted.refusal,
+        note: wanted.note.clone(),
+    };
+    Ok(match store.put_mock(&mock, now)? {
+        flowlight_store::Wrote::Added => "added",
+        flowlight_store::Wrote::Changed => "changed",
+        flowlight_store::Wrote::Unchanged => "unchanged",
+    })
+}
+
+/// Headers as they are typed: one `Name: value` per line.
+fn parse_headers(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| {
+            (
+                flowlight_proxy::http::header_safe(name),
+                flowlight_proxy::http::header_safe(value),
+            )
+        })
+        .filter(|(name, _)| !name.is_empty())
+        .collect()
 }
 
 /// One thing a candidate rule would change.

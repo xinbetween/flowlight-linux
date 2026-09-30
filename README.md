@@ -159,8 +159,9 @@ Useful flags:
 
 
 Plus subcommands that read the database rather than the kernel — `history --since 6h`, `agents`, `summary`,
-`coverage --since 24h`, `budget`, `export`, `model`, `query` — and six for rules: `block`, `allow`, `ask`,
-`simulate`, `rules`, `forget`. `--json` works on all of them.
+`coverage --since 24h`, `budget`, `export`, `model`, `query`, `intercept`, `trust`, `mock`, `mocks`,
+`forget-mock` — and six for rules: `block`, `allow`, `ask`, `simulate`, `rules`, `forget`. `--json` works on all
+of them.
 
 If it refuses to start, the message says why — an unmounted tracefs, a kernel built without the tracepoint,
 and a policy that forbids loading programs are three different problems and it will not conflate them.
@@ -373,7 +374,7 @@ A native window, GTK4, running **as you** while the daemon runs as root.
 flowlight
 ```
 
-Seven pages — **Live**, **Agents**, **Rules**, **Coverage**, **Budget**, **Export**, **Ask** — and a window selector from fifteen
+Eight pages — **Live**, **Agents**, **Rules**, **Coverage**, **Budget**, **Export**, **Ask**, **Intercept** — and a window selector from fifteen
 minutes to seven days. On the Agents page each host an agent reached carries the two buttons the macOS build settled
 on: block it **for this agent**, or block it **everywhere**.
 
@@ -399,6 +400,123 @@ sudo ./target/release/flowlightd --web
 ```
 
 and it prints its own warning, because on a shared machine it is a disclosure.
+
+### Interception
+
+The one thing here that changes what an application sees. Everything else reads what a process hands its TLS
+library, before encryption, and alters nothing on the wire. This stands in the middle of a connection, presents
+a certificate of its own, and can answer a request the server never received.
+
+So it is a different switch, with its own scope, and it is off:
+
+```console
+$ sudo flowlightd intercept
+Interception is not watching. Everything else Flowlight does reads what an application hands its TLS library
+and changes nothing that crosses the network.
+No agents are named, so nothing is redirected. Interception applies to the agents it names and to nothing else
+on this machine.
+That proxy presents a certificate signed by a certificate authority created on this machine. Anything that does
+not trust it will refuse the connection, which is what a pinned certificate is supposed to do.
+A host nobody has written a mock for is passed through without being terminated at all, so the certificate is
+only ever presented where there is a reason to.
+Turning it off stops the redirect immediately. Removing the certificate authority is a separate step, because
+trusting one and untrusting it are both things somebody should do on purpose.
+
+Nothing is being terminated: Interception is off. Nothing is terminated, and no certificate of Flowlight's is
+presented to anything.
+```
+
+A canned answer, and then the scope:
+
+```console
+$ sudo flowlightd mock api.example.com --path '/v1/*' --method POST --status 503 \
+      --header 'Retry-After: 30' --body '{"error":"the API is having a bad day"}'
+added
+
+$ sudo flowlightd intercept --agent claude --on
+```
+
+From then on, `claude` and everything it starts get the canned 503 for that request and the real server for
+everything else. The answer names itself in a header — `X-Flowlight-Mock`, or `X-Flowlight-Refused` when the
+rule calls itself a refusal — so a log kept elsewhere on the machine can tell too.
+
+#### Why the kernel redirects rather than an environment variable
+
+`HTTPS_PROXY` has to be set before a process starts, by whoever starts it, and is honoured by curl and Python
+and ignored by plenty of other things. A `cgroup/connect4` hook is none of that: it rewrites the destination
+inside `connect()`, so it applies to a process that is **already running**, to everything it starts, and to
+every library any of them use — because it is below all of them.
+
+The original destination cannot survive that rewrite, so the program writes it down. It is remembered twice:
+first against the socket's cookie, because inside `connect()` the source port does not exist yet, and then
+against the source port, because that is the only handle the proxy has on a connection it accepts from
+`127.0.0.1`. `SO_ORIGINAL_DST` is no help here — nothing was translated by netfilter, so there is no conntrack
+entry to ask.
+
+**The blocking programs are attached first, deliberately.** Both hang off the same hook and the kernel runs them
+in attach order. Blocking decides about the address in the context; redirect *changes* that address. The other
+way round, a rule refusing `1.2.3.4` would be asked about `127.0.0.1` instead — so turning interception on would
+quietly disable blocking for everything in its scope.
+
+#### What is terminated, and what is not
+
+- **Only the agents named.** Empty means nobody, not everybody. A scope that meant the machine would redirect
+  the package manager, which pins certificates, and the first symptom would be a machine that cannot update
+  itself.
+- **Only a host some rule could answer for.** The proxy reads the server name out of the handshake, and if no
+  canned answer covers that host the connection is relayed as ciphertext — the bytes copied both ways, nothing
+  decrypted, no certificate presented. A host nobody mocks never pays for the feature.
+- **Never `--never` hosts**, whatever else says so.
+- **Only HTTPS**, and only HTTP/1.1. The proxy offers `http/1.1` in ALPN and nothing else, so an HTTP/2 client
+  negotiates down for the hosts in scope. Plain HTTP is not redirected at all: there is nothing to terminate and
+  the payload probes already read it.
+- **Never loopback.** A connection to this machine includes every connection to the proxy, and redirecting
+  those is a loop.
+
+#### The certificate
+
+Created on this machine the first time interception is available, and never leaves it. Its key signs a
+short-lived certificate for each host that is terminated; one key is shared by all of them, because the leaves
+live for a fortnight and a key per host would be the slowest thing in the connection.
+
+The keys live beside the database, mode 600 in a directory of 700, created that way rather than created and then
+restricted — and narrowed again on every open, because a directory somebody widened later is the same problem as
+one that was never narrowed. Anybody who can read the authority's key can impersonate every site on the internet
+to anything that trusts it.
+
+The certificate itself goes somewhere else: `/usr/local/share/flowlight/`, readable by everybody, because an
+agent runs as a person who has to be able to read the certificate they are being asked to trust. Beside it is
+`ca-bundle.pem` — this machine's own roots **plus** Flowlight's, so a tool pointed at it does not stop trusting
+everything else.
+
+```console
+$ sudo flowlightd trust
+The certificate is at /usr/local/share/flowlight/flowlight-ca.pem
+A bundle of this machine's roots plus it is at /usr/local/share/flowlight/ca-bundle.pem
+
+the machine's trust store — present on this machine, and Flowlight can do it
+    `sudo flowlightd trust --install` copies it to /usr/local/share/ca-certificates/flowlight.crt and runs
+    `update-ca-certificates`. That covers OpenSSL, curl, git and anything else that reads the machine's store.
+
+Node — present on this machine
+    Node does not read the machine's trust store. `NODE_EXTRA_CA_CERTS=…` is the only way in, and it has to be
+    set before node starts — which is what `flowlightd launch` will be for.
+…
+```
+
+`trust` installs into the distribution's store and **reports** everything else: Python's certifi, Java's
+keystore, NSS. Those are somebody else's files, replaced by the next upgrade of whatever owns them, and a tool
+that edits them quietly is a tool nobody can reason about. The two that need an environment variable cannot be
+done from here at all — a variable is set before a process starts, by whoever starts it, which is the next
+release.
+
+#### Interception does not record anything
+
+Worth stating plainly: the payload probes see every request whether interception is on or off, so the proxy does
+no recording. A proxy that also recorded would put a second copy of every request into the database with no way
+to tell the two apart. What it writes down is only what it *did* — a request it answered and the rule that
+answered it — and a connection it merely passed on is counted rather than kept, because a note per connection
+would bury the ones that matter.
 
 ### Ask — with your own model
 

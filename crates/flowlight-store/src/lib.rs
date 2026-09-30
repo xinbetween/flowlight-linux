@@ -33,10 +33,13 @@
 pub mod ask;
 pub mod budget;
 pub mod export;
+pub mod intercept;
 
 pub use ask::Ask;
 pub use budget::{Budget, Paths};
 pub use export::Export;
+pub use flowlight_rules::Mock;
+pub use intercept::Intercept;
 
 use anyhow::{Context as _, Result};
 use rusqlite::{Connection, OptionalExtension as _, params};
@@ -418,7 +421,7 @@ impl Store {
     }
 
     /// The schema this version of the code expects.
-    pub const SCHEMA: i64 = 8;
+    pub const SCHEMA: i64 = 9;
 
     /// Creates the schema, or brings an older one up to it.
     ///
@@ -473,6 +476,25 @@ impl Store {
                 requests INTEGER NOT NULL,
                 bytes    INTEGER NOT NULL,
                 PRIMARY KEY (day, process, host)
+            );
+            CREATE TABLE IF NOT EXISTS intercept (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS mocks (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                created INTEGER NOT NULL,
+                enabled INTEGER NOT NULL,
+                subject TEXT    NOT NULL,
+                path    TEXT    NOT NULL,
+                method  TEXT    NOT NULL,
+                status  INTEGER NOT NULL,
+                headers TEXT    NOT NULL,
+                body    TEXT    NOT NULL,
+                delay   INTEGER NOT NULL,
+                refusal INTEGER NOT NULL,
+                note    TEXT,
+                UNIQUE(subject, path, method)
             );
             CREATE TABLE IF NOT EXISTS ask (
                 key   TEXT PRIMARY KEY,
@@ -1244,6 +1266,113 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Whether connections are terminated, and whose.
+    pub fn intercept(&self) -> Result<Intercept> {
+        intercept::read(&self.connection)
+    }
+
+    /// Writes the interception configuration.
+    pub fn set_intercept(&mut self, intercept: &Intercept) -> Result<()> {
+        intercept::write(&self.connection, intercept)
+    }
+
+    /// Every canned answer, in the order they are tried.
+    ///
+    /// Oldest first, because the first match answers and the order somebody wrote them in is the order they
+    /// expect them to be tried in.
+    pub fn mocks(&mut self) -> Result<Vec<Mock>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, enabled, subject, path, method, status, headers, body, delay, refusal, note
+             FROM mocks ORDER BY id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(Mock {
+                id: row.get(0)?,
+                enabled: row.get::<_, i64>(1)? != 0,
+                subject: flowlight_rules::Subject::parse(&row.get::<_, String>(2)?),
+                path: row.get(3)?,
+                method: row.get(4)?,
+                status: row.get::<_, i64>(5)?.clamp(100, 599) as u16,
+                headers: headers_from(&row.get::<_, String>(6)?),
+                body: row.get(7)?,
+                delay: row.get::<_, i64>(8)?.clamp(0, 600) as u32,
+                refusal: row.get::<_, i64>(9)? != 0,
+                note: row.get(10)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Writes a canned answer, replacing whatever was said about the same subject, path and method.
+    ///
+    /// Replacing for the same reason a rule replaces: two answers for one request is a contradiction nobody
+    /// wrote, and resolving it by order would depend on which was typed first.
+    pub fn put_mock(&mut self, mock: &Mock, now: i64) -> Result<Wrote> {
+        let subject = mock.subject.as_text();
+        let method = mock.method.trim().to_uppercase();
+        let existing: Option<(i64, i64, String, String, i64, i64)> = self
+            .connection
+            .query_row(
+                "SELECT status, delay, headers, body, refusal, enabled FROM mocks
+                 WHERE subject = ?1 AND path = ?2 AND method = ?3",
+                params![subject, mock.path, method],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let wrote = match &existing {
+            Some((status, delay, headers, body, refusal, enabled))
+                if *status == i64::from(mock.status)
+                    && *delay == i64::from(mock.delay)
+                    && *headers == headers_to(&mock.headers)
+                    && *body == mock.body
+                    && (*refusal != 0) == mock.refusal
+                    && (*enabled != 0) == mock.enabled =>
+            {
+                Wrote::Unchanged
+            }
+            Some(_) => Wrote::Changed,
+            None => Wrote::Added,
+        };
+        self.connection.execute(
+            "INSERT INTO mocks (created, enabled, subject, path, method, status, headers, body, delay,
+                                refusal, note)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(subject, path, method) DO UPDATE SET
+                 enabled = ?2, status = ?6, headers = ?7, body = ?8, delay = ?9, refusal = ?10, note = ?11",
+            params![
+                now,
+                i64::from(mock.enabled),
+                subject,
+                mock.path,
+                method,
+                i64::from(mock.status),
+                headers_to(&mock.headers),
+                mock.body,
+                i64::from(mock.delay),
+                i64::from(mock.refusal),
+                mock.note,
+            ],
+        )?;
+        Ok(wrote)
+    }
+
+    /// Removes a canned answer. Returns whether there was one.
+    pub fn forget_mock(&mut self, id: i64) -> Result<bool> {
+        Ok(self
+            .connection
+            .execute("DELETE FROM mocks WHERE id = ?1", params![id])?
+            > 0)
+    }
+
     /// How Flowlight is set up, for a question about the tool rather than about the traffic.
     pub fn ask(&self) -> Result<Ask> {
         ask::read(&self.connection)
@@ -1291,6 +1420,27 @@ impl Store {
             .optional()?
             .flatten())
     }
+}
+
+/// Headers as the one string they are stored as: `Name: value`, one per line.
+///
+/// A text column rather than a table of its own. They are read and written as a block, never queried, and a
+/// second table would be a join for something nobody asks a question about.
+fn headers_to(headers: &[(String, String)]) -> String {
+    headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// And back. A line without a colon is not a header and is dropped rather than guessed at.
+fn headers_from(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
+        .filter(|(name, _)| !name.is_empty())
+        .collect()
 }
 
 /// Sets a file or directory's mode, on the only platform this runs on.
@@ -1872,6 +2022,188 @@ mod tests {
         drop(store);
         let store = Store::open(&path).unwrap();
         assert_eq!(store.schema_version().unwrap(), Store::SCHEMA);
+    }
+
+    /// Every release since 0.1.7 has added a table to this file, and each one is a table an older database
+    /// does not have. Opening one must give it them, or the first question asked after an upgrade fails.
+    #[test]
+    fn an_older_database_gains_the_tables_added_since() {
+        let directory = std::env::temp_dir().join("flowlight-store-gains-tables");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("flowlight.db");
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta (key, value) VALUES ('schema', '6');",
+            )
+            .unwrap();
+        }
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), Store::SCHEMA);
+        // Each of these reads a table that did not exist at schema 6.
+        assert!(!store.export().unwrap().enabled);
+        assert!(!store.ask().unwrap().enabled);
+        assert!(!store.intercept().unwrap().enabled);
+        assert!(store.mocks().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    // Interception
+
+    #[test]
+    fn an_interception_that_was_never_configured_is_off() {
+        let store = Store::in_memory().unwrap();
+        let intercept = store.intercept().unwrap();
+        assert!(!intercept.enabled);
+        assert!(!intercept.running());
+        assert_eq!(intercept.port, crate::intercept::DEFAULT_PORT);
+    }
+
+    #[test]
+    fn an_interception_written_is_one_read_back() {
+        let mut store = Store::in_memory().unwrap();
+        let wanted = Intercept {
+            enabled: true,
+            port: 9999,
+            agents: vec!["claude".to_owned(), "cursor".to_owned()],
+            never: vec!["*.apple.com".to_owned()],
+        };
+        store.set_intercept(&wanted).unwrap();
+        assert_eq!(store.intercept().unwrap(), wanted);
+    }
+
+    fn mock(subject: &str, path: &str, method: &str, status: u16) -> Mock {
+        Mock {
+            id: 0,
+            enabled: true,
+            subject: flowlight_rules::Subject::parse(subject),
+            path: path.to_owned(),
+            method: method.to_owned(),
+            status,
+            headers: vec![("Retry-After".to_owned(), "30".to_owned())],
+            body: r#"{"error":"mocked"}"#.to_owned(),
+            delay: 0,
+            refusal: false,
+            note: Some("a test".to_owned()),
+        }
+    }
+
+    #[test]
+    fn a_mock_written_is_a_mock_read_back() {
+        let mut store = Store::in_memory().unwrap();
+        assert_eq!(
+            store
+                .put_mock(&mock("api.example.com", "/v1/*", "post", 503), 1_000)
+                .unwrap(),
+            Wrote::Added
+        );
+        let stored = store.mocks().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].subject.as_text(), "api.example.com");
+        assert_eq!(stored[0].path, "/v1/*");
+        // Stored uppercased, because a method is uppercase on the wire and two spellings of one method would
+        // be two rules about one request.
+        assert_eq!(stored[0].method, "POST");
+        assert_eq!(stored[0].status, 503);
+        assert_eq!(
+            stored[0].headers,
+            vec![("Retry-After".to_owned(), "30".to_owned())]
+        );
+        assert!(stored[0].id > 0);
+    }
+
+    /// Two answers for one request is a contradiction nobody wrote.
+    #[test]
+    fn a_second_mock_for_the_same_request_replaces_the_first() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .put_mock(&mock("api.example.com", "/v1/*", "POST", 503), 1_000)
+            .unwrap();
+        assert_eq!(
+            store
+                .put_mock(&mock("api.example.com", "/v1/*", "POST", 503), 1_000)
+                .unwrap(),
+            Wrote::Unchanged
+        );
+        assert_eq!(
+            store
+                .put_mock(&mock("api.example.com", "/v1/*", "POST", 429), 1_000)
+                .unwrap(),
+            Wrote::Changed
+        );
+        let stored = store.mocks().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].status, 429);
+    }
+
+    /// The order they were written in is the order they are tried in, because the first match answers.
+    #[test]
+    fn mocks_come_back_in_the_order_they_were_written() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .put_mock(&mock("*.example.com", "*", "", 500), 1_000)
+            .unwrap();
+        store
+            .put_mock(&mock("api.example.com", "*", "", 503), 2_000)
+            .unwrap();
+        let stored = store.mocks().unwrap();
+        assert_eq!(stored[0].subject.as_text(), "*.example.com");
+        assert_eq!(stored[1].subject.as_text(), "api.example.com");
+        // And that order is the one the matcher uses.
+        let chosen = flowlight_rules::mocked(&stored, "api.example.com", "GET", "/x").unwrap();
+        assert_eq!(chosen.status, 500);
+    }
+
+    #[test]
+    fn a_mock_can_be_forgotten() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .put_mock(&mock("api.example.com", "*", "", 503), 1_000)
+            .unwrap();
+        let id = store.mocks().unwrap()[0].id;
+        assert!(store.forget_mock(id).unwrap());
+        assert!(store.mocks().unwrap().is_empty());
+        assert!(!store.forget_mock(id).unwrap());
+    }
+
+    /// A status somebody typed is a number in a text field. 900 is not a status, and answering with it would
+    /// produce a response no client can read.
+    #[test]
+    fn a_status_and_a_delay_are_clamped_on_the_way_out() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO mocks (created, enabled, subject, path, method, status, headers, body, delay,
+                                    refusal, note)
+                 VALUES (1, 1, 'x.example', '*', '', 9000, '', '', 99999, 0, NULL)",
+                [],
+            )
+            .unwrap();
+        let stored = store.mocks().unwrap();
+        assert_eq!(stored[0].status, 599);
+        assert_eq!(stored[0].delay, 600);
+    }
+
+    /// A line without a colon is not a header, and is dropped rather than guessed at.
+    #[test]
+    fn headers_survive_a_round_trip_and_rubbish_does_not() {
+        let headers = vec![
+            ("Content-Type".to_owned(), "application/json".to_owned()),
+            ("Retry-After".to_owned(), "30".to_owned()),
+        ];
+        assert_eq!(headers_from(&headers_to(&headers)), headers);
+        assert!(headers_from("not a header").is_empty());
+        assert!(headers_from(": no name").is_empty());
+        assert_eq!(
+            headers_from("X-A: 1\nrubbish\nX-B: 2"),
+            vec![
+                ("X-A".to_owned(), "1".to_owned()),
+                ("X-B".to_owned(), "2".to_owned())
+            ]
+        );
     }
 
     // Ask

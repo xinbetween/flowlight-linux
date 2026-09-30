@@ -23,6 +23,7 @@
 
 mod attribution;
 mod block;
+mod redirect;
 mod tasks;
 mod tls;
 

@@ -183,7 +183,7 @@ impl Subject {
     }
 
     /// Whether this subject covers a host.
-    fn covers_host(&self, host: &str) -> bool {
+    pub fn covers_host(&self, host: &str) -> bool {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
         match self {
             Self::Anything => true,
@@ -999,5 +999,251 @@ mod tests {
         assert_eq!(Scope::parse("global"), Some(Scope::Everyone));
         assert_eq!(Scope::parse("agent:"), None);
         assert_eq!(Scope::parse("something-new"), None);
+    }
+}
+
+// MARK: Interception
+
+/// Whether a pattern with `*` in it covers a string.
+///
+/// `*` stands for any run of characters, including none. Nothing else is special: a `?` in a path is a query
+/// string, not a wildcard, and treating it as one would make `/v1/*` behave differently depending on whether
+/// the request happened to carry parameters.
+///
+/// Iterative rather than recursive, and with no backtracking stack, because this runs on a request path that
+/// somebody else chose. A pattern of alternating stars against a long path must not be a way to make the
+/// machine stop answering.
+pub fn glob(pattern: &str, subject: &str) -> bool {
+    let pattern: &[u8] = pattern.as_bytes();
+    let subject: &[u8] = subject.as_bytes();
+    let (mut p, mut s) = (0, 0);
+    // Where to resume if the current run of literal characters turns out not to match: just after the last
+    // star, with the subject one character further on than when that star was last tried.
+    let (mut star, mut resume) = (None, 0);
+    while s < subject.len() {
+        match (pattern.get(p), subject.get(s)) {
+            (Some(b'*'), _) => {
+                star = Some(p);
+                resume = s;
+                p += 1;
+            }
+            (Some(expected), Some(found)) if expected == found => {
+                p += 1;
+                s += 1;
+            }
+            _ => match star {
+                Some(at) => {
+                    p = at + 1;
+                    resume += 1;
+                    s = resume;
+                }
+                None => return false,
+            },
+        }
+    }
+    // Trailing stars match nothing at all, which is how `/v1/*` covers `/v1/`.
+    while pattern.get(p) == Some(&b'*') {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+/// A canned answer for one request: "reply to `POST api.example.com/v1/items` with a 503".
+///
+/// It exists to watch an agent cope with an API that fails, stalls, or answers with something odd, without
+/// breaking the real service or waiting for it to misbehave on its own. The first enabled rule that matches
+/// answers; everything else is relayed untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mock {
+    /// Its identifier, so `forget` can take it away.
+    pub id: i64,
+    /// Whether it answers at all.
+    pub enabled: bool,
+    /// `api.example.com` or `*.example.com`, read the same way a rule's subject is.
+    pub subject: Subject,
+    /// A glob against the path. `*` for any path.
+    pub path: String,
+    /// The method, uppercased, or empty for any.
+    pub method: String,
+    /// The status to answer with.
+    pub status: u16,
+    /// Headers, as name and value.
+    pub headers: Vec<(String, String)>,
+    /// The body.
+    pub body: String,
+    /// Seconds to wait before answering, so "the API stalls" is testable.
+    pub delay: u32,
+    /// Whether this answer is a refusal rather than a stand-in for the server.
+    ///
+    /// It changes only what the answer calls itself. The same machinery gives it, but "Flowlight refused
+    /// this" and "Flowlight pretended to be the server" are not the same thing to read in a log.
+    pub refusal: bool,
+    /// Why, for whoever reads the list later.
+    pub note: Option<String>,
+}
+
+impl Mock {
+    /// Whether this answers that request.
+    pub fn answers(&self, host: &str, method: &str, path: &str) -> bool {
+        self.enabled
+            && self.subject.covers_host(host)
+            && self.covers_method(method)
+            && glob(&self.path, path)
+    }
+
+    /// Whether this rule's method covers one. Empty and `ANY` mean every method.
+    fn covers_method(&self, method: &str) -> bool {
+        let mine = self.method.trim();
+        mine.is_empty()
+            || mine.eq_ignore_ascii_case("any")
+            || mine.eq_ignore_ascii_case("*")
+            || mine.eq_ignore_ascii_case(method)
+    }
+
+    /// How this reads in a list.
+    pub fn title(&self) -> String {
+        alloc::format!(
+            "{} {}{}",
+            if self.method.trim().is_empty() {
+                "ANY"
+            } else {
+                self.method.trim()
+            },
+            self.subject.as_text(),
+            self.path
+        )
+    }
+}
+
+/// The first enabled mock that answers a request, or nothing when it should go upstream untouched.
+pub fn mocked<'a>(mocks: &'a [Mock], host: &str, method: &str, path: &str) -> Option<&'a Mock> {
+    mocks.iter().find(|mock| mock.answers(host, method, path))
+}
+
+/// Whether any enabled mock could answer for this host.
+///
+/// Asked once per connection, before anything is framed, so a host nobody mocks does not pay for the feature
+/// — and, more to the point, is not terminated and re-encrypted for no reason.
+pub fn mocks_anything(mocks: &[Mock], host: &str) -> bool {
+    mocks
+        .iter()
+        .any(|mock| mock.enabled && mock.subject.covers_host(host))
+}
+
+#[cfg(test)]
+mod interception_tests {
+    use super::*;
+    use alloc::vec;
+
+    fn mock(subject: &str, method: &str, path: &str) -> Mock {
+        Mock {
+            id: 1,
+            enabled: true,
+            subject: Subject::parse(subject),
+            path: path.to_owned(),
+            method: method.to_owned(),
+            status: 503,
+            headers: Vec::new(),
+            body: String::new(),
+            delay: 0,
+            refusal: false,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn a_star_stands_for_any_run_of_characters() {
+        assert!(glob("*", "/anything"));
+        assert!(glob("/v1/*", "/v1/messages"));
+        assert!(glob("/v1/*", "/v1/"));
+        assert!(!glob("/v1/*", "/v2/messages"));
+        assert!(glob("*/messages", "/v1/messages"));
+        assert!(glob("/v1/*/stream", "/v1/a/b/stream"));
+        assert!(!glob("/v1/*/stream", "/v1/a/b/streaming"));
+        assert!(glob("/exact", "/exact"));
+        assert!(!glob("/exact", "/exactly"));
+    }
+
+    /// A `?` is a query string, not a wildcard. Treating it as one would make `/v1/*` behave differently
+    /// depending on whether the request happened to carry parameters.
+    #[test]
+    fn nothing_but_a_star_is_special() {
+        assert!(glob("/v1/x?a=1", "/v1/x?a=1"));
+        assert!(!glob("/v1/x?a=1", "/v1/xya=1"));
+        assert!(glob("/v1/*", "/v1/x?a=1"));
+    }
+
+    /// A pattern of alternating stars against a long path must not be a way to make the machine stop
+    /// answering. This runs in the proxy, on a path somebody else chose.
+    #[test]
+    fn a_pathological_pattern_still_finishes() {
+        let pattern = "*a*a*a*a*a*a*a*a*a*a*a*a*a*b";
+        let subject = "a".repeat(2_000);
+        assert!(!glob(pattern, &subject));
+        assert!(glob("*a*a*a*b", "aaaaaaaaaaaaaaaaaaaab"));
+    }
+
+    #[test]
+    fn a_mock_answers_what_it_names_and_nothing_else() {
+        let rule = mock("api.example.com", "POST", "/v1/*");
+        assert!(rule.answers("api.example.com", "POST", "/v1/messages"));
+        assert!(!rule.answers("api.example.com", "GET", "/v1/messages"));
+        assert!(!rule.answers("other.example.com", "POST", "/v1/messages"));
+        assert!(!rule.answers("api.example.com", "POST", "/v2/messages"));
+    }
+
+    #[test]
+    fn an_empty_method_is_every_method() {
+        for named in ["", "  ", "ANY", "any", "*"] {
+            let rule = mock("api.example.com", named, "*");
+            assert!(rule.answers("api.example.com", "DELETE", "/"), "{named}");
+        }
+        // And a named one is case-insensitive, because a method written lowercase is the same method.
+        assert!(mock("api.example.com", "post", "*").answers("api.example.com", "POST", "/"));
+    }
+
+    #[test]
+    fn a_mock_that_is_off_answers_nothing() {
+        let mut rule = mock("api.example.com", "", "*");
+        rule.enabled = false;
+        assert!(!rule.answers("api.example.com", "GET", "/"));
+        assert!(mocked(&[rule.clone()], "api.example.com", "GET", "/").is_none());
+        assert!(!mocks_anything(&[rule], "api.example.com"));
+    }
+
+    /// The first enabled rule that matches answers. Ordering is the whole of the precedence here, unlike
+    /// [`decide`], because a mock is a canned answer rather than a claim about what is allowed.
+    #[test]
+    fn the_first_matching_mock_answers() {
+        let mut first = mock("*.example.com", "", "*");
+        first.id = 1;
+        first.status = 500;
+        let mut second = mock("api.example.com", "", "*");
+        second.id = 2;
+        second.status = 503;
+        let rules = vec![first, second];
+        let chosen = mocked(&rules, "api.example.com", "GET", "/").expect("one matches");
+        assert_eq!(chosen.id, 1);
+    }
+
+    /// Asked once per connection: a host nobody mocks is not terminated and re-encrypted for no reason.
+    #[test]
+    fn a_host_nobody_mocks_is_left_alone() {
+        let rules = vec![mock("api.example.com", "", "*")];
+        assert!(mocks_anything(&rules, "api.example.com"));
+        assert!(!mocks_anything(&rules, "github.com"));
+        // A subdomain pattern covers subdomains and not the apex, exactly as a rule's subject does.
+        let rules = vec![mock("*.example.com", "", "*")];
+        assert!(mocks_anything(&rules, "a.example.com"));
+        assert!(!mocks_anything(&rules, "example.com"));
+    }
+
+    #[test]
+    fn a_title_says_what_it_matches() {
+        assert_eq!(
+            mock("api.example.com", "post", "/v1/*").title(),
+            "post api.example.com/v1/*"
+        );
+        assert_eq!(mock("*.example.com", "", "*").title(), "ANY *.example.com*");
     }
 }

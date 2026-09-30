@@ -112,6 +112,27 @@ pub enum Request {
         /// The question, in plain English.
         question: String,
     },
+    /// Whether connections are terminated, and whose.
+    Intercept,
+    /// Change what is intercepted.
+    SetIntercept {
+        /// The fields to change. Anything left out is left alone.
+        #[serde(flatten)]
+        change: crate::views::InterceptChange,
+    },
+    /// Every canned answer.
+    Mocks,
+    /// Write a canned answer.
+    WriteMock {
+        /// What it answers for.
+        #[serde(flatten)]
+        mock: crate::views::MockWrite,
+    },
+    /// Remove a canned answer.
+    ForgetMock {
+        /// The identifier.
+        id: i64,
+    },
     /// Write a rule.
     Write {
         /// `allow`, `ask` or `block`.
@@ -176,7 +197,13 @@ pub struct Hello {
 ///
 /// `owner` is the user the socket belongs to — the one who ran `sudo`, when there was one. Root otherwise,
 /// which on a machine with no desktop session is the honest answer.
-pub fn serve(path: &Path, database: PathBuf, owner: (u32, u32), hello: Hello) -> Result<()> {
+pub fn serve(
+    path: &Path,
+    database: PathBuf,
+    certificates: PathBuf,
+    owner: (u32, u32),
+    hello: Hello,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -197,13 +224,19 @@ pub fn serve(path: &Path, database: PathBuf, owner: (u32, u32), hello: Hello) ->
 
     std::thread::Builder::new()
         .name("flowlight-control".to_owned())
-        .spawn(move || accept(&listener, &database, owner.0, &hello))
+        .spawn(move || accept(&listener, &database, &certificates, owner.0, &hello))
         .context("starting the control thread")?;
     Ok(())
 }
 
 /// Answers connections until the process ends.
-fn accept(listener: &UnixListener, database: &Path, owner: u32, hello: &Hello) {
+fn accept(
+    listener: &UnixListener,
+    database: &Path,
+    certificates: &Path,
+    owner: u32,
+    hello: &Hello,
+) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         match peer(&stream) {
@@ -213,6 +246,7 @@ fn accept(listener: &UnixListener, database: &Path, owner: u32, hello: &Hello) {
             _ => continue,
         }
         let database = database.to_path_buf();
+        let certificates = certificates.to_path_buf();
         let hello = Hello {
             version: hello.version.clone(),
             enforcing: hello.enforcing,
@@ -221,7 +255,7 @@ fn accept(listener: &UnixListener, database: &Path, owner: u32, hello: &Hello) {
         // A thread per connection. There is one interface, and a handful of requests a second from it.
         let _ = std::thread::Builder::new()
             .name("flowlight-client".to_owned())
-            .spawn(move || converse(stream, &database, &hello));
+            .spawn(move || converse(stream, &database, &certificates, &hello));
     }
 }
 
@@ -248,7 +282,7 @@ fn peer(stream: &UnixStream) -> Option<u32> {
 }
 
 /// Handles one connection.
-fn converse(stream: UnixStream, database: &Path, hello: &Hello) {
+fn converse(stream: UnixStream, database: &Path, certificates: &Path, hello: &Hello) {
     let Ok(writer) = stream.try_clone() else {
         return;
     };
@@ -259,7 +293,7 @@ fn converse(stream: UnixStream, database: &Path, hello: &Hello) {
         if line.trim().is_empty() {
             continue;
         }
-        let reply = answer(&line, database, hello);
+        let reply = answer(&line, database, certificates, hello);
         if writeln!(writer, "{reply}").is_err() || writer.flush().is_err() {
             return;
         }
@@ -267,8 +301,8 @@ fn converse(stream: UnixStream, database: &Path, hello: &Hello) {
 }
 
 /// One request, one line of reply.
-fn answer(line: &str, database: &Path, hello: &Hello) -> String {
-    match handle(line, database, hello) {
+fn answer(line: &str, database: &Path, certificates: &Path, hello: &Hello) -> String {
+    match handle(line, database, certificates, hello) {
         Ok(payload) => format!(r#"{{"ok":{payload}}}"#),
         // The message goes to the interface, because the interface is the only thing looking, and it is
         // this machine's own error about this machine's own database shown to somebody who has already
@@ -287,7 +321,7 @@ struct Failure {
 }
 
 /// Does what was asked and returns the payload as JSON.
-fn handle(line: &str, database: &Path, hello: &Hello) -> Result<String> {
+fn handle(line: &str, database: &Path, certificates: &Path, hello: &Hello) -> Result<String> {
     let request: Request = serde_json::from_str(line)
         .context("reading the request; it is one JSON object per line")?;
     let now = crate::views::now();
@@ -303,7 +337,10 @@ fn handle(line: &str, database: &Path, hello: &Hello) -> Result<String> {
         | Request::Forget { .. }
         | Request::SetBudget { .. }
         | Request::SetExport { .. }
-        | Request::SetModel { .. } => Store::open(database)?,
+        | Request::SetModel { .. }
+        | Request::SetIntercept { .. }
+        | Request::WriteMock { .. }
+        | Request::ForgetMock { .. } => Store::open(database)?,
         _ => Store::open_read_only(database)?,
     };
 
@@ -338,6 +375,20 @@ fn handle(line: &str, database: &Path, hello: &Hello) -> Result<String> {
             serde_json::to_string(&crate::views::set_budget(&mut store, &change, now)?)?
         }
         Request::Export => serde_json::to_string(&crate::views::export(&mut store)?)?,
+        Request::Intercept => serde_json::to_string(&crate::views::intercept(
+            &mut store,
+            crate::history::authority_paths(database, certificates),
+        )?)?,
+        Request::SetIntercept { change } => serde_json::to_string(&crate::views::set_intercept(
+            &mut store,
+            &change,
+            crate::history::authority_paths(database, certificates),
+        )?)?,
+        Request::Mocks => serde_json::to_string(&crate::views::mocks(&mut store)?)?,
+        Request::WriteMock { mock } => {
+            serde_json::to_string(&crate::views::write_mock(&mut store, &mock, now)?)?
+        }
+        Request::ForgetMock { id } => serde_json::to_string(&store.forget_mock(id)?)?,
         Request::Model => serde_json::to_string(&crate::views::ask(
             &mut store,
             crate::asking::have_key(database),
@@ -444,6 +495,14 @@ pub fn intended_owner() -> (u32, u32) {
 mod tests {
     use super::*;
 
+    /// The socket's answer, for a test that does not care where certificates are published.
+    ///
+    /// One helper rather than eleven call sites: the last time this signature grew it grew in eleven places,
+    /// and two of them were wrong.
+    fn answered(line: &str, database: &Path) -> String {
+        answer(line, database, Path::new("/nonexistent"), &hello())
+    }
+
     fn hello() -> Hello {
         Hello {
             version: "test".to_owned(),
@@ -454,13 +513,13 @@ mod tests {
 
     #[test]
     fn a_request_that_is_not_json_is_refused_with_a_reason() {
-        let reply = answer("not json", Path::new("/nonexistent"), &hello());
+        let reply = answered("not json", Path::new("/nonexistent"));
         assert!(reply.contains("one JSON object per line"), "{reply}");
     }
 
     #[test]
     fn hello_needs_no_database() {
-        let reply = answer(r#"{"op":"hello"}"#, Path::new("/nonexistent"), &hello());
+        let reply = answered(r#"{"op":"hello"}"#, Path::new("/nonexistent"));
         assert!(reply.contains(r#""version":"test""#), "{reply}");
         assert!(reply.contains(r#""enforcing":true"#), "{reply}");
     }
@@ -472,10 +531,9 @@ mod tests {
         let directory = std::env::temp_dir().join("flowlight-control-action");
         let _ = std::fs::remove_dir_all(&directory);
         let database = directory.join("flowlight.db");
-        let reply = answer(
+        let reply = answered(
             r#"{"op":"write","action":"maybe","subject":"example.com"}"#,
             &database,
-            &hello(),
         );
         assert!(reply.contains("not allow, ask or block"), "{reply}");
 
@@ -489,10 +547,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         let database = directory.join("flowlight.db");
 
-        let reply = answer(
+        let reply = answered(
             r#"{"op":"write","action":"block","subject":"example.com","agent":"claude"}"#,
             &database,
-            &hello(),
         );
         assert!(reply.contains("added"), "{reply}");
 
@@ -504,7 +561,7 @@ mod tests {
 
         // And it can be taken away again by the identifier the interface was given.
         let forget = format!(r#"{{"op":"forget","id":{}}}"#, rules[0].id);
-        assert!(answer(&forget, &database, &hello()).contains("true"));
+        assert!(answered(&forget, &database).contains("true"));
     }
 
     /// Asking a question of a database that does not exist is a missing answer, not a created file: a
@@ -515,7 +572,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
         let database = directory.join("flowlight.db");
-        let reply = answer(r#"{"op":"rules"}"#, &database, &hello());
+        let reply = answered(r#"{"op":"rules"}"#, &database);
         assert!(reply.contains("error"), "{reply}");
         assert!(!database.exists());
     }
@@ -529,13 +586,12 @@ mod tests {
         // Brought into being by a write, as the daemon would.
         drop(Store::open(&database).unwrap());
 
-        let reply = answer(r#"{"op":"budget"}"#, &database, &hello());
+        let reply = answered(r#"{"op":"budget"}"#, &database);
         assert!(reply.contains(r#""paths":"full""#), "{reply}");
 
-        let reply = answer(
+        let reply = answered(
             r#"{"op":"set-budget","paths":"none","payloads":false}"#,
             &database,
-            &hello(),
         );
         assert!(reply.contains(r#""paths":"none""#), "{reply}");
         assert!(reply.contains(r#""payloads":false"#), "{reply}");
@@ -576,10 +632,9 @@ mod tests {
             store.flush().unwrap();
         }
 
-        let reply = answer(
+        let reply = answered(
             r#"{"op":"simulate","action":"block","subject":"telemetry.example"}"#,
             &database,
-            &hello(),
         );
         assert!(reply.contains(r#""after":"block""#), "{reply}");
         assert!(reply.contains(r#""occurrences":1"#), "{reply}");

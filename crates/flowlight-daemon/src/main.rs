@@ -17,11 +17,13 @@ mod control;
 mod exporting;
 mod history;
 mod http2;
+mod intercepting;
 mod libraries;
 mod payload;
 mod record;
 mod spending;
 mod tracefs;
+mod trusting;
 mod ui;
 mod views;
 
@@ -66,6 +68,12 @@ const RESCAN: Duration = Duration::from_secs(5);
 /// Where the database lives, unless told otherwise. Under `/var/lib` rather than a home directory because
 /// this daemon runs as root and watches the whole machine, so it is not any one user's data.
 const DEFAULT_DATABASE: &str = "/var/lib/flowlight/flowlight.db";
+
+/// Where the certificate anything has to trust is published, unless told otherwise.
+///
+/// Under `/usr/local/share` because it is a file this machine's administrator put there, which is exactly what
+/// that directory is for — and because it is readable by everybody, which a certificate has to be.
+const DEFAULT_CERTIFICATES: &str = "/usr/local/share/flowlight";
 
 /// How often expired detail is folded into the summary and removed.
 const SWEEP: Duration = Duration::from_secs(3600);
@@ -173,6 +181,27 @@ struct Args {
     #[arg(long)]
     no_block: bool,
 
+    /// Where the interception proxy listens, when interception is on.
+    ///
+    /// Loopback, always. It is reached only by the kernel's own redirect, so there is nothing to be gained by
+    /// putting it anywhere else and a great deal to lose.
+    #[arg(long, value_name = "PORT", default_value_t = flowlight_store::intercept::DEFAULT_PORT)]
+    intercept_port: u16,
+
+    /// Where the certificate anything has to trust is published.
+    ///
+    /// Not beside the database: that directory is root's alone, and an agent runs as a person who has to be
+    /// able to read the certificate they are being asked to trust.
+    #[arg(long, value_name = "PATH", default_value = DEFAULT_CERTIFICATES, global = true)]
+    certificates: PathBuf,
+
+    /// Do not intercept, whatever the configuration says.
+    ///
+    /// Interception is the one thing Flowlight does that changes what an application sees, so there is a flag
+    /// that takes it off the table for a whole run rather than only a setting in a database.
+    #[arg(long)]
+    no_intercept: bool,
+
     /// How often a batch is sent to whatever export is configured.
     ///
     /// Ten seconds unless told otherwise. Shorter is for a test that cannot wait; much shorter would make
@@ -267,6 +296,74 @@ enum Command {
         /// Stop sending, keeping the destination and the agreement.
         #[arg(long)]
         off: bool,
+    },
+    /// Whether Flowlight terminates connections, and whose.
+    ///
+    /// The one thing here that changes what an application sees. Off, and off by default. With no options,
+    /// says what is configured and what turning it on would mean.
+    Intercept {
+        /// Turn it on.
+        #[arg(long)]
+        on: bool,
+        /// Turn it off, keeping the scope.
+        #[arg(long)]
+        off: bool,
+        /// An agent whose connections are redirected. May be repeated; replaces the whole scope.
+        #[arg(long = "agent", value_name = "NAME")]
+        agents: Vec<String>,
+        /// A host never terminated, whatever else says so. May be repeated; replaces the whole list.
+        #[arg(long = "never", value_name = "HOST")]
+        never: Vec<String>,
+    },
+    /// What anything has to be told in order to trust Flowlight's certificate.
+    ///
+    /// Says what it can do and does it; says what it cannot and gives you the exact commands. Nothing here
+    /// touches a trust store without being asked.
+    Trust {
+        /// Install the certificate into the machine's trust store.
+        #[arg(long)]
+        install: bool,
+        /// Take it out again.
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Answer a request with something canned instead of passing it to the server.
+    ///
+    /// Needs interception, which `intercept` turns on. The first answer that matches a request wins.
+    Mock {
+        /// The host or `*.domain`, as a rule's subject is written.
+        subject: String,
+        /// A glob against the path. Every path by default.
+        #[arg(long, default_value = "*")]
+        path: String,
+        /// The method. Every method by default.
+        #[arg(long, default_value = "")]
+        method: String,
+        /// The status to answer with.
+        #[arg(long, default_value_t = 503)]
+        status: u16,
+        /// A header, as `Name: value`. May be repeated.
+        #[arg(long = "header", value_name = "NAME: VALUE")]
+        headers: Vec<String>,
+        /// The body.
+        #[arg(long, default_value = "")]
+        body: String,
+        /// Seconds to wait before answering, so "the API stalls" is testable.
+        #[arg(long, default_value_t = 0)]
+        delay: u32,
+        /// Call it a refusal rather than a stand-in for the server.
+        #[arg(long)]
+        refusal: bool,
+        /// Why, for whoever reads the list later.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Every canned answer, with the identifiers `forget-mock` takes.
+    Mocks,
+    /// Remove a canned answer.
+    ForgetMock {
+        /// The identifier, as `mocks` prints it.
+        id: i64,
     },
     /// Which model answers questions about this machine.
     ///
@@ -377,6 +474,8 @@ enum Message {
     Blocked(Box<BlockEvent>),
     /// A process wrote or read plaintext.
     Payload(Box<TlsChunk>),
+    /// The proxy decided about a redirected connection.
+    Intercepted(Box<intercepting::Happened>),
     /// The kernel had something to report and nowhere to put it.
     ///
     /// Carried rather than swallowed. A tool whose entire claim is "this is what your machine did" has to be
@@ -388,7 +487,7 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     if let Some(command) = &args.command {
-        return history::run(command, &args.database, args.json);
+        return history::run(command, &args.database, &args.certificates, args.json);
     }
 
     // Checked here, before anything is loaded or attached, so that a mistyped address fails in a tenth of a
@@ -466,6 +565,47 @@ fn main() -> anyhow::Result<()> {
     if !args.no_payloads {
         spawn_readers(&mut ebpf, "TLS_EVENTS", Kind::Payload, &sender)?;
     }
+    // Interception, which is the one thing here that changes what an application sees. Attached after the
+    // blocking programs on purpose: the kernel runs them in the order they were attached, blocking decides
+    // about the address in the context and redirect changes it, so the other order would quietly disable
+    // blocking for everything in interception's scope.
+    let mut intercepting = if args.no_intercept || args.no_store {
+        if args.no_intercept {
+            eprintln!("not intercepting: --no-intercept. Nothing will be terminated.");
+        }
+        None
+    } else {
+        match intercepting::Interception::attach(
+            &mut ebpf,
+            Path::new(CGROUP_ROOT),
+            &args.database,
+            &args.certificates,
+            &machine_name(),
+        ) {
+            Ok(mut ready) => match take_originals(&mut ebpf).and_then(|originals| {
+                intercepting::sensible_port(args.intercept_port)
+                    .and_then(|port| ready.listen(port, originals, &sender))
+            }) {
+                Ok(port) => {
+                    eprintln!(
+                        "interception is available: a proxy on 127.0.0.1:{port}. Nothing is redirected                          until a rule and a scope say so — `flowlightd intercept` says what would happen."
+                    );
+                    Some(ready)
+                }
+                Err(err) => {
+                    eprintln!("not intercepting: {err:#}. Watching continues.");
+                    None
+                }
+            },
+            // Not fatal, like blocking. A kernel that will not take these programs is a machine that cannot
+            // intercept, which is a reason to say so rather than a reason to stop watching.
+            Err(err) => {
+                eprintln!("not intercepting: {err:#}. Watching continues.");
+                None
+            }
+        }
+    };
+
     // Every remaining sender lives in a reader thread. Dropping ours means the channel closes if they all
     // die, rather than leaving the main loop waiting on threads that are not coming back.
     drop(sender);
@@ -536,7 +676,13 @@ fn main() -> anyhow::Result<()> {
                 enforcing: enforcing.is_some(),
                 storing: true,
             };
-            match control::serve(&args.socket, args.database.clone(), owner, hello) {
+            match control::serve(
+                &args.socket,
+                args.database.clone(),
+                args.certificates.clone(),
+                owner,
+                hello,
+            ) {
                 Ok(()) => eprintln!(
                     "interface socket at {}, owned by uid {}",
                     args.socket.display(),
@@ -601,7 +747,31 @@ fn main() -> anyhow::Result<()> {
         store.as_mut(),
         enforcing.as_mut(),
         spending.as_mut(),
+        intercepting.as_mut(),
     )
+}
+
+/// What this machine is called, for the certificate authority's name.
+///
+/// A certificate somebody finds in a trust store two years from now should say where it came from without
+/// anybody having to guess.
+fn machine_name() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|name| name.trim().to_owned())
+        .ok()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "this machine".to_owned())
+}
+
+/// Takes the map the kernel writes redirected destinations into.
+fn take_originals(
+    ebpf: &mut Ebpf,
+) -> anyhow::Result<aya::maps::HashMap<aya::maps::MapData, u16, flowlight_common::redirect::Original>>
+{
+    let map = ebpf
+        .take_map("ORIGINALS")
+        .ok_or_else(|| anyhow!("the compiled program has no ORIGINALS map"))?;
+    Ok(aya::maps::HashMap::try_from(map)?)
 }
 
 /// Which map a reader thread is draining, and therefore what its records are.
@@ -647,6 +817,7 @@ fn run(
     mut store: Option<&mut Store>,
     mut enforcing: Option<&mut Blocking>,
     mut spending: Option<&mut Spending>,
+    mut intercepting: Option<&mut intercepting::Interception>,
 ) -> anyhow::Result<()> {
     let deadline = args
         .seconds
@@ -732,6 +903,42 @@ fn run(
             eprintln!("the budget changed:");
             for line in budget.describe(now()) {
                 eprintln!("  {line}");
+            }
+        }
+
+        // On the same timer as the rules, and for the same reason: a mock somebody just wrote should take
+        // effect without them restarting anything.
+        //
+        // Needs the enforcing half as well, and not only for the numbering: which processes belong to an
+        // agent is written into the kernel by the blocking module and by the fork tracepoint it attaches. With
+        // `--no-block` there are no marks at all, so there is nothing for a scope to match and interception
+        // cannot work however it is configured.
+        if let (Some(store), Some(intercepting), Some(enforcing)) = (
+            store.as_deref_mut(),
+            intercepting.as_deref_mut(),
+            enforcing.as_deref_mut(),
+        ) && Instant::now() >= next_rules
+        {
+            match (store.intercept(), store.mocks()) {
+                (Ok(intercept), Ok(mocks)) => {
+                    // The agent numbering is the blocking module's, shared on purpose: two numberings for one
+                    // agent would be a scope naming a different process from the rules.
+                    match intercepting.apply(&intercept, mocks, |agent| enforcing.identity(agent)) {
+                        Ok(true) => {
+                            for line in intercept.disclose() {
+                                eprintln!("  {line}");
+                            }
+                            if let Some(reason) = intercept.why_not() {
+                                eprintln!("not intercepting: {reason}");
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(err) => eprintln!("could not change what is intercepted: {err:#}"),
+                    }
+                }
+                (Err(err), _) | (_, Err(err)) => {
+                    eprintln!("could not read what is intercepted: {err:#}");
+                }
             }
         }
 
@@ -858,6 +1065,25 @@ fn run(
                     keep(store.record_connection(record.stored(now())));
                 }
                 render(&mut stdout, args.json, &record, &record.human())?;
+            }
+            Ok(Message::Intercepted(happened)) => {
+                let (kind, subject, detail) = happened.describe();
+                let agent = agents.of(happened.tgid);
+                if happened.is_worth_keeping() {
+                    if let Some(store) = store.as_deref_mut() {
+                        keep(store.record_note(&kind, &subject, &detail));
+                    }
+                    eprintln!(
+                        "{subject}: {detail}{}",
+                        agent
+                            .as_deref()
+                            .map(|agent| format!(" (for {agent})"))
+                            .unwrap_or_default()
+                    );
+                } else if args.all {
+                    eprintln!("{subject}: {detail}");
+                }
+                continue;
             }
             Ok(Message::Connection(event)) => {
                 let exe = executable_of(event.tgid);

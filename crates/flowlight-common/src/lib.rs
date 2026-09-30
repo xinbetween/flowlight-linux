@@ -29,5 +29,6 @@ pub mod identity;
 pub mod procmaps;
 #[cfg(feature = "alloc")]
 pub mod redact;
+pub mod redirect;
 pub mod tls;
 pub mod tracepoint;
