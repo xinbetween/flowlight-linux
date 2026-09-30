@@ -1,0 +1,14 @@
+#!/bin/sh
+# What is left behind, and what is not.
+set -e
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+# `purge` means the person asked for everything to go. `remove` leaves the history alone: somebody removing a
+# package is usually not asking for the record of what their machine has been doing to be deleted.
+if [ "$1" = purge ]; then
+    rm -rf /var/lib/flowlight /usr/local/share/flowlight
+    echo "Removed Flowlight's database and its certificate authority."
+fi

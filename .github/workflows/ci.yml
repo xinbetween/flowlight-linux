@@ -95,6 +95,24 @@ jobs:
       # The part that cannot be faked. Loads the programs into a real kernel, attaches them, makes real
       # requests, and insists on finding them: the connection with the right process and port, and the
       # request itself in the clear.
+      # Built and then installed on the machine that built it, which is the only way to find out whether a
+      # package works: a `.deb` that unpacks is not a `.deb` that installs.
+      - name: Build the packages and install them
+        run: |
+          set -euo pipefail
+          ./packaging/deb/build.sh 0.0.0-ci amd64
+          ls -l target/deb
+          sudo apt-get install -y -qq ./target/deb/flowlight_0.0.0-ci_amd64.deb
+          # Installed and not running, which is the whole point of shipping the unit disabled.
+          test -x /usr/sbin/flowlightd
+          systemctl is-enabled flowlightd && { echo "the unit is enabled; it must not be"; exit 1; } || true
+          systemctl is-active flowlightd && { echo "the daemon is running; it must not be"; exit 1; } || true
+          /usr/sbin/flowlightd --version
+          # And it comes off again without leaving the history behind, unless asked.
+          sudo apt-get remove -y -qq flowlight
+          test ! -x /usr/sbin/flowlightd
+          echo "the package installs, does not start itself, and comes off again"
+
       - name: Attribute and read a real request
         env:
           # `gh` is written in Go, so its TLS is linked into its own binary and Flowlight cannot read it.
