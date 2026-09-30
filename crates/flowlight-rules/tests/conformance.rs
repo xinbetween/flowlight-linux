@@ -139,9 +139,9 @@ fn every_case_explains_itself() {
 }
 
 /// Where the file is, from wherever the test happens to be run.
+///
+/// Not canonicalised: a path that does not exist should fail where it is read, with the name of the file in
+/// the message, rather than here with a message about a directory.
 fn path() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../conformance/rules.json")
-        .canonicalize()
-        .expect("the conformance directory should be beside the crates")
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../conformance/rules.json")
 }
