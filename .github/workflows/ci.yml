@@ -159,6 +159,14 @@ jobs:
               Release | sha256sum --check --strict )
           echo "the archive's index and Release agree with what is in the pool"
 
+      # Handed to the job that runs it inside other distributions, rather than built there: four containers
+      # each compiling the workspace would be forty minutes of CI to prove something about one binary.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: static-daemon
+          path: target/x86_64-unknown-linux-musl/release/flowlightd
+          if-no-files-found: error
+
       - name: Attribute and read a real request
         env:
           # `gh` is written in Go, so its TLS is linked into its own binary and Flowlight cannot read it.
@@ -172,3 +180,46 @@ jobs:
           # The binary that ships, rather than the one that happens to be easiest to build: if the static
           # daemon cannot load a probe, nobody wants to find that out from a release.
           ./scripts/smoke.sh target/x86_64-unknown-linux-musl/release/flowlightd
+
+  # The claim this job exists to stop anybody making on a hunch: that because the binary has no libc
+  # requirement and the library search reads `/proc`, it therefore works on Fedora. A container has no kernel
+  # of its own — these run against the runner's — so what is being tested is each distribution's *userland*:
+  # whether the binary runs on it, whether its TLS library is found where that distribution keeps it, and
+  # whether a request made by its own `curl` is read.
+  distributions:
+    needs: check
+    runs-on: ubuntu-24.04
+    strategy:
+      # Every distribution is reported, rather than the run stopping at the first one that fails: "it works
+      # everywhere except Arch" is the useful sentence, and fail-fast turns it into "it failed".
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:12
+            install: apt-get update -qq && apt-get install -y -qq curl jq ca-certificates
+          - image: fedora:41
+            install: dnf install -y -q curl jq
+          - image: archlinux:base
+            install: pacman -Sy --noconfirm --quiet curl jq
+          - image: opensuse/leap:15.6
+            install: zypper --non-interactive --quiet install curl jq
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: static-daemon
+          path: built
+
+      - name: Run it inside ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          chmod +x built/flowlightd
+          # `--privileged` because loading a BPF program needs it; the tracefs bind mount because a container
+          # gets a fresh `/sys` with tracefs not mounted, and the daemon reads one file out of it to learn the
+          # tracepoint's layout on this kernel.
+          docker run --rm --privileged --ulimit memlock=-1 \
+            -v /sys/kernel/tracing:/sys/kernel/tracing:ro \
+            -v "$PWD:/work" -w /work \
+            "${{ matrix.image }}" \
+            bash -c '${{ matrix.install }} >/dev/null && exec ./scripts/inside-a-distribution.sh built/flowlightd'
