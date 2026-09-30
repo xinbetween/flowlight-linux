@@ -474,7 +474,9 @@ pub fn set_ask(store: &mut Store, change: &AskChange, key_on_file: bool) -> Resu
     if let Some(endpoint) = &change.endpoint {
         match flowlight_store::ask::Safety::of(endpoint, configuration.kind) {
             flowlight_store::ask::Safety::Fine => {}
-            refused => bail!("{}", refused.describe(endpoint)),
+            // In the reader's language: this one is shown to whoever is configuring a model, which is the
+            // moment the refusal is about.
+            refused => bail!("{}", refused.describe(endpoint, store.speaking()?)),
         }
         configuration.endpoint = Some(endpoint.clone());
     }
