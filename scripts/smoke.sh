@@ -248,6 +248,39 @@ ask '{"op":"requests","since":600,"limit":50}' \
     || fail "the socket does not report the request that was read."
 echo "OK: the socket reports what was read"
 
+# The budget: what Flowlight is allowed to read, and for how long. Asserted while the daemon is running,
+# because the whole point of it is that it can be changed without restarting anything.
+ask '{"op":"budget"}' | jq -e '.ok.described | length == 4 and (.[0] | test("Payloads"))' >/dev/null \
+    || fail "the budget does not describe itself."
+echo "OK: the budget says what it is, in sentences"
+
+echo "Keeping only the host of each request..."
+ask '{"op":"set-budget","paths":"host-only"}' | jq -e '.ok.paths == "host-only"' >/dev/null \
+    || fail "the budget would not change."
+# The daemon reads the budget back on the same two-second timer as the rules.
+sleep 4
+curl -sS --http1.1 --max-time 10 "https://$target_host/budget-test-path" -o /dev/null
+sleep 2
+ask '{"op":"requests","since":600,"limit":200}' \
+    | jq -e '[.ok[] | select(.target == "/budget-test-path")] | length == 0' >/dev/null \
+    || fail "a path was kept after the budget said to keep only the host."
+ask '{"op":"requests","since":600,"limit":200}' \
+    | jq -e '[.ok[] | select(.target == "/\u2026")] | length > 0' >/dev/null \
+    || fail "the request was not recorded at all, which is not the same as keeping only its host."
+echo "OK: only the host is kept, and the request is still recorded"
+
+echo "Turning payload capture off..."
+before=$(ask '{"op":"requests","since":600,"limit":400}' | jq '[.ok[] | select(.process == "curl")] | length')
+ask '{"op":"set-budget","payloads":false}' | jq -e '.ok.payloads == false and .ok.reading == false' >/dev/null \
+    || fail "payload capture would not turn off."
+sleep 4
+curl -sS --http1.1 --max-time 10 "https://$target_host/after-capture-off" -o /dev/null
+sleep 2
+after=$(ask '{"op":"requests","since":600,"limit":400}' | jq '[.ok[] | select(.process == "curl")] | length')
+[ "$before" = "$after" ] \
+    || fail "payloads were still read after capture was turned off ($before then $after)."
+echo "OK: nothing is read once capture is off, and the kernel is what stops it"
+
 # The interface, while it is still up. The daemon flushes a partial batch once a second, so the page sees
 # what was just read rather than what was read a batch ago.
 sleep 2

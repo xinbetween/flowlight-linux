@@ -98,21 +98,46 @@ Flowlight looked it up, so the name is the one the kernel captured, which it cut
 
 Nothing is modified.
 
-### What is kept, and for how long
+### What is read, and for how long
 
-Two tiers, both with a number attached, and both printed at startup rather than left in a manual:
+Up to 0.2.3 the answer was "everything, forever". That is defensible for a tool somebody has just started
+and indefensible for one that has been running since March.
 
-- **Detail** — every connection and every request, for **seven days**. Hosts, paths, methods, statuses, byte
-  counts. The tier that answers *what happened*.
-- **Summary** — one row per day per process per host, for **ninety days**. Counts and totals, no paths. The
-  tier that answers *is this normal*, and what the detail is folded into rather than what replaces it after
-  the fact.
+```sh
+sudo ./target/release/flowlightd budget
+```
 
-Nothing is kept forever. The database is created mode `600` in a directory mode `700`, because it holds every
-host every process on the machine reached — on a shared machine, a list of what everyone was doing. Credentials
-are redacted before a record is made, so they are not in it either.
+```text
+Payloads are being read for another 7 hours and 12 minutes.
+After 64 MB in a day, a process stops having its payloads captured until tomorrow.
+Request paths are kept in full, with credentials removed from them.
+Individual requests are kept for 7 days, and a daily summary for 90 days.
+```
 
-`--no-store` keeps nothing at all.
+Four limits, each a number rather than a principle:
+
+- **A session.** Payload capture stops after eight hours unless it is renewed. You turned this on to look at
+  something; it should not still be reading your traffic next week. The kernel is what stops — a switch it
+  checks *before* anything is copied out of an application's memory.
+- **A daily ceiling per process.** After 64 MB in a day, that process stops having its payloads captured
+  until tomorrow. Its connections are still attributed. One chatty program should not be able to fill a
+  disk, and nothing needs a gigabyte of somebody's traffic to be useful.
+- **What of a request is kept.** The whole path, the host only, or neither. Credentials are already removed;
+  a path can still say more about what somebody was doing than they would choose to write down.
+- **Retention.** Seven days of detail, ninety of summary, folded into the summary rather than deleted.
+
+```sh
+sudo ./target/release/flowlightd budget --paths host-only
+sudo ./target/release/flowlightd budget --session 120 --daily 16
+sudo ./target/release/flowlightd budget --payloads no
+sudo ./target/release/flowlightd budget --renew
+```
+
+The **Budget** page in the window does the same, and a running daemon picks any change up within a couple of
+seconds. `--no-store` keeps nothing at all, and reads no payloads either.
+
+The database is created mode `600` in a directory mode `700`, because it holds every host every process on
+the machine reached — on a shared machine, a list of what everyone was doing.
 
 Useful flags:
 
@@ -131,11 +156,11 @@ Useful flags:
 | `--no-block` | do not enforce rules; nothing is refused whatever the rules say |
 | `--database PATH` | where to keep what is seen. Default `/var/lib/flowlight/flowlight.db` |
 | `--no-store` | keep nothing; watch the terminal and let it scroll |
-| `--retention-days N` | days of individual requests. Default 7 |
-| `--summary-days N` | days of the daily summary. Default 90 |
+
 
 Plus subcommands that read the database rather than the kernel — `history --since 6h`, `agents`, `summary`,
-`coverage --since 24h` — and six for rules: `block`, `allow`, `ask`, `simulate`, `rules`, `forget`. `--json` works on
+`coverage --since 24h`, `budget` — and six for rules: `block`, `allow`, `ask`, `simulate`, `rules`,
+`forget`. `--json` works on
 all of them.
 
 If it refuses to start, the message says why — an unmounted tracefs, a kernel built without the tracepoint,
@@ -329,8 +354,8 @@ A native window, GTK4, running **as you** while the daemon runs as root.
 flowlight
 ```
 
-Four pages — **Live**, **Agents**, **Rules**, **Coverage** — and a window selector from fifteen minutes to
-seven days. On the Agents page each host an agent reached carries the two buttons the macOS build settled
+Five pages — **Live**, **Agents**, **Rules**, **Coverage**, **Budget** — and a window selector from fifteen
+minutes to seven days. On the Agents page each host an agent reached carries the two buttons the macOS build settled
 on: block it **for this agent**, or block it **everywhere**.
 
 #### Why it is two programs

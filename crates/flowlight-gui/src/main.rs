@@ -24,6 +24,9 @@ const REFRESH_SECONDS: u32 = 2;
 /// How many recent requests to show.
 const RECENT: usize = 300;
 
+/// How many pages the switcher has.
+const PAGES: usize = 5;
+
 /// The windows the picker offers, and what each means in seconds.
 const WINDOWS: &[(&str, i64)] = &[
     ("Last 15 minutes", 900),
@@ -63,14 +66,14 @@ struct State {
     window: i64,
     /// What each page last drew, so that a second identical answer does not throw away the scroll
     /// position somebody was reading from.
-    drawn: RefCell<[String; 4]>,
+    drawn: RefCell<[String; PAGES]>,
 }
 
 fn build(application: &adw::Application, socket: PathBuf) {
     let state = Rc::new(State {
         socket,
         window: WINDOWS.get(1).map_or(3_600, |(_, seconds)| *seconds),
-        drawn: RefCell::new([String::new(), String::new(), String::new(), String::new()]),
+        drawn: RefCell::new(Default::default()),
     });
     let window_seconds = Rc::new(RefCell::new(state.window));
 
@@ -79,6 +82,7 @@ fn build(application: &adw::Application, socket: PathBuf) {
     let agents = page(&stack, "agents", "Agents", "system-users-symbolic");
     let rules = page(&stack, "rules", "Rules", "security-high-symbolic");
     let coverage = page(&stack, "coverage", "Coverage", "dialog-question-symbolic");
+    let budget = page(&stack, "budget", "Budget", "emblem-important-symbolic");
 
     let picker =
         gtk::DropDown::from_strings(&WINDOWS.iter().map(|(label, _)| *label).collect::<Vec<_>>());
@@ -124,8 +128,7 @@ fn build(application: &adw::Application, socket: PathBuf) {
             if let Some((_, seconds)) = WINDOWS.get(picker.selected() as usize) {
                 *window_seconds.borrow_mut() = *seconds;
                 // A different window is different data, so nothing that was drawn still stands.
-                *state.drawn.borrow_mut() =
-                    [String::new(), String::new(), String::new(), String::new()];
+                *state.drawn.borrow_mut() = Default::default();
             }
         });
     }
@@ -153,7 +156,7 @@ fn build(application: &adw::Application, socket: PathBuf) {
         loop {
             let seconds = *window_seconds.borrow();
             refresh(
-                &state, seconds, &stack, &status, &live, &agents, &rules, &coverage,
+                &state, seconds, &stack, &status, &live, &agents, &rules, &coverage, &budget,
             )
             .await;
             glib::timeout_future_seconds(REFRESH_SECONDS).await;
@@ -199,6 +202,7 @@ async fn refresh(
     agents: &gtk::Box,
     rules: &gtk::Box,
     coverage: &gtk::Box,
+    budget: &gtk::Box,
 ) {
     let visible = stack.visible_child_name().unwrap_or_else(|| "live".into());
     let socket = state.socket.clone();
@@ -224,6 +228,17 @@ async fn refresh(
             }
             Err(err) => say(status, &err),
         },
+        "budget" => {
+            match fetch::<protocol::Budget>(socket, r#"{"op":"budget"}"#.to_owned()).await {
+                Ok(row) => {
+                    draw(state, 4, &row, budget, |column| {
+                        render_budget(state, column, &row);
+                    });
+                    say(status, "");
+                }
+                Err(err) => say(status, &err),
+            }
+        }
         "coverage" => {
             match fetch::<Coverage>(socket, protocol::windowed("coverage", seconds)).await {
                 Ok(row) => {
@@ -549,7 +564,7 @@ fn block_button(
             )
             .await;
             // Whatever happened, what is on screen no longer reflects the rules.
-            *state.drawn.borrow_mut() = [String::new(), String::new(), String::new(), String::new()];
+            *state.drawn.borrow_mut() = Default::default();
         });
     });
     button
@@ -607,8 +622,7 @@ fn render_rules(state: &Rc<State>, column: &gtk::Box, rows: &[Rule]) {
             let state = Rc::clone(&state);
             glib::spawn_future_local(async move {
                 let _: Result<bool, String> = fetch(socket, request).await;
-                *state.drawn.borrow_mut() =
-                    [String::new(), String::new(), String::new(), String::new()];
+                *state.drawn.borrow_mut() = Default::default();
             });
         });
         entry.add_suffix(&forget);
@@ -735,4 +749,160 @@ fn nothing(title: &str, about: &str) -> adw::StatusPage {
         .description(about)
         .vexpand(true)
         .build()
+}
+
+/// The budget: what Flowlight is allowed to read, and for how long.
+///
+/// The sentences first, the controls after. Somebody arriving here wants to know what is happening before
+/// they want a switch, and seven numbers do not tell them.
+fn render_budget(state: &Rc<State>, column: &gtk::Box, row: &protocol::Budget) {
+    let said = adw::PreferencesGroup::builder()
+        .title("What is being read")
+        .build();
+    for sentence in &row.described {
+        said.add(&adw::ActionRow::builder().title(sentence).build());
+    }
+    column.append(&said);
+
+    let controls = adw::PreferencesGroup::builder()
+        .title("Limits")
+        .description(
+            "Changing one of these changes only that one. A running daemon picks it up within a couple of \
+             seconds.",
+        )
+        .build();
+
+    let payloads = adw::SwitchRow::builder()
+        .title("Read payloads")
+        .subtitle(
+            "Connections are attributed either way. This decides whether what they carry is read.",
+        )
+        .active(row.payloads)
+        .build();
+    controls.add(&payloads);
+    {
+        let state = Rc::clone(state);
+        payloads.connect_active_notify(move |switch| {
+            change(&state, "payloads", &switch.is_active().to_string());
+        });
+    }
+
+    let renew = adw::ActionRow::builder()
+        .title("Session")
+        .subtitle(match row.session_remaining {
+            Some(0) => "Run out. Nothing is being read.".to_owned(),
+            Some(remaining) => format!("{} left.", duration(remaining)),
+            None => "No limit, which was asked for rather than assumed.".to_owned(),
+        })
+        .build();
+    let renew_button = gtk::Button::builder()
+        .label("Renew")
+        .valign(gtk::Align::Center)
+        .build();
+    {
+        let state = Rc::clone(state);
+        renew_button.connect_clicked(move |_| change(&state, "renew", "true"));
+    }
+    renew.add_suffix(&renew_button);
+    controls.add(&renew);
+
+    // Eight hours is the default and the reason it exists; the rest are the answers people actually want.
+    let choices = ["30 minutes", "2 hours", "8 hours", "24 hours", "No limit"];
+    let minutes = [30_u32, 120, 480, 1_440, 0];
+    let session = adw::ComboRow::builder()
+        .title("Stop reading after")
+        .subtitle(
+            "You turned this on to look at something. It should not still be running next week.",
+        )
+        .model(&gtk::StringList::new(&choices))
+        .build();
+    session.set_selected(
+        minutes
+            .iter()
+            .position(|candidate| *candidate == row.session_minutes)
+            .unwrap_or(2) as u32,
+    );
+    controls.add(&session);
+    {
+        let state = Rc::clone(state);
+        session.connect_selected_notify(move |combo| {
+            if let Some(chosen) = minutes.get(combo.selected() as usize) {
+                change(&state, "session_minutes", &chosen.to_string());
+            }
+        });
+    }
+
+    let paths_choices = ["The whole path", "The host only", "Neither"];
+    let paths_values = ["full", "host-only", "none"];
+    let paths = adw::ComboRow::builder()
+        .title("Keep of each request")
+        .subtitle("Credentials are already removed. A path can still say more than somebody would choose.")
+        .model(&gtk::StringList::new(&paths_choices))
+        .build();
+    paths.set_selected(
+        paths_values
+            .iter()
+            .position(|candidate| *candidate == row.paths)
+            .unwrap_or(0) as u32,
+    );
+    controls.add(&paths);
+    {
+        let state = Rc::clone(state);
+        paths.connect_selected_notify(move |combo| {
+            if let Some(chosen) = paths_values.get(combo.selected() as usize) {
+                change(&state, "paths", &format!("\"{chosen}\""));
+            }
+        });
+    }
+
+    column.append(&controls);
+
+    let keeping = adw::PreferencesGroup::builder()
+        .title("How long it is kept")
+        .description(
+            "Detail answers what happened. The summary answers whether it was normal, and is what expired \
+             detail is folded into rather than what replaces it.",
+        )
+        .build();
+    keeping.add(
+        &adw::ActionRow::builder()
+            .title("Individual requests")
+            .subtitle(format!("{} days", row.detail_days))
+            .build(),
+    );
+    keeping.add(
+        &adw::ActionRow::builder()
+            .title("Daily summary")
+            .subtitle(format!("{} days", row.summary_days))
+            .build(),
+    );
+    column.append(&keeping);
+}
+
+/// Changes one field of the budget and lets the next refresh show the result.
+fn change(state: &Rc<State>, field: &str, value: &str) {
+    let socket = state.socket.clone();
+    let request = protocol::set_budget(field, value);
+    let state = Rc::clone(state);
+    glib::spawn_future_local(async move {
+        let _: Result<serde_json::Value, String> = fetch(socket, request).await;
+        *state.drawn.borrow_mut() = Default::default();
+    });
+}
+
+/// A length of time, in words.
+fn duration(seconds: i64) -> String {
+    if seconds < 60 {
+        format!("{seconds} seconds")
+    } else if seconds < 3_600 {
+        format!("{} minutes", seconds / 60)
+    } else {
+        let hours = seconds / 3_600;
+        let minutes = (seconds % 3_600) / 60;
+        if minutes == 0 {
+            format!("{hours} hours")
+        } else {
+            format!("{hours} hours and {minutes} minutes")
+        }
+    }
 }

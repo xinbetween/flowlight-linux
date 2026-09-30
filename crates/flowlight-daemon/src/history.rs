@@ -19,7 +19,11 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
     // command is a question about history, and a missing database is the answer to it.
     let writes = matches!(
         command,
-        Command::Block(_) | Command::Allow(_) | Command::Ask(_) | Command::Forget { .. }
+        Command::Block(_)
+            | Command::Allow(_)
+            | Command::Ask(_)
+            | Command::Forget { .. }
+            | Command::Budget { .. }
     );
     if !writes && !database.exists() {
         bail!(
@@ -63,6 +67,62 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
         Command::Block(rule) => write_rule(&mut store, "block", rule)?,
         Command::Allow(rule) => write_rule(&mut store, "allow", rule)?,
         Command::Ask(rule) => write_rule(&mut store, "ask", rule)?,
+        Command::Budget {
+            payloads,
+            session,
+            renew,
+            daily,
+            paths,
+            detail_days,
+            summary_days,
+        } => {
+            let asked = payloads.is_some()
+                || session.is_some()
+                || *renew
+                || daily.is_some()
+                || paths.is_some()
+                || detail_days.is_some()
+                || summary_days.is_some();
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs() as i64);
+
+            let view = if asked {
+                let payloads = match payloads.as_deref() {
+                    None => None,
+                    Some("yes" | "true" | "on") => Some(true),
+                    Some("no" | "false" | "off") => Some(false),
+                    Some(other) => bail!("`{other}` is not yes or no"),
+                };
+                crate::views::set_budget(
+                    &mut store,
+                    &crate::views::BudgetChange {
+                        payloads,
+                        session_minutes: *session,
+                        renew: *renew,
+                        // Megabytes on the way in, bytes inside: nobody types a byte count.
+                        daily_bytes: daily.map(|megabytes| megabytes.max(0) * 1024 * 1024),
+                        paths: paths.clone(),
+                        detail_days: *detail_days,
+                        summary_days: *summary_days,
+                    },
+                    now,
+                )?
+            } else {
+                crate::views::budget(&mut store, now)?
+            };
+
+            if json {
+                writeln!(out, "{}", line(&view))?;
+            } else {
+                for sentence in &view.described {
+                    writeln!(out, "{sentence}")?;
+                }
+                if asked {
+                    eprintln!("\nA running flowlightd picks this up within a couple of seconds.");
+                }
+            }
+        }
         Command::Simulate {
             action,
             rule,

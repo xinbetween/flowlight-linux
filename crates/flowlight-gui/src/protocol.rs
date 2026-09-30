@@ -92,6 +92,29 @@ pub struct Domain {
     pub servers: Vec<String>,
 }
 
+/// What Flowlight is allowed to read, and for how long.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Budget {
+    /// Whether payloads are read at all.
+    pub payloads: bool,
+    /// Whether they are being read now, which the session can decide otherwise.
+    pub reading: bool,
+    /// Minutes before capture has to be renewed. Zero for no limit.
+    pub session_minutes: u32,
+    /// Seconds of the session left, if it ends.
+    pub session_remaining: Option<i64>,
+    /// Bytes one process may contribute in a day.
+    pub daily_bytes: i64,
+    /// `full`, `host-only` or `none`.
+    pub paths: String,
+    /// Days of individual requests.
+    pub detail_days: u32,
+    /// Days of the daily summary.
+    pub summary_days: u32,
+    /// The whole thing in sentences, which is what to show rather than seven numbers.
+    pub described: Vec<String>,
+}
+
 /// One thing a candidate rule would change.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Change {
@@ -250,6 +273,14 @@ pub fn write_rule(action: &str, subject: &str, port: u16, agent: Option<&str>) -
     format!(
         r#"{{"op":"write","action":"{action}","subject":{subject},"port":{port},"agent":{scope}}}"#
     )
+}
+
+/// Builds a request that changes one thing about the budget.
+///
+/// One field at a time. Restating the others would silently overwrite whatever somebody else had changed in
+/// between, and the daemon is explicit that anything left out is left alone.
+pub fn set_budget(field: &str, value: &str) -> String {
+    format!(r#"{{"op":"set-budget","{field}":{value}}}"#)
 }
 
 /// Builds the request that asks what a rule would change without writing it.

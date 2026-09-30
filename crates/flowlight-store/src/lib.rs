@@ -30,6 +30,10 @@
 //! It has no Linux-only dependency, so it builds and its tests run on any machine — including the ones the
 //! daemon around it cannot be compiled on. The same reason [`flowlight_common`] is a crate of its own.
 
+pub mod budget;
+
+pub use budget::{Budget, Paths};
+
 use anyhow::{Context as _, Result};
 use rusqlite::{Connection, OptionalExtension as _, params};
 use std::path::Path;
@@ -380,7 +384,7 @@ impl Store {
     }
 
     /// The schema this version of the code expects.
-    pub const SCHEMA: i64 = 4;
+    pub const SCHEMA: i64 = 5;
 
     /// Creates the schema, or brings an older one up to it.
     ///
@@ -433,6 +437,10 @@ impl Store {
                 requests INTEGER NOT NULL,
                 bytes    INTEGER NOT NULL,
                 PRIMARY KEY (day, process, host)
+            );
+            CREATE TABLE IF NOT EXISTS budget (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS rules (
                 id      INTEGER PRIMARY KEY,
@@ -843,6 +851,33 @@ impl Store {
                 last_seen: row.get(5)?,
             })
         })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// What Flowlight is allowed to read, and for how long.
+    ///
+    /// Defaults for anything never written, so that a database from before this existed reads as the
+    /// defaults rather than as nothing.
+    pub fn budget(&self) -> Result<Budget> {
+        budget::read(&self.connection)
+    }
+
+    /// Writes the budget.
+    pub fn set_budget(&mut self, budget: &Budget) -> Result<()> {
+        budget::write(&self.connection, budget)
+    }
+
+    /// How many bytes of payload one process has contributed on a given day.
+    ///
+    /// Read out of what was stored rather than counted in memory, so that a daemon restarted at noon does
+    /// not hand every process a fresh allowance.
+    pub fn payload_bytes_today(&mut self, day_began: i64) -> Result<Vec<(String, i64)>> {
+        self.flush()?;
+        let mut statement = self.connection.prepare(
+            "SELECT process, coalesce(sum(bytes), 0) FROM requests
+             WHERE at >= ?1 GROUP BY process",
+        )?;
+        let rows = statement.query_map(params![day_began], |row| Ok((row.get(0)?, row.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1612,6 +1647,58 @@ mod tests {
         drop(store);
         let store = Store::open(&path).unwrap();
         assert_eq!(store.schema_version().unwrap(), Store::SCHEMA);
+    }
+
+    // The budget
+
+    /// A database from before this existed must read as the defaults rather than as nothing.
+    #[test]
+    fn a_budget_that_was_never_written_is_the_default_one() {
+        let mut store = Store::in_memory().unwrap();
+        assert_eq!(store.budget().unwrap(), Budget::default());
+        let _ = &mut store;
+    }
+
+    #[test]
+    fn a_budget_written_is_a_budget_read_back() {
+        let mut store = Store::in_memory().unwrap();
+        let wanted = Budget {
+            payloads: false,
+            session_minutes: 30,
+            session_began: 1_234,
+            daily_bytes: 4_096,
+            paths: Paths::HostOnly,
+            detail_days: 2,
+            summary_days: 10,
+        };
+        store.set_budget(&wanted).unwrap();
+        assert_eq!(store.budget().unwrap(), wanted);
+    }
+
+    /// A daemon restarted at noon must not hand every process a fresh allowance, so the count comes from
+    /// what was stored rather than from memory.
+    #[test]
+    fn what_a_process_has_contributed_today_is_read_out_of_what_was_kept() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .record_request(request(1_000, "claude", "api.anthropic.com", 400))
+            .unwrap();
+        store
+            .record_request(request(1_100, "claude", "api.anthropic.com", 600))
+            .unwrap();
+        store
+            .record_request(request(1_200, "curl", "example.com", 10))
+            .unwrap();
+        // And one from yesterday, which does not count towards today.
+        store
+            .record_request(request(10, "claude", "api.anthropic.com", 9_999))
+            .unwrap();
+
+        let today = store.payload_bytes_today(500).unwrap();
+        let claude = today.iter().find(|(name, _)| name == "claude").unwrap();
+        assert_eq!(claude.1, 1_000);
+        let curl = today.iter().find(|(name, _)| name == "curl").unwrap();
+        assert_eq!(curl.1, 10);
     }
 
     // Traffic, for trying a rule against
