@@ -542,6 +542,8 @@ pub fn run(
                 bail!("there is no canned answer {id}");
             }
         }
+        // Answered before the database is opened, because it runs as a person rather than as root.
+        Command::Launch { .. } => unreachable!("launch is handled before anything is opened"),
         Command::Simulate {
             action,
             rule,

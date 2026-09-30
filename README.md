@@ -166,7 +166,8 @@ Useful flags:
 Plus subcommands that read the database rather than the kernel — `history --since 6h`, `agents`, `summary`,
 `coverage --since 24h`, `budget`, `export`, `model`, `query`, `intercept`, `trust`, `mock`, `mocks`,
 `forget-mock` — and six for rules: `block`, `allow`, `ask`, `simulate`, `rules`, `forget`. `--json` works on all
-of them.
+of them. One subcommand is not like the others: `launch` runs as you rather than as root, because the agent it
+starts has to.
 
 If it refuses to start, the message says why — an unmounted tracefs, a kernel built without the tracepoint,
 and a policy that forbids loading programs are three different problems and it will not conflate them.
@@ -405,6 +406,72 @@ sudo ./target/release/flowlightd --web
 ```
 
 and it prints its own warning, because on a shared machine it is a disclosure.
+
+### Starting an agent through Flowlight
+
+Two things have to be true before an agent makes its first request, and neither can be arranged afterwards.
+
+The **mark** — which processes belong to which agent — is written into a kernel map, and until now that happened
+on a timer: a scan notices a new agent within a second and the kernel carries the mark to everything it forks.
+That is right for a long-lived agent and has a hole at the beginning. An agent that connects immediately
+connects *unmarked*, so a rule scoped to it does not apply to that connection.
+
+The **environment** is the other. A certificate is trusted at launch by whatever started the process, and Node
+reads no trust store at all — `NODE_EXTRA_CA_CERTS` is the only way in. A variable cannot be put into a process
+that is already running, which is why `trust` can only tell you about those and this can do them.
+
+```console
+$ flowlightd launch -- claude
+starting claude, marked before it runs
+  SSL_CERT_FILE — OpenSSL, and most things that link it
+  NODE_EXTRA_CA_CERTS — Node, which reads no trust store at all
+  …
+```
+
+The order is the whole feature, and it is arranged by marking *this* process and then forking. The kernel's
+fork tracepoint copies an agent's mark from parent to child at the moment the child is created — the same
+machinery that already carries a mark from an agent to everything it starts — so the agent is marked before it
+has run an instruction. If the mark cannot be written, nothing is started at all.
+
+The obvious alternative does not work, which is worth writing down: holding the child between `fork` and
+`exec` on a pipe deadlocks, because `Command::spawn` does not return until the child execs — that is how it
+reports whether the exec succeeded. The parent would wait for the child to exec and the child for the parent
+to release it. Marking the parent needs none of that.
+
+**This is the one Flowlight command that must not be run as root.** Everything else needs it, because loading a
+probe does; this needs the opposite, since an agent started by root would run as root, read root's
+configuration and write root's files. It refuses, and says to run it as the person the agent belongs to. It
+needs no root of its own: it asks the running daemon over the interface socket, which that person owns.
+
+`--agent NAME` says what to call it; otherwise the name is worked out from the command, stepping over an
+interpreter the same way the process-tree attribution does — `node /usr/lib/claude/cli.js` is an agent called
+`claude`, not one called `node`.
+
+The agent's exit status is what `launch` exits with, so a supervisor watching exit statuses sees the agent's.
+
+#### When Flowlight cannot be the parent
+
+A desktop entry, a systemd unit, a session manager that outlives any window — sometimes the thing that starts
+agents is not something you can put `flowlightd launch` in front of. For those, the environment half is
+available on its own:
+
+```console
+$ flowlightd launch --agent claude --print-environment
+FLOWLIGHT_AGENT=claude
+NODE_EXTRA_CA_CERTS=/usr/local/share/flowlight/ca-bundle.pem
+SSL_CERT_FILE=/usr/local/share/flowlight/ca-bundle.pem
+…
+```
+
+Variables on standard output, the explanations on standard error, so something can read the one without the
+other. It says plainly that a process started this way is **not** marked: only being its parent can do that.
+
+#### Marking is checked against who is asking
+
+`launch` asks the daemon to mark a process, and that is the one request over the socket that changes something
+outside the database — so it is the one that is checked against the asker. Marking a process makes every rule
+scoped to that agent apply to it and, when interception is on, redirects its connections. Root may name any
+process; anybody else may name only their own, by real uid, read from `/proc`.
 
 ### Interception
 
