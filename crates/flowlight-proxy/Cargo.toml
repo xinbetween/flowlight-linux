@@ -9,10 +9,12 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+flowlight-agents.workspace = true
 flowlight-rules.workspace = true
 flowlight-store.workspace = true
 anyhow.workspace = true
 rcgen.workspace = true
+serde_json.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 rustls-pki-types.workspace = true

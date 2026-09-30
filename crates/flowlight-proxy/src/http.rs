@@ -745,3 +745,222 @@ mod tests {
         assert!(text.contains("connection refused"));
     }
 }
+
+// MARK: Guardrails
+
+/// How much of a request body is looked at before it is forwarded.
+///
+/// The same four kilobytes the payload probes capture, and for the same reason: a JSON-RPC envelope puts its
+/// method and its parameters at the front, and everything after that is the argument — which nothing here
+/// reads.
+pub const PEEK: usize = 4096;
+
+/// The most of a body that is held in memory in order to look at its beginning.
+///
+/// A body larger than this is forwarded without being looked at at all. That is a deliberate hole and it is
+/// the safe direction: the alternative is holding an arbitrary upload in the proxy's memory, and a guardrail
+/// that can be evaded by a sixteen-megabyte request is better than a proxy that can be stopped by one.
+pub const MOST_HELD: u64 = 16 * 1024 * 1024;
+
+/// Whether a request could be an MCP call worth looking at.
+///
+/// Asked before anything is held in memory. A GET has no body, and a body that is not JSON is not JSON-RPC,
+/// so neither is worth the copy.
+pub fn could_be_mcp(head: &Head) -> bool {
+    if !matches!(
+        head.method.to_ascii_uppercase().as_str(),
+        "POST" | "PUT" | "PATCH"
+    ) {
+        return false;
+    }
+    head.header("content-type").is_none_or(|kind| {
+        let kind = kind.to_ascii_lowercase();
+        kind.contains("json") || kind.contains("event-stream")
+    })
+}
+
+/// Reads a body into memory so that its beginning can be looked at, or says it was too big to hold.
+///
+/// The bytes come back untouched, to be forwarded exactly as they arrived. Nothing here decodes, reframes or
+/// keeps them.
+pub fn hold_body<R: BufRead>(from: &mut R, framing: Framing) -> Result<Option<Vec<u8>>> {
+    match framing {
+        Framing::Nothing => Ok(Some(Vec::new())),
+        Framing::Length(length) if length > MOST_HELD => Ok(None),
+        Framing::Length(length) => {
+            let mut held = Vec::with_capacity(length.min(64 * 1024) as usize);
+            let copied = std::io::copy(&mut from.take(length), &mut held)?;
+            if copied < length {
+                bail!("the body ended after {copied} of {length} byte(s)");
+            }
+            Ok(Some(held))
+        }
+        // A chunked body has no length to check in advance, so it is held up to the same ceiling and
+        // abandoned past it. Re-framed on the way out as one piece, which is why the length is written.
+        Framing::Chunked => {
+            let mut held = Vec::new();
+            let mut sink = std::io::Cursor::new(&mut held);
+            relay_body(from, &mut sink, Framing::Chunked)?;
+            if held.len() as u64 > MOST_HELD {
+                return Ok(None);
+            }
+            Ok(Some(held))
+        }
+        // Reading until close would mean waiting for a client that is waiting for us.
+        Framing::UntilClose => Ok(None),
+    }
+}
+
+/// A JSON-RPC error, as the answer to a call a guardrail refused.
+///
+/// An error the agent understands, not a dropped connection it will retry. A refusal that looks like a network
+/// failure teaches an agent to try again; one that looks like an answer teaches it that the tool is not
+/// available, which is what is true.
+///
+/// `-32000` is the JSON-RPC range reserved for an implementation's own errors, which this is.
+pub fn refusal_bytes(id: &str, said: &str) -> Vec<u8> {
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32000,"message":{},"data":{{"refusedBy":"flowlight"}}}}}}"#,
+        serde_json::to_string(said).unwrap_or_else(|_| "\"refused\"".to_owned())
+    );
+    let mut text = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         X-Flowlight-Guardrail: refused\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    text.push_str(&body);
+    text.into_bytes()
+}
+
+/// The `id` of the first JSON-RPC envelope in a body, as JSON, so a refusal can answer the call it refuses.
+///
+/// A JSON-RPC client matches the answer to the question by this. Getting it wrong means the agent waits for an
+/// answer that never comes, which is the same as a dropped connection and worse than an error.
+///
+/// Read as a raw token rather than parsed, because an id may be a number or a string and it is written back
+/// exactly as it arrived either way.
+pub fn envelope_id(body: &[u8]) -> String {
+    let window = body.get(..body.len().min(PEEK)).unwrap_or(body);
+    let Ok(text) = core::str::from_utf8(window) else {
+        return "null".to_owned();
+    };
+    let Some(at) = text.find("\"id\"") else {
+        return "null".to_owned();
+    };
+    let rest = text.get(at + 4..).unwrap_or_default();
+    let Some(colon) = rest.find(':') else {
+        return "null".to_owned();
+    };
+    let value = rest.get(colon + 1..).unwrap_or_default().trim_start();
+    if let Some(quoted) = value.strip_prefix('"') {
+        let end = quoted.find('"').unwrap_or(0);
+        let inner = quoted.get(..end).unwrap_or_default();
+        return serde_json::to_string(inner).unwrap_or_else(|_| "null".to_owned());
+    }
+    let end = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    match value.get(..end) {
+        Some(digits) if !digits.is_empty() => digits.to_owned(),
+        _ => "null".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod guardrail_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn head(text: &str) -> Head {
+        let mut reader = Cursor::new(text.as_bytes().to_vec());
+        read_head(&mut reader).unwrap().expect("a head")
+    }
+
+    /// Asked before anything is held in memory, so that a request nobody could have a guardrail about does
+    /// not pay for the feature.
+    #[test]
+    fn only_something_that_could_be_a_call_is_looked_at() {
+        assert!(could_be_mcp(&head(
+            "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n\r\n"
+        )));
+        // A content type nobody stated: worth looking at, because plenty of clients do not send one.
+        assert!(could_be_mcp(&head("POST /mcp HTTP/1.1\r\nHost: x\r\n\r\n")));
+        // Streaming responses to a POST are how MCP works over HTTP.
+        assert!(could_be_mcp(&head(
+            "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: text/event-stream\r\n\r\n"
+        )));
+        assert!(!could_be_mcp(&head("GET /mcp HTTP/1.1\r\nHost: x\r\n\r\n")));
+        assert!(!could_be_mcp(&head(
+            "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Type: image/png\r\n\r\n"
+        )));
+    }
+
+    #[test]
+    fn a_body_is_held_exactly_as_it_arrived() {
+        let mut reader = Cursor::new(b"{\"jsonrpc\":\"2.0\"}rest".to_vec());
+        let held = hold_body(&mut reader, Framing::Length(17))
+            .unwrap()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&held), r#"{"jsonrpc":"2.0"}"#);
+    }
+
+    /// A guardrail that can be evaded by a sixteen-megabyte request is better than a proxy that can be
+    /// stopped by one.
+    #[test]
+    fn a_body_too_large_to_hold_is_not_held() {
+        let mut reader = Cursor::new(Vec::new());
+        assert_eq!(
+            hold_body(&mut reader, Framing::Length(MOST_HELD + 1)).unwrap(),
+            None
+        );
+        assert_eq!(hold_body(&mut reader, Framing::UntilClose).unwrap(), None);
+    }
+
+    /// A JSON-RPC client matches an answer to its question by the id. Getting it wrong means the agent waits
+    /// for an answer that never comes.
+    #[test]
+    fn the_id_of_a_call_is_read_back_exactly() {
+        assert_eq!(
+            envelope_id(br#"{"jsonrpc":"2.0","id":7,"method":"tools/call"}"#),
+            "7"
+        );
+        assert_eq!(
+            envelope_id(br#"{"jsonrpc":"2.0","id":"abc","method":"tools/call"}"#),
+            "\"abc\""
+        );
+        assert_eq!(envelope_id(br#"{"id" : 42 }"#), "42");
+        // Nothing recognisable is a null id, which is what JSON-RPC says to answer when the id is unknown.
+        assert_eq!(envelope_id(b"not json at all"), "null");
+        assert_eq!(envelope_id(br#"{"method":"tools/call"}"#), "null");
+        assert_eq!(envelope_id(&[0xff, 0xfe]), "null");
+    }
+
+    /// An id that is a string has to come back as a string, quoted and escaped, or the answer is not JSON.
+    #[test]
+    fn a_string_id_comes_back_as_valid_json() {
+        let bytes = refusal_bytes(&envelope_id(br#"{"id":"a\"b"}"#), "no");
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let body = text.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let parsed: serde_json::Value =
+            serde_json::from_str(body).expect("the refusal should be JSON");
+        assert_eq!(parsed["jsonrpc"], "2.0");
+    }
+
+    /// An error the agent understands, not a dropped connection it will retry.
+    #[test]
+    fn a_refusal_is_an_answer_and_not_a_failure() {
+        let bytes = refusal_bytes("7", "claude: no write_file");
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
+        assert!(text.contains("X-Flowlight-Guardrail: refused"));
+        let body = text.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let parsed: serde_json::Value =
+            serde_json::from_str(body).expect("the refusal should be JSON");
+        assert_eq!(parsed["id"], 7);
+        assert_eq!(parsed["error"]["code"], -32000);
+        assert_eq!(parsed["error"]["message"], "claude: no write_file");
+        assert_eq!(parsed["error"]["data"]["refusedBy"], "flowlight");
+        // And the length is Flowlight's arithmetic, not anybody's claim.
+        assert!(text.contains(&format!("Content-Length: {}\r\n", body.len())));
+    }
+}

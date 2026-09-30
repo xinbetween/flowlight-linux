@@ -378,6 +378,37 @@ enum Command {
         #[arg(long)]
         note: Option<String>,
     },
+    /// Refuse a tool an agent may not use.
+    ///
+    /// The other half of the rule model: which tools an agent may use is a different question from which
+    /// hosts it may reach. Needs interception, because refusing a call means reading what the agent said.
+    ///
+    /// There is no allow. A guardrail is subtractive by nature — it is applied to a list the agent itself
+    /// declares, and "allow" would only ever mean "do not subtract this".
+    Guardrail {
+        /// The tool, or a glob like `*write*`. Every tool on the named server when left out.
+        #[arg(long, default_value = "")]
+        tool: String,
+        /// The agent this applies to. Every agent when left out.
+        #[arg(long, value_name = "NAME", default_value = "")]
+        agent: String,
+        /// The host the MCP server is at. Every server when left out.
+        #[arg(long, value_name = "HOST", default_value = "")]
+        server: String,
+        /// A resource URI or glob, for `resources/read`.
+        #[arg(long, default_value = "")]
+        resource: String,
+        /// Why, for whoever reads the list later.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Every guardrail, with how often each has refused something.
+    Guardrails,
+    /// Remove a guardrail.
+    ForgetGuardrail {
+        /// The identifier, as `guardrails` prints it.
+        id: i64,
+    },
     /// Every canned answer, with the identifiers `forget-mock` takes.
     Mocks,
     /// Remove a canned answer.
@@ -1057,11 +1088,13 @@ fn run(
             enforcing.as_deref_mut(),
         ) && Instant::now() >= next_rules
         {
-            match (store.intercept(), store.mocks()) {
-                (Ok(intercept), Ok(mocks)) => {
+            match (store.intercept(), store.mocks(), store.guardrails()) {
+                (Ok(intercept), Ok(mocks), Ok(guardrails)) => {
                     // The agent numbering is the blocking module's, shared on purpose: two numberings for one
                     // agent would be a scope naming a different process from the rules.
-                    match intercepting.apply(&intercept, mocks, |agent| enforcing.identity(agent)) {
+                    match intercepting.apply(&intercept, mocks, guardrails, |agent| {
+                        enforcing.identity(agent)
+                    }) {
                         Ok(true) => {
                             for line in intercept.disclose() {
                                 eprintln!("  {line}");
@@ -1074,7 +1107,7 @@ fn run(
                         Err(err) => eprintln!("could not change what is intercepted: {err:#}"),
                     }
                 }
-                (Err(err), _) | (_, Err(err)) => {
+                (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
                     eprintln!("could not read what is intercepted: {err:#}");
                 }
             }
@@ -1232,6 +1265,11 @@ fn run(
                 if happened.is_worth_keeping() {
                     if let Some(store) = store.as_deref_mut() {
                         keep(store.record_note(&kind, &subject, &detail));
+                        // Counted against the guardrail that made the refusal. A list of guardrails nobody
+                        // can tell has ever fired is a list nobody trusts.
+                        for id in happened.guardrails() {
+                            keep(store.record_guardrail_hit(*id, now()));
+                        }
                     }
                     eprintln!(
                         "{subject}: {detail}{}",

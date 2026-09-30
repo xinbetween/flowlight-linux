@@ -39,6 +39,11 @@ pub struct Call {
     pub method: String,
     /// The tool, for a `tools/call`. Never its arguments.
     pub tool: Option<String>,
+    /// The resource, for a `resources/read`.
+    ///
+    /// A URI is an identifier, like a tool's name, and it is what a guardrail about resources is written
+    /// against. It is not the resource's contents, which pass through here unread like every other argument.
+    pub resource: Option<String>,
 }
 
 /// What a JSON-RPC envelope carries that is worth keeping.
@@ -59,6 +64,9 @@ struct Envelope {
 struct Params {
     #[serde(default)]
     name: Option<String>,
+    /// The resource, for a `resources/read`. An identifier, not contents.
+    #[serde(default)]
+    uri: Option<String>,
 }
 
 /// Every MCP call in a payload.
@@ -106,9 +114,13 @@ fn read(bytes: &[u8]) -> Option<(Call, usize)> {
         return None;
     }
     let method = envelope.method?;
+    let (tool, resource) = envelope
+        .params
+        .map_or((None, None), |params| (params.name, params.uri));
     Some((
         Call {
-            tool: envelope.params.and_then(|params| params.name),
+            tool,
+            resource,
             method,
         },
         stream.byte_offset(),

@@ -613,12 +613,14 @@ name = "flowlight-proxy"
 version = "0.2.10"
 dependencies = [
  "anyhow",
+ "flowlight-agents",
  "flowlight-rules",
  "flowlight-store",
  "rcgen",
  "rustls",
  "rustls-pemfile",
  "rustls-pki-types",
+ "serde_json",
  "webpki-roots",
 ]
 

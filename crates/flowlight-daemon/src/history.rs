@@ -53,6 +53,8 @@ pub fn run(
             | Command::Mock { .. }
             | Command::ForgetMock { .. }
             | Command::Trust { .. }
+            | Command::Guardrail { .. }
+            | Command::ForgetGuardrail { .. }
     );
     if !writes && !database.exists() {
         bail!(
@@ -502,6 +504,81 @@ pub fn run(
                     // somebody watching a rule that cannot fire.
                     writeln!(out, "\nThis cannot answer anything yet: {reason}")?;
                 }
+            }
+        }
+        Command::Guardrail {
+            tool,
+            agent,
+            server,
+            resource,
+            note,
+        } => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs() as i64);
+            let wrote = crate::views::write_guardrail(
+                &mut store,
+                &crate::views::GuardrailWrite {
+                    agent: agent.clone(),
+                    server: server.clone(),
+                    tool: tool.clone(),
+                    resource: resource.clone(),
+                    enabled: Some(true),
+                    note: note.clone(),
+                },
+                now,
+            )?;
+            if json {
+                writeln!(out, "{}", line(&wrote))?;
+            } else {
+                writeln!(out, "{wrote}")?;
+                // A guardrail is decided in the proxy, so it does nothing until the agent's connections are
+                // being terminated. Saying so here beats somebody watching a rule that cannot fire.
+                let intercept = store.intercept()?;
+                let covered = agent.trim().is_empty()
+                    || intercept.agents.iter().any(|named| named == agent.trim());
+                if let Some(reason) = intercept.why_not() {
+                    writeln!(out, "\nThis cannot refuse anything yet: {reason}")?;
+                } else if !covered {
+                    writeln!(
+                        out,
+                        "\nThis cannot refuse anything yet: {} is not one of the agents being intercepted. \
+                         `flowlightd intercept --agent {}` adds it.",
+                        agent.trim(),
+                        agent.trim()
+                    )?;
+                }
+            }
+        }
+        Command::Guardrails => {
+            let rows = crate::views::guardrails(&mut store)?;
+            if rows.is_empty() && !json {
+                eprintln!("No guardrails. `flowlightd guardrail --tool write_file` writes one.");
+                return Ok(());
+            }
+            for row in &rows {
+                if json {
+                    writeln!(out, "{}", line(row))?;
+                } else {
+                    writeln!(
+                        out,
+                        "{:>4}  {}{}  — refused {} call(s)",
+                        row.id,
+                        row.title,
+                        if row.enabled { "" } else { " [off]" },
+                        row.hits
+                    )?;
+                }
+            }
+        }
+        Command::ForgetGuardrail { id } => {
+            let removed = store.forget_guardrail(*id)?;
+            if json {
+                writeln!(out, "{}", line(&removed))?;
+            } else if removed {
+                writeln!(out, "forgotten")?;
+            } else {
+                bail!("there is no guardrail {id}");
             }
         }
         Command::Mocks => {
