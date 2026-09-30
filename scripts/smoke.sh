@@ -646,15 +646,19 @@ echo "OK: turning it off stops questions being answered"
 sudo "$binary" --database "$database" --certificates "$certificates" model --model smoke-model >/dev/null
 
 echo "Turning payload capture off..."
-before=$(ask '{"op":"requests","since":600,"limit":400}' | jq '[.ok[] | select(.process == "curl")] | length')
 ask '{"op":"set-budget","payloads":false}' | jq -e '.ok.payloads == false and .ok.reading == false' >/dev/null \
     || fail "payload capture would not turn off."
+# The daemon reads the budget back on the same two-second timer as the rules.
 sleep 4
 curl -sS --http1.1 --max-time 10 "https://$target_host/after-capture-off" -o /dev/null
 sleep 2
-after=$(ask '{"op":"requests","since":600,"limit":400}' | jq '[.ok[] | select(.process == "curl")] | length')
-[ "$before" = "$after" ] \
-    || fail "payloads were still read after capture was turned off ($before then $after)."
+# Asked of a short window rather than by comparing two counts of a long one. Counting `curl` rows inside the
+# newest four hundred was a flake: this machine's own background traffic pushes older rows out of that window,
+# so the count moved without anything having been read. What is actually being claimed is that nothing was read
+# *after* capture was turned off, and a window of the last few seconds says exactly that.
+ask '{"op":"requests","since":5,"limit":400}' \
+    | jq -e '[.ok[] | select(.process == "curl")] | length == 0' >/dev/null \
+    || fail "a payload was read after capture was turned off."
 echo "OK: nothing is read once capture is off, and the kernel is what stops it"
 
 # The interface, while it is still up. The daemon flushes a partial batch once a second, so the page sees
