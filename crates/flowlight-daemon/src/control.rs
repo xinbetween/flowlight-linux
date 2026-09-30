@@ -85,6 +85,14 @@ pub enum Request {
         #[serde(flatten)]
         change: crate::views::BudgetChange,
     },
+    /// Where what was seen is sent, and what was agreed to.
+    Export,
+    /// Change where what was seen is sent.
+    SetExport {
+        /// The fields to change. Anything left out is left alone.
+        #[serde(flatten)]
+        change: crate::views::ExportChange,
+    },
     /// Write a rule.
     Write {
         /// `allow`, `ask` or `block`.
@@ -272,9 +280,10 @@ fn handle(line: &str, database: &Path, hello: &Hello) -> Result<String> {
     let mut store = match &request {
         // Writing a rule is the one thing that needs to write, and it is also the one thing worth doing
         // when nothing has been recorded yet.
-        Request::Write { .. } | Request::Forget { .. } | Request::SetBudget { .. } => {
-            Store::open(database)?
-        }
+        Request::Write { .. }
+        | Request::Forget { .. }
+        | Request::SetBudget { .. }
+        | Request::SetExport { .. } => Store::open(database)?,
         _ => Store::open_read_only(database)?,
     };
 
@@ -307,6 +316,10 @@ fn handle(line: &str, database: &Path, hello: &Hello) -> Result<String> {
         Request::Budget => serde_json::to_string(&crate::views::budget(&mut store, now)?)?,
         Request::SetBudget { change } => {
             serde_json::to_string(&crate::views::set_budget(&mut store, &change, now)?)?
+        }
+        Request::Export => serde_json::to_string(&crate::views::export(&mut store)?)?,
+        Request::SetExport { change } => {
+            serde_json::to_string(&crate::views::set_export(&mut store, &change)?)?
         }
         Request::Simulate {
             action,

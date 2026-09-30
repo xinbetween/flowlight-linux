@@ -190,6 +190,160 @@ pub struct BudgetView {
     pub described: Vec<String>,
 }
 
+/// Where what was seen is sent, and what somebody agreed to.
+///
+/// Carries the disclosure as well as the settings, because an interface that showed the settings and not the
+/// disclosure would be offering a yes to a question it had not asked.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ExportView {
+    /// Whether export is wanted.
+    pub enabled: bool,
+    /// Whether anything may actually be sent, which is the only one of these that decides anything.
+    pub sending: bool,
+    /// Where to, if anywhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    /// `file` or `otlp`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// What travels.
+    pub fields: Vec<String>,
+    /// Every field that could be chosen, so an interface can offer them without knowing the list.
+    pub every_field: Vec<String>,
+    /// The names of the headers sent. Never the values.
+    pub headers: Vec<String>,
+    /// Whether the configuration in force is the one somebody agreed to.
+    pub consented: bool,
+    /// Why nothing is being sent, when nothing is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why_not: Option<String>,
+    /// The identifier of the last record sent.
+    pub sent_through: i64,
+    /// What somebody is being asked to agree to, in sentences.
+    pub disclosure: Vec<String>,
+    /// Whether this change took an existing agreement away.
+    pub revoked: bool,
+}
+
+/// What one request may change about export.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ExportChange {
+    /// A path or a URL.
+    pub destination: Option<String>,
+    /// The whole list, not an addition: a caller that meant to add one field and sent one field should get
+    /// one field, and a disclosure somebody re-reads either way.
+    pub fields: Option<Vec<String>>,
+    /// Headers to set. An empty value removes one.
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
+    /// Agree to the configuration as it stands.
+    #[serde(default)]
+    pub consent: bool,
+    /// Stop sending, without forgetting where to or what was agreed.
+    #[serde(default)]
+    pub off: bool,
+}
+
+/// Where what was seen is sent, described.
+pub fn export(store: &mut Store) -> Result<ExportView> {
+    Ok(describe_export(&store.export()?, false))
+}
+
+/// Turns an export configuration into what an interface shows.
+fn describe_export(export: &flowlight_store::Export, revoked: bool) -> ExportView {
+    ExportView {
+        enabled: export.enabled,
+        sending: export.may_send(),
+        destination: export.destination.clone(),
+        transport: export
+            .transport()
+            .map(|transport| transport.as_str().to_owned()),
+        fields: export
+            .fields
+            .iter()
+            .map(|field| field.as_str().to_owned())
+            .collect(),
+        every_field: flowlight_store::export::EVERY_FIELD
+            .iter()
+            .map(|field| field.as_str().to_owned())
+            .collect(),
+        // Names only, here as everywhere. A view is the thing that ends up in a screenshot.
+        headers: export.headers.keys().cloned().collect(),
+        consented: export.consented.as_ref() == Some(&export.fingerprint()),
+        why_not: export.why_not(),
+        sent_through: export.sent_through,
+        disclosure: export.disclose(),
+        revoked,
+    }
+}
+
+/// Changes the export configuration, and says what it now is.
+///
+/// Consent cannot be given in the same call that changes what consent would be to. That is the whole
+/// mechanism: a yes belongs to a sentence somebody read, and a call that rewrote the sentence and said yes to
+/// it in one breath would be a yes to nothing.
+pub fn set_export(store: &mut Store, change: &ExportChange) -> Result<ExportView> {
+    use anyhow::{Context as _, bail};
+    let mut export = store.export()?;
+    let reconfigured =
+        change.destination.is_some() || change.fields.is_some() || change.headers.is_some();
+    if change.consent && reconfigured {
+        bail!(
+            "consent is agreement to a particular disclosure, so it cannot be given in the same breath as              changing what the disclosure says. Make the change, read what it prints, then agree to it."
+        );
+    }
+
+    if let Some(destination) = &change.destination {
+        flowlight_store::export::Transport::of(destination).with_context(|| {
+            format!(
+                "`{destination}` is neither an absolute path nor an http(s) URL. A path means a file on                  this machine and nothing crosses the network; a URL means an OTLP collector and something                  does. Anything else is refused rather than guessed at."
+            )
+        })?;
+        export.destination = Some(destination.clone());
+        // Naming a destination is asking for export. It still sends nothing until somebody agrees.
+        export.enabled = true;
+    }
+    if let Some(names) = &change.fields {
+        let mut fields = std::collections::BTreeSet::new();
+        for name in names {
+            let field = flowlight_store::export::Field::parse(name)
+                .with_context(|| format!("`{name}` is not a field this exports"))?;
+            fields.insert(field);
+        }
+        if fields.is_empty() {
+            bail!("a field list with nothing in it would send empty records");
+        }
+        export.fields = fields;
+    }
+    if let Some(headers) = &change.headers {
+        for (name, value) in headers {
+            if value.is_empty() {
+                export.headers.remove(&name.to_lowercase());
+            } else {
+                export.headers.insert(name.to_lowercase(), value.clone());
+            }
+        }
+    }
+    if change.off {
+        // The destination and the agreement are kept. Turning it off is not a change to what was agreed, so
+        // turning it back on should not need agreeing again.
+        export.enabled = false;
+    }
+
+    // Any change that moved the fingerprint takes the agreement with it. Not a warning: the agreement was to
+    // something that is no longer what would happen.
+    let revoked =
+        export.consented.is_some() && export.consented.as_ref() != Some(&export.fingerprint());
+    if revoked {
+        export.consented = None;
+    }
+    if change.consent {
+        export.consented = Some(export.fingerprint());
+        export.enabled = true;
+    }
+    store.set_export(&export)?;
+    Ok(describe_export(&export, revoked))
+}
+
 /// One thing a candidate rule would change.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ChangeView {
@@ -786,6 +940,191 @@ mod tests {
     fn an_action_that_is_not_one_is_refused() {
         let mut store = Store::in_memory().unwrap();
         assert!(simulate(&mut store, "maybe", "example.com", 0, None, 0).is_err());
+    }
+
+    /// A destination that is neither a path nor a URL is refused rather than guessed at, because guessing
+    /// wrong in the direction of the network is the worse mistake.
+    #[test]
+    fn a_destination_that_says_nothing_about_itself_is_refused() {
+        let mut store = Store::in_memory().unwrap();
+        assert!(
+            set_export(
+                &mut store,
+                &ExportChange {
+                    destination: Some("collector.example".to_owned()),
+                    ..ExportChange::default()
+                }
+            )
+            .is_err()
+        );
+    }
+
+    /// Naming a destination is not agreeing to it.
+    #[test]
+    fn a_destination_alone_sends_nothing() {
+        let mut store = Store::in_memory().unwrap();
+        let view = set_export(
+            &mut store,
+            &ExportChange {
+                destination: Some("/tmp/flowlight.jsonl".to_owned()),
+                ..ExportChange::default()
+            },
+        )
+        .unwrap();
+        assert!(view.enabled);
+        assert!(!view.sending);
+        assert!(!view.consented);
+        assert!(view.why_not.is_some());
+        assert!(view.disclosure.len() > 3);
+    }
+
+    /// The mechanism, in one test: a yes belongs to a sentence somebody read, so a call that rewrote the
+    /// sentence and said yes to it in the same breath is refused outright.
+    #[test]
+    fn consent_cannot_be_given_in_the_same_call_that_changes_what_it_is_consent_to() {
+        let mut store = Store::in_memory().unwrap();
+        let refused = set_export(
+            &mut store,
+            &ExportChange {
+                destination: Some("/tmp/flowlight.jsonl".to_owned()),
+                consent: true,
+                ..ExportChange::default()
+            },
+        );
+        assert!(refused.is_err());
+        // And nothing was written on the way to refusing.
+        assert!(!export(&mut store).unwrap().enabled);
+    }
+
+    #[test]
+    fn agreeing_to_what_is_configured_puts_it_in_force() {
+        let mut store = Store::in_memory().unwrap();
+        set_export(
+            &mut store,
+            &ExportChange {
+                destination: Some("/tmp/flowlight.jsonl".to_owned()),
+                ..ExportChange::default()
+            },
+        )
+        .unwrap();
+        let view = set_export(
+            &mut store,
+            &ExportChange {
+                consent: true,
+                ..ExportChange::default()
+            },
+        )
+        .unwrap();
+        assert!(view.sending);
+        assert!(view.consented);
+        assert_eq!(view.why_not, None);
+    }
+
+    /// The failure the whole design exists to prevent, at the layer somebody's window talks to.
+    #[test]
+    fn changing_where_it_goes_takes_the_agreement_with_it() {
+        let mut store = Store::in_memory().unwrap();
+        for change in [
+            ExportChange {
+                destination: Some("/tmp/flowlight.jsonl".to_owned()),
+                ..ExportChange::default()
+            },
+            ExportChange {
+                consent: true,
+                ..ExportChange::default()
+            },
+        ] {
+            set_export(&mut store, &change).unwrap();
+        }
+        let view = set_export(
+            &mut store,
+            &ExportChange {
+                destination: Some("https://somebody.else.example/v1/logs".to_owned()),
+                ..ExportChange::default()
+            },
+        )
+        .unwrap();
+        assert!(view.revoked);
+        assert!(!view.sending);
+        assert!(!view.consented);
+    }
+
+    /// Turning it off is not a change to what was agreed, so turning it back on must not need agreeing
+    /// again. The alternative trains people to click through the disclosure.
+    #[test]
+    fn turning_it_off_keeps_the_agreement() {
+        let mut store = Store::in_memory().unwrap();
+        for change in [
+            ExportChange {
+                destination: Some("/tmp/flowlight.jsonl".to_owned()),
+                ..ExportChange::default()
+            },
+            ExportChange {
+                consent: true,
+                ..ExportChange::default()
+            },
+            ExportChange {
+                off: true,
+                ..ExportChange::default()
+            },
+        ] {
+            set_export(&mut store, &change).unwrap();
+        }
+        let view = export(&mut store).unwrap();
+        assert!(!view.enabled);
+        assert!(!view.sending);
+        // Still agreed to. Nothing about what would be sent has changed.
+        assert!(view.consented);
+        assert!(!view.revoked);
+    }
+
+    /// A field list with nothing in it would send empty records, and an interface that allowed it would be
+    /// offering an export that does nothing and says it is working.
+    #[test]
+    fn an_empty_field_list_is_refused() {
+        let mut store = Store::in_memory().unwrap();
+        assert!(
+            set_export(
+                &mut store,
+                &ExportChange {
+                    fields: Some(Vec::new()),
+                    ..ExportChange::default()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            set_export(
+                &mut store,
+                &ExportChange {
+                    fields: Some(vec!["not-a-field".to_owned()]),
+                    ..ExportChange::default()
+                }
+            )
+            .is_err()
+        );
+    }
+
+    /// Header values are not in a view, because a view is the thing that ends up in a screenshot.
+    #[test]
+    fn a_view_carries_header_names_and_never_their_values() {
+        let mut store = Store::in_memory().unwrap();
+        let view = set_export(
+            &mut store,
+            &ExportChange {
+                destination: Some("https://collector.example/v1/logs".to_owned()),
+                headers: Some(
+                    [("Authorization".to_owned(), "Bearer sekrit".to_owned())]
+                        .into_iter()
+                        .collect(),
+                ),
+                ..ExportChange::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(view.headers, vec!["authorization".to_owned()]);
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("sekrit"), "{json}");
     }
 
     #[test]

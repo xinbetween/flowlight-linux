@@ -136,6 +136,33 @@ pub struct Budget {
     pub described: Vec<String>,
 }
 
+/// Where what was seen is sent, and what was agreed to.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct Export {
+    /// Whether export is wanted.
+    pub enabled: bool,
+    /// Whether anything may actually be sent.
+    pub sending: bool,
+    /// Where to, if anywhere.
+    pub destination: Option<String>,
+    /// `file` or `otlp`.
+    pub transport: Option<String>,
+    /// What travels.
+    pub fields: Vec<String>,
+    /// Every field there is, so this does not carry its own copy of the list.
+    pub every_field: Vec<String>,
+    /// The names of the headers sent. Never the values.
+    pub headers: Vec<String>,
+    /// Whether what is configured is what was agreed to.
+    pub consented: bool,
+    /// Why nothing is being sent, when nothing is.
+    pub why_not: Option<String>,
+    /// The identifier of the last record sent.
+    pub sent_through: i64,
+    /// What agreeing would mean, in sentences.
+    pub disclosure: Vec<String>,
+}
+
 /// One thing a candidate rule would change.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Change {
@@ -302,6 +329,13 @@ pub fn write_rule(action: &str, subject: &str, port: u16, agent: Option<&str>) -
 /// between, and the daemon is explicit that anything left out is left alone.
 pub fn set_budget(field: &str, value: &str) -> String {
     format!(r#"{{"op":"set-budget","{field}":{value}}}"#)
+}
+
+/// Builds the request that changes where what was seen is sent.
+///
+/// The value is JSON, so a caller decides between a string, a list and a boolean.
+pub fn set_export(field: &str, value: &str) -> String {
+    format!(r#"{{"op":"set-export","{field}":{value}}}"#)
 }
 
 /// Builds the request that asks what a rule would change without writing it.

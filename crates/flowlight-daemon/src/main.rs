@@ -13,6 +13,7 @@
 mod agent;
 mod blocking;
 mod control;
+mod exporting;
 mod history;
 mod http2;
 mod libraries;
@@ -171,6 +172,13 @@ struct Args {
     #[arg(long)]
     no_block: bool,
 
+    /// How often a batch is sent to whatever export is configured.
+    ///
+    /// Ten seconds unless told otherwise. Shorter is for a test that cannot wait; much shorter would make
+    /// this daemon's own traffic the loudest thing on a quiet machine.
+    #[arg(long, value_name = "SECONDS", default_value_t = 10)]
+    export_seconds: u64,
+
     /// Ask the database a question instead of watching.
     #[command(subcommand)]
     command: Option<Command>,
@@ -234,6 +242,30 @@ enum Command {
         /// Days to keep the daily summary that expired requests are folded into.
         #[arg(long, value_name = "DAYS")]
         summary_days: Option<u32>,
+    },
+    /// Where what was seen is sent, and what was agreed to.
+    ///
+    /// With no options, says what the configuration is and what agreeing to it would mean. With any, changes
+    /// it — and changing it takes away an agreement that was to something else.
+    Export {
+        /// An absolute path for a file, one JSON object per line, or an http(s) URL for an OTLP collector.
+        #[arg(long, value_name = "PATH|URL")]
+        to: Option<String>,
+        /// The whole list of fields, comma-separated. `export` with no options prints the ones there are.
+        #[arg(long, value_name = "LIST", value_delimiter = ',')]
+        fields: Option<Vec<String>>,
+        /// A header to send with each batch, as `Name=value`. May be repeated. An empty value removes one.
+        ///
+        /// The names are disclosed and the values never are, so a token here does not end up in a
+        /// disclosure, a screenshot or this tool's own output.
+        #[arg(long = "header", value_name = "NAME=VALUE")]
+        headers: Vec<String>,
+        /// Agree to the configuration as it stands, which is what lets anything be sent.
+        #[arg(long)]
+        consent: bool,
+        /// Stop sending, keeping the destination and the agreement.
+        #[arg(long)]
+        off: bool,
     },
     /// What a rule would change, without writing it.
     ///
@@ -442,6 +474,14 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Flowlight's own traffic, which is only there because Flowlight is exporting. Left in, a record of a
+    // batch being sent becomes a record in the next batch, for ever, at whatever rate the loop can manage.
+    // The kernel is told once, here, rather than filtered in userspace: the point is not to tidy the output,
+    // it is to not copy this process's own TLS buffers out of its memory in the first place.
+    if let Some(spending) = spending.as_mut() {
+        spending.ignore(std::process::id());
+    }
+
     if !args.no_socket {
         if store.is_none() {
             eprintln!(
@@ -465,6 +505,34 @@ fn main() -> anyhow::Result<()> {
                 // machine.
                 Err(err) => eprintln!("no control socket: {err:#}. Still watching."),
             }
+        }
+    }
+
+    if let Some(store) = store.as_mut() {
+        match store.export() {
+            // Said out loud on every start, like the budget, and for the same reason: a tool that sends what
+            // it saw somewhere else should never be quiet about doing it.
+            Ok(export) if export.may_send() => {
+                eprintln!(
+                    "exporting to {} ({}), fields: {}",
+                    export.destination.as_deref().unwrap_or("nowhere"),
+                    export
+                        .transport()
+                        .map_or("unknown", flowlight_store::export::Transport::as_str),
+                    export
+                        .fields
+                        .iter()
+                        .map(|field| field.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            Ok(export) => {
+                if let Some(reason) = export.why_not().filter(|_| export.destination.is_some()) {
+                    eprintln!("not exporting: {reason}");
+                }
+            }
+            Err(err) => eprintln!("could not read the export configuration: {err:#}"),
         }
     }
 
@@ -550,6 +618,8 @@ fn run(
     let mut next_sweep = Instant::now();
     let mut next_flush = Instant::now() + FLUSH;
     let mut next_rules = Instant::now();
+    let export_every = Duration::from_secs(args.export_seconds.max(1));
+    let mut next_export = Instant::now() + export_every;
     let mut next_agent_scan = Instant::now();
     let mut last_propagation = blocking::Propagation::default();
     let mut seen = 0_u64;
@@ -676,6 +746,33 @@ fn run(
         }
 
         if let Some(store) = store.as_deref_mut()
+            && Instant::now() >= next_export
+        {
+            // After the flush interval has had a chance to run, because what is in the batch is not yet in
+            // the database, and `requests_after` flushes anyway rather than trusting that ordering.
+            match exporting::pass(store) {
+                Some(report) if !report.is_quiet() => {
+                    if report.sent > 0 {
+                        eprintln!("exported {} record(s)", report.sent);
+                    }
+                    if let Some(failure) = &report.failure {
+                        eprintln!(
+                            "export failed: {failure}. The records are kept and tried again."
+                        );
+                    }
+                    // A backlog drains in batches; waiting the full interval between them would take a day
+                    // to catch up on an hour of traffic.
+                    next_export = if report.more {
+                        Instant::now()
+                    } else {
+                        Instant::now() + export_every
+                    };
+                }
+                _ => next_export = Instant::now() + export_every,
+            }
+        }
+
+        if let Some(store) = store.as_deref_mut()
             && Instant::now() >= next_flush
         {
             if store.has_pending() {
@@ -691,12 +788,14 @@ fn run(
                 .min(next_sweep)
                 .min(next_flush)
                 .min(next_rules)
-                .min(next_agent_scan),
+                .min(next_agent_scan)
+                .min(next_export),
             None => next_scan
                 .min(next_sweep)
                 .min(next_flush)
                 .min(next_rules)
-                .min(next_agent_scan),
+                .min(next_agent_scan)
+                .min(next_export),
         };
         let timeout = until.saturating_duration_since(Instant::now());
 

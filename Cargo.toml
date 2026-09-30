@@ -22,7 +22,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/xinbetween/flowlight-linux"
@@ -44,6 +44,10 @@ serde_json = "1"
 # HPACK, which is not worth writing: a static table, a dynamic table with its own eviction rules, and a
 # canonical Huffman code. MIT, which composes with GPL-3.0 without friction.
 loona-hpack = "0.4"
+sha2 = "0.11"
+# A blocking HTTP client with rustls and no async runtime. The daemon is threads, not futures, and pulling
+# in tokio to send a batch of JSON every few seconds would be the tail wagging the dog.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

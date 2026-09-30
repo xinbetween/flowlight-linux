@@ -374,7 +374,7 @@ A native window, GTK4, running **as you** while the daemon runs as root.
 flowlight
 ```
 
-Five pages — **Live**, **Agents**, **Rules**, **Coverage**, **Budget** — and a window selector from fifteen
+Six pages — **Live**, **Agents**, **Rules**, **Coverage**, **Budget**, **Export** — and a window selector from fifteen
 minutes to seven days. On the Agents page each host an agent reached carries the two buttons the macOS build settled
 on: block it **for this agent**, or block it **everywhere**.
 
@@ -400,6 +400,60 @@ sudo ./target/release/flowlightd --web
 ```
 
 and it prints its own warning, because on a shared machine it is a disclosure.
+
+### Export
+
+What was seen, sent somewhere else: a file on this machine, one JSON object per line, or an OTLP collector
+over HTTP. Off until it is configured, and configured is not the same as sending.
+
+```console
+$ sudo flowlightd export --to /var/log/flowlight.jsonl
+Every request Flowlight reads will be written to /var/log/flowlight.jsonl, one line each. Nothing crosses the
+network.
+Eight fields travel: when it happened, what the process is called, the agent that caused it, out or in, the
+host, the request method, the response status, how many bytes.
+These do not: where that name came from, the process identifier, the request target, whether the connection
+was HTTP/2, the JSON-RPC method, the tool for an MCP call.
+This agreement is bound to exactly that. Changing the destination, the fields or the headers stops the export
+until somebody agrees again.
+
+Nothing is being sent: Nobody has agreed to this yet. Nothing is sent until somebody does.
+
+Fields available: at, process, confidence, pid, agent, direction, host, method, target, status, bytes,
+protocol, rpc_method, rpc_tool
+```
+
+Naming a destination discloses and sends nothing. Agreeing is a second command:
+
+```console
+$ sudo flowlightd export --consent
+```
+
+The agreement is bound to the disclosure, not to the act of exporting. It is a hash of the destination, the
+transport, the field list and the header *names*; change any of them and the agreement is gone and nothing is
+sent until somebody agrees to the new sentences. That is the failure this exists to prevent: somebody agrees
+to four fields going to their own collector, and three weeks later eleven fields go to somebody else's under
+the same yes.
+
+Header values are not part of it, and are never shown back — not in the disclosure, not in the window, not in
+this tool's output. A token is a secret, not a description of where data goes, and rotating one is not a change
+anybody should have to agree to again.
+
+```console
+$ sudo flowlightd export --to https://collector.example/v1/logs \
+      --header "Authorization=Bearer …" --fields at,process,agent,host,method,status
+```
+
+Three more things are true of it, because they are the ones that go wrong:
+
+- **A record is sent once.** The high-water mark is the row identifier, not a timestamp — two records can
+  share a second, and a mark on time either sends one of them twice or neither.
+- **A batch that failed has not been sent.** The mark moves after delivery, so a collector that was down for
+  an hour receives that hour when it comes back.
+- **Flowlight's own traffic is not in it.** Exporting is itself an HTTPS request from this machine. Left in,
+  a record of a batch being sent is a record in the next batch, for ever.
+
+The Export page in the window says the same sentences, and its Agree button opens a dialog containing them.
 
 ### Coverage: what was *not* seen
 
@@ -427,7 +481,6 @@ Coverage for the last 24h
 Zeroes are printed rather than omitted. A line that disappears when it reads zero turns "nothing was dropped"
 into "nobody checked".
 
-### What it does not see yet
 ### What it does not see yet
 
 Stated here rather than discovered later:

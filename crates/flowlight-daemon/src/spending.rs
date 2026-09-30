@@ -50,6 +50,9 @@ pub struct Spending {
     spent: HashMap<String, i64>,
     /// Names that have used up their share, so a second crossing is not a second announcement.
     stopped: HashSet<String>,
+    /// Processes whose payloads are never read, whatever the budget says. Kept because the kernel's list is
+    /// emptied at midnight, and an exclusion that lapses at midnight is not an exclusion.
+    ignored: HashSet<u32>,
     /// Which day the arithmetic above is about, in whole days since the epoch.
     day: i64,
     /// Whether the kernel currently believes it is capturing.
@@ -79,6 +82,7 @@ impl Spending {
             budget,
             spent,
             stopped: HashSet::new(),
+            ignored: HashSet::new(),
             day,
             told_kernel: false,
             complained: false,
@@ -101,6 +105,15 @@ impl Spending {
         let capturing = budget.reading_payloads(now);
         self.told_kernel = !capturing;
         self.tell_kernel(capturing);
+    }
+
+    /// Never read this process's payloads, whatever the allowance says.
+    ///
+    /// The one caller is the daemon excluding itself. Export means this process sends what it saw over TLS,
+    /// and reading that back would put a record of the export into the next export, for ever.
+    pub fn ignore(&mut self, pid: u32) {
+        self.ignored.insert(pid);
+        let _ = self.spent_in_kernel.insert(pid, 1, 0);
     }
 
     /// Counts one captured payload, and stops the process if that was its last.
@@ -140,6 +153,11 @@ impl Spending {
                 .collect();
             for pid in stale {
                 let _ = self.spent_in_kernel.remove(&pid);
+            }
+            // Put back. These were never spending an allowance, so giving the allowance back does not
+            // include them.
+            for pid in &self.ignored {
+                let _ = self.spent_in_kernel.insert(pid, 1, 0);
             }
             change.day_began = true;
         }
