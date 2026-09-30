@@ -786,10 +786,17 @@ no quiet fallback to somebody's API.
 [xinbetween/flowlight](https://github.com/xinbetween/flowlight) is the macOS application, written in Swift.
 This is a separate implementation in Rust, sharing no code with it.
 
-What must not diverge is not code but **semantics**: what `block` means against `refuse`, how rule precedence
-resolves, what Coverage is permitted to claim. The design note proposes a language-neutral conformance suite —
-cases as data, run by both test suites — so that a divergence is a failing test rather than a support thread
-eighteen months later.
+What must not diverge is not code but **semantics**: what `block` means against `allow`, how rule precedence
+resolves, what a pattern covers. Those are decisions, and a decision written down in two languages is one that
+will be made twice and eventually differently — so they live in [`conformance/`](conformance/) as data, and
+both test suites load the same file. A divergence is a failing test rather than a support thread eighteen
+months later.
+
+Thirty-two cases so far, each carrying the reason its answer is what it is: that a subdomain pattern does not
+cover the apex, that subject beats port beats scope, that an exception has to be *more specific* than what it is
+an exception to, and that a rule naming a port cannot be judged against a stored request, because a probe on a
+TLS library never saw one. When a question about semantics comes up, the answer goes there first and into the
+code second.
 
 ## Licence
 

@@ -10,5 +10,11 @@ publish = false
 
 [dependencies]
 
+[dev-dependencies]
+# Only for the shared conformance cases, which are JSON so that the macOS build can run the same file. The
+# crate itself has no dependencies and this does not change that: a dev-dependency is not in the binary.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
 [lints]
 workspace = true
