@@ -742,6 +742,9 @@ fn run(
                     // Applied before the record exists in any form that could be printed, stored or
                     // exported, so there is no copy of the path anywhere for the policy to have missed.
                     record.target = paths.apply(record.target.take());
+                    if !paths.keeps_tool_names() {
+                        record.rpc_tool = None;
+                    }
                 }
                 if let Some(spending) = spending.as_deref_mut()
                     && let Some(stopped) = records.first().and_then(|record| {

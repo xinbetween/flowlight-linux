@@ -102,6 +102,10 @@ pub struct RequestRow {
     pub truncated: bool,
     /// Why this connection could not be read, when it could not.
     pub unreadable: Option<String>,
+    /// The JSON-RPC method, for a request to an MCP server.
+    pub rpc_method: Option<String>,
+    /// The tool, for an MCP `tools/call`. Never its arguments.
+    pub rpc_tool: Option<String>,
 }
 
 /// A process that opened HTTPS connections and had none of its traffic read.
@@ -197,6 +201,21 @@ pub struct AgentRow {
     pub processes: i64,
     /// Bytes those requests carried.
     pub bytes: i64,
+    /// The most recent one.
+    pub last_seen: i64,
+}
+
+/// One thing an agent said to an MCP server, and how often.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolRow {
+    /// The JSON-RPC method.
+    pub method: String,
+    /// The tool, for a `tools/call`.
+    pub tool: Option<String>,
+    /// The host it was said to.
+    pub host: String,
+    /// How many times.
+    pub calls: i64,
     /// The most recent one.
     pub last_seen: i64,
 }
@@ -384,7 +403,7 @@ impl Store {
     }
 
     /// The schema this version of the code expects.
-    pub const SCHEMA: i64 = 5;
+    pub const SCHEMA: i64 = 6;
 
     /// Creates the schema, or brings an older one up to it.
     ///
@@ -426,7 +445,9 @@ impl Store {
                 bytes      INTEGER NOT NULL,
                 truncated  INTEGER NOT NULL,
                 unreadable TEXT,
-                agent      TEXT
+                agent      TEXT,
+                rpc_method TEXT,
+                rpc_tool   TEXT
             );
             CREATE INDEX IF NOT EXISTS requests_at ON requests(at);
             CREATE INDEX IF NOT EXISTS requests_process ON requests(process, at);
@@ -479,6 +500,9 @@ impl Store {
             ("connections", "blocked", "INTEGER NOT NULL DEFAULT 0"),
             // Schema 3 is 0.2.0, where every rule was a block and every scope was global.
             ("rules", "action", "TEXT NOT NULL DEFAULT 'block'"),
+            // Schema 5 is 0.2.4, before anything read MCP's own protocol.
+            ("requests", "rpc_method", "TEXT"),
+            ("requests", "rpc_tool", "TEXT"),
         ] {
             if !self.has_column(table, column)? {
                 self.connection
@@ -568,8 +592,9 @@ impl Store {
             }
             let mut insert = transaction.prepare_cached(
                 "INSERT INTO requests(at, process, confidence, pid, direction, protocol, method,
-                                      target, host, status, bytes, truncated, unreadable, agent)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                      target, host, status, bytes, truncated, unreadable, agent,
+                                      rpc_method, rpc_tool)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             )?;
             for row in &self.pending_requests {
                 insert.execute(params![
@@ -586,7 +611,9 @@ impl Store {
                     row.bytes,
                     row.truncated,
                     row.unreadable,
-                    row.agent
+                    row.agent,
+                    row.rpc_method,
+                    row.rpc_tool
                 ])?;
             }
         }
@@ -660,7 +687,7 @@ impl Store {
         self.flush()?;
         let mut statement = self.connection.prepare(
             "SELECT at, process, confidence, pid, direction, protocol, method, target, host,
-                    status, bytes, truncated, unreadable, agent
+                    status, bytes, truncated, unreadable, agent, rpc_method, rpc_tool
              FROM requests WHERE at >= ?1 ORDER BY at DESC, id DESC LIMIT ?2",
         )?;
         let rows = statement.query_map(params![since, limit as i64], |row| {
@@ -679,6 +706,8 @@ impl Store {
                 truncated: row.get(11)?,
                 unreadable: row.get(12)?,
                 agent: row.get(13)?,
+                rpc_method: row.get(14)?,
+                rpc_tool: row.get(15)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -982,6 +1011,35 @@ impl Store {
         )?)
     }
 
+    /// Which MCP tools an agent has called, and how often.
+    ///
+    /// The method as well as the tool, because `tools/list` and `initialize` say something too: an agent
+    /// that lists a server's tools every minute and never calls one is doing something worth noticing.
+    pub fn tools_for_agent(
+        &mut self,
+        agent: &str,
+        since: i64,
+        limit: usize,
+    ) -> Result<Vec<ToolRow>> {
+        self.flush()?;
+        let mut statement = self.connection.prepare(
+            "SELECT rpc_method, rpc_tool, coalesce(host, ''), count(*), max(at) FROM requests
+             WHERE at >= ?1 AND agent = ?2 AND rpc_method IS NOT NULL
+             GROUP BY rpc_method, rpc_tool, host
+             ORDER BY count(*) DESC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![since, agent, limit as i64], |row| {
+            Ok(ToolRow {
+                method: row.get(0)?,
+                tool: row.get(1)?,
+                host: row.get(2)?,
+                calls: row.get(3)?,
+                last_seen: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Every agent something was read from, busiest first.
     pub fn agents(&mut self, since: i64) -> Result<Vec<AgentRow>> {
         self.flush()?;
@@ -1106,6 +1164,8 @@ mod tests {
             bytes,
             truncated: false,
             unreadable: None,
+            rpc_method: None,
+            rpc_tool: None,
         }
     }
 
@@ -1699,6 +1759,87 @@ mod tests {
         assert_eq!(claude.1, 1_000);
         let curl = today.iter().find(|(name, _)| name == "curl").unwrap();
         assert_eq!(curl.1, 10);
+    }
+
+    // What was said to an MCP server
+
+    /// The method as well as the tool: an agent that lists a server's tools every minute and never calls
+    /// one is doing something worth noticing.
+    #[test]
+    fn what_an_agent_said_to_an_mcp_server_is_grouped_by_what_it_said() {
+        let mut store = Store::in_memory().unwrap();
+        let call = |method: &str, tool: Option<&str>| {
+            let mut row = request(1_000, "node", "mcp.sentry.dev", 10);
+            row.agent = Some("claude".to_owned());
+            row.rpc_method = Some(method.to_owned());
+            row.rpc_tool = tool.map(|name| name.to_owned());
+            row
+        };
+        store
+            .record_request(call("tools/call", Some("search")))
+            .unwrap();
+        store
+            .record_request(call("tools/call", Some("search")))
+            .unwrap();
+        store
+            .record_request(call("tools/call", Some("fetch")))
+            .unwrap();
+        store.record_request(call("tools/list", None)).unwrap();
+        // And an ordinary request, which is not a call.
+        store
+            .record_request(request(1_000, "node", "api.anthropic.com", 10))
+            .unwrap();
+
+        let tools = store.tools_for_agent("claude", 0, 10).unwrap();
+        assert_eq!(tools.len(), 3);
+        assert_eq!(tools[0].tool.as_deref(), Some("search"));
+        assert_eq!(tools[0].calls, 2);
+        assert_eq!(tools[0].host, "mcp.sentry.dev");
+        assert!(
+            tools
+                .iter()
+                .any(|row| row.method == "tools/list" && row.tool.is_none())
+        );
+    }
+
+    #[test]
+    fn another_agents_calls_are_another_agents() {
+        let mut store = Store::in_memory().unwrap();
+        let mut mine = request(1_000, "node", "mcp.example", 1);
+        mine.agent = Some("claude".to_owned());
+        mine.rpc_method = Some("tools/call".to_owned());
+        store.record_request(mine).unwrap();
+        assert!(store.tools_for_agent("codex", 0, 10).unwrap().is_empty());
+    }
+
+    /// A database written by 0.2.4 has neither column, and must still open and still be readable.
+    #[test]
+    fn a_database_from_before_mcp_was_read_still_opens() {
+        let directory = std::env::temp_dir().join("flowlight-store-rpc-migrate");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("flowlight.db");
+
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE requests (id INTEGER PRIMARY KEY, at INTEGER NOT NULL,
+               process TEXT NOT NULL, confidence TEXT NOT NULL, pid INTEGER NOT NULL,
+               direction TEXT NOT NULL, protocol TEXT, method TEXT, target TEXT, host TEXT,
+               status INTEGER, bytes INTEGER NOT NULL, truncated INTEGER NOT NULL, unreadable TEXT,
+               agent TEXT);
+             INSERT INTO meta(key, value) VALUES('schema', '5');
+             INSERT INTO requests(at, process, confidence, pid, direction, bytes, truncated, host)
+               VALUES (1000, 'node', 'path', 7, 'out', 42, 0, 'mcp.example');",
+        )
+        .unwrap();
+        drop(old);
+
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), Store::SCHEMA);
+        let rows = store.requests_since(0, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].rpc_method, None);
     }
 
     // Traffic, for trying a rule against

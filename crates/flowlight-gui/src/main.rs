@@ -366,7 +366,12 @@ fn render_live(column: &gtk::Box, rows: &[Request]) {
     }
     let group = adw::PreferencesGroup::new();
     for row in rows {
-        let what = if let Some(method) = &row.method {
+        let what = if let Some(rpc) = &row.rpc_method {
+            match &row.rpc_tool {
+                Some(tool) => format!("{rpc}  {tool}"),
+                None => rpc.clone(),
+            }
+        } else if let Some(method) = &row.method {
             format!(
                 "{method} {}{}",
                 row.host.as_deref().unwrap_or(""),
@@ -477,6 +482,33 @@ fn render_agents(state: &Rc<State>, seconds: i64, column: &gtk::Box, rows: &[Age
                 None,
             ));
             group.add(&entry);
+        }
+        if !agent.tools.is_empty() {
+            let said = adw::PreferencesGroup::builder()
+                .title("What it said")
+                .description(
+                    "Read out of MCP's own protocol, which is JSON-RPC in the plaintext already being \
+                     captured. The tool's name, never its arguments.",
+                )
+                .build();
+            for tool in &agent.tools {
+                said.add(
+                    &adw::ActionRow::builder()
+                        .title(match &tool.tool {
+                            Some(name) => format!("{}  {name}", tool.method),
+                            None => tool.method.clone(),
+                        })
+                        .subtitle(format!(
+                            "{}  ·  {} call{}  ·  last {}",
+                            tool.host,
+                            tool.calls,
+                            if tool.calls == 1 { "" } else { "s" },
+                            ago(tool.last_seen)
+                        ))
+                        .build(),
+                );
+            }
+            column.append(&said);
         }
         column.append(&group);
     }

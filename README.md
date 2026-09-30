@@ -217,6 +217,25 @@ model name, a UUID, a page number — are left alone.
 claude    pid 17903    → PUT productionresultssa17.blob.core.windows.net/…/logs.txt?se=2026-09-29T08%3A31%3A14Z&sig=…&sp=cw
 ```
 
+### What an agent said to an MCP server
+
+MCP is JSON-RPC, so a request to an MCP server carries a method and, for a tool call, the name of the tool —
+in plaintext a uprobe has already copied. Both are read out of it.
+
+```text
+claude/node              pid 17903    → tools/call  read_file
+claude/node              pid 17903    → tools/list
+```
+
+**Never the arguments.** A tool called `read_file` is a fact about what an agent is doing; the path it was
+given is the contents of somebody's work, and a monitoring tool that quietly kept that would be a worse
+problem than the one it was installed to solve. The parser reads two fields and does not know the others
+exist — which is the difference between something that cannot leak arguments and something that merely does
+not. Under `--paths none` the tool's name goes too, and only the method stays.
+
+The Agents page lists what each agent said, per server. CI makes a real tool call over TLS and checks the
+argument it passed appears neither in the output nor in the database.
+
 ### Rules
 
 A `cgroup/connect` hook refuses a connection **before the SYN**. The application gets `EPERM` from
@@ -341,7 +360,8 @@ agent's own service, which is neither MCP nor a surprise; without that distincti
 would read as unexpected, which is the fastest possible way to teach somebody to ignore this screen.
 
 Configured servers are read from the agents' own files — `~/.claude.json`, `~/.codex/config.toml`,
-`~/.cursor/mcp.json`, `~/.gemini/settings.json` and the rest — across every home directory on the machine,
+`~/.cursor/mcp.json`, `~/.gemini/settings.json`, VS Code's, Zed's, Windsurf's and Claude Desktop's — across
+every home directory on the machine,
 because the daemon runs as root and the agents belong to users. A server that runs locally over a pipe is
 listed as invisible rather than omitted: nothing here can ever see it, and leaving it off the screen invites
 the conclusion that Flowlight looked and found nothing.

@@ -124,6 +124,15 @@ secret="aVeryLongOpaqueTokenValue1234567890ABCdef"
 echo "Connecting once more, with a credential in the query string..."
 curl -sS --http1.1 --max-time 10 "https://$target_host/?token=$secret" -o /dev/null
 
+# MCP, which is JSON-RPC over HTTPS. The server will refuse the request; what matters is that the envelope
+# was in the plaintext and that only the method and the tool's name came out of it.
+mcp_secret="do-not-keep-this-argument"
+echo "Making an MCP tool call..."
+curl -sS --http1.1 --max-time 10 -X POST \
+    -H 'Content-Type: application/json' \
+    --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"smoke_tool\",\"arguments\":{\"secret\":\"$mcp_secret\"}}}" \
+    "https://$target_host/mcp" -o /dev/null || true
+
 # GnuTLS, through a different pair of functions. `gnutls-cli` rather than wget, because whether wget is built
 # against GnuTLS varies by distribution and an assertion that quietly tests OpenSSL twice is worse than no
 # assertion.
@@ -363,6 +372,21 @@ if [ "$gnutls_tested" = yes ]; then
 else
     echo "SKIP: gnutls-cli is not installed, so GnuTLS was not exercised"
 fi
+
+check "the MCP tool call was read out of the plaintext" \
+    '.rpc_method == "tools/call" and .rpc_tool == "smoke_tool"'
+
+# The whole shape of the parser, asked of everything it produced: a tool's name is a fact about what an
+# agent is doing; the argument it was given is the contents of somebody's work.
+if grep -q "$mcp_secret" "$output"; then
+    echo "FAIL: an MCP call's arguments were reported." >&2
+    exit 1
+fi
+if sudo grep -qa "$mcp_secret" "$database"; then
+    echo "FAIL: an MCP call's arguments were stored." >&2
+    exit 1
+fi
+echo "OK: the tool's name was kept and its arguments were not, anywhere"
 
 check "the credential in the query string was redacted" \
     '.process == "curl" and ((.target // "") | contains("token=…"))'

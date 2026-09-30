@@ -18,6 +18,7 @@
 //! | Cursor | `~/.cursor/mcp.json` | `mcpServers` |
 //! | Gemini | `~/.gemini/settings.json` | `mcpServers` |
 //! | VS Code | `.vscode/mcp.json` | `servers` |
+//! | Zed | `~/.config/zed/settings.json` | `context_servers` |
 //!
 //! # What is not attempted
 //!
@@ -177,7 +178,9 @@ fn collect_json(
     let Some(object) = value.as_object() else {
         return;
     };
-    for key in ["mcpServers", "mcp_servers", "servers"] {
+    // Four spellings of the same map. Zed's `context_servers` holds exactly what `mcpServers` holds; it is
+    // a name, not a different shape.
+    for key in ["mcpServers", "mcp_servers", "servers", "context_servers"] {
         if let Some(map) = object.get(key).and_then(serde_json::Value::as_object) {
             for (name, entry) in map {
                 if let Ok(raw) = serde_json::from_value::<RawServer>(entry.clone())
@@ -190,7 +193,7 @@ fn collect_json(
     }
     // Only into containers, and only the ones that could hold a per-project copy. Descending into every
     // value would find the word `command` in somebody's prompt history.
-    for key in ["projects", "mcp", "context_servers"] {
+    for key in ["projects", "mcp"] {
         if let Some(nested) = object.get(key) {
             if let Some(children) = nested.as_object() {
                 for child in children.values() {
@@ -227,15 +230,26 @@ pub fn from_toml(text: &str, agent: &str, source: &str) -> Vec<Server> {
 }
 
 /// Where each agent keeps its configuration, relative to a home directory.
+///
+/// Every one of these is JSON or TOML with a key this module already knows. Goose's `config.yaml` is
+/// deliberately absent: adding a YAML parser to read a file whose key would also have to be guessed at is
+/// two guesses, and a parser that finds nothing is worse than an absence somebody can be told about.
 const CONFIGURATIONS: &[(&str, &str)] = &[
     ("claude", ".claude.json"),
     ("claude", ".claude/settings.json"),
     ("claude", ".config/claude/mcp.json"),
+    // Claude Desktop, which is a different program with the same servers in it.
+    ("claude", ".config/Claude/claude_desktop_config.json"),
     ("codex", ".codex/config.toml"),
     ("cursor", ".cursor/mcp.json"),
     ("gemini", ".gemini/settings.json"),
-    ("goose", ".config/goose/config.yaml"),
     ("opencode", ".config/opencode/opencode.json"),
+    // VS Code, whose key is `servers` rather than `mcpServers`.
+    ("vscode", ".config/Code/User/mcp.json"),
+    ("vscode", ".config/Code - Insiders/User/mcp.json"),
+    // Zed keeps them under `context_servers`, which the walker already descends into.
+    ("zed", ".config/zed/settings.json"),
+    ("windsurf", ".codeium/windsurf/mcp_config.json"),
 ];
 
 /// Every agent configuration file that exists under these home directories.
@@ -674,11 +688,29 @@ mod tests {
         let home = std::env::temp_dir().join("flowlight-mcp-home");
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::create_dir_all(home.join(".config/Code/User")).unwrap();
+        std::fs::create_dir_all(home.join(".codeium/windsurf")).unwrap();
         std::fs::write(home.join(".claude.json"), "{}").unwrap();
         std::fs::write(home.join(".codex/config.toml"), "").unwrap();
+        std::fs::write(home.join(".config/Code/User/mcp.json"), "{}").unwrap();
+        std::fs::write(home.join(".codeium/windsurf/mcp_config.json"), "{}").unwrap();
 
         let found = configuration_files(&[home.clone(), PathBuf::from("/nonexistent")]);
         let agents: Vec<_> = found.iter().map(|(agent, _)| agent.as_str()).collect();
-        assert_eq!(agents, ["claude", "codex"]);
+        assert_eq!(agents, ["claude", "codex", "vscode", "windsurf"]);
+    }
+
+    /// Zed keeps its servers under `context_servers`, which the walker descends into. A format nobody has
+    /// written a parser for has to be found by the file's own key rather than by its agent's name.
+    #[test]
+    fn a_zed_configuration_is_read_out_of_its_own_key() {
+        let text = r#"{
+            "context_servers": {
+                "sentry": { "url": "https://mcp.sentry.dev/mcp" }
+            }
+        }"#;
+        let servers = from_json(text, "zed", "~/.config/zed/settings.json");
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].host.as_deref(), Some("mcp.sentry.dev"));
     }
 }
