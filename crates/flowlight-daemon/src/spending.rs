@@ -29,16 +29,17 @@ pub struct Change {
     pub session_ended: bool,
     /// A new day began, so every allowance was given back.
     pub day_began: bool,
-    /// Processes newly stopped for the day, by name.
-    pub stopped: Vec<String>,
 }
 
 impl Change {
     /// Whether anything happened worth a line.
     pub fn is_quiet(&self) -> bool {
-        !self.session_ended && !self.day_began && self.stopped.is_empty()
+        !self.session_ended && !self.day_began
     }
 }
+
+/// The two maps the budget is held against: whether to capture, and who has spent their share.
+pub type Maps = (Array<MapData, u8>, BpfHashMap<MapData, u32, u8>);
 
 /// Holds the budget against the kernel.
 pub struct Spending {
@@ -187,10 +188,6 @@ mod tests {
             },
             Change {
                 day_began: true,
-                ..Change::default()
-            },
-            Change {
-                stopped: vec!["x".to_owned()],
                 ..Change::default()
             },
         ] {

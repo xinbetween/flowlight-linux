@@ -662,14 +662,16 @@ fn run(
 
         if let Some(spending) = spending.as_deref_mut() {
             let change = spending.tick(now());
-            if change.session_ended {
-                eprintln!(
-                    "payload capture has run out and has stopped. Connections are still attributed. \
-                     `flowlightd budget --renew` starts it again."
-                );
-            }
-            if change.day_began {
-                eprintln!("a new day: every process has its share of payload capture back.");
+            if !change.is_quiet() {
+                if change.session_ended {
+                    eprintln!(
+                        "payload capture has run out and has stopped. Connections are still attributed. \
+                         `flowlightd budget --renew` starts it again."
+                    );
+                }
+                if change.day_began {
+                    eprintln!("a new day: every process has its share of payload capture back.");
+                }
             }
         }
 
@@ -978,9 +980,7 @@ fn keep(result: anyhow::Result<()>) {
 }
 
 /// Takes the two maps the budget is held against.
-fn take_budget_maps(
-    ebpf: &mut Ebpf,
-) -> anyhow::Result<(Array<MapData, u8>, BpfHashMap<MapData, u32, u8>)> {
+fn take_budget_maps(ebpf: &mut Ebpf) -> anyhow::Result<spending::Maps> {
     let capturing = ebpf
         .take_map("CAPTURING")
         .ok_or_else(|| anyhow!("the compiled program has no CAPTURING map"))?;
