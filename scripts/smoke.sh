@@ -525,11 +525,16 @@ sudo "$binary" --database "$database" --certificates "$certificates" demo --into
     | grep -q "Nothing in it happened" || fail "the demonstration does not say what it is."
 sudo "$binary" --database "$demo" --certificates "$certificates" --json report --by host --since 86400 \
     | jq -e '.rows | length >= 3' >/dev/null || fail "the demonstration has nothing to photograph."
-said=$(sudo "$binary" --database "$demo" --certificates "$certificates" coverage)
-case "${said%%$'\n'*}" in
-    "This is a demonstration database."*) ;;
+# On stderr, not stdout: stdout is the answer, and a notice printed into it makes `--json` unparseable.
+said=$(sudo "$binary" --database "$demo" --certificates "$certificates" coverage 2>&1 >/dev/null)
+case "$said" in
+    *"This is a demonstration database."*) ;;
     *) fail "reading a demonstration does not say that is what it is." ;;
 esac
+# And the answer itself stays machine-readable, which is the reason the notice is not in it.
+sudo "$binary" --database "$demo" --certificates "$certificates" --json coverage 2>/dev/null \
+    | jq -e '.requests > 0' >/dev/null \
+    || fail "a demonstration's JSON is not parseable, or says nothing was read."
 # It will not write over anything, and the daemon will not watch into one: real traffic mixed into a
 # demonstration would leave two things nobody can tell apart.
 if sudo "$binary" --database "$database" --certificates "$certificates" demo --into "$demo" >/dev/null 2>&1; then

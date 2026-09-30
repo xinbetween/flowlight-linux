@@ -95,13 +95,15 @@ pub fn run(
     let mut store = Store::open(database)?;
     let mut out = std::io::stdout().lock();
 
-    // Before anything else it says. A demonstration database is meant to be photographed, and a screenshot
-    // that does not say what it is of is a screenshot somebody will read as a machine's real traffic.
+    // Before anything else it says, and on stderr rather than stdout. A demonstration database is meant to be
+    // photographed, and a screenshot that does not say what it is of is a screenshot somebody will read as a
+    // machine's real traffic — but stdout is the answer, and a notice printed into it turns `--json` into
+    // something no program can parse. Which is how this was found.
+    //
+    // There is no equivalent for the socket, because the socket never serves one: the daemon refuses to start
+    // against a demonstration database at all.
     if store.is_demonstration()? {
-        writeln!(
-            out,
-            "This is a demonstration database. Nothing in it happened.\n"
-        )?;
+        eprintln!("This is a demonstration database. Nothing in it happened.");
     }
 
     match command {
