@@ -470,9 +470,15 @@ if [ "$(printf '%s' "$narrowed" | jq '.rows | length')" -ge "$everything" ]; the
 fi
 # The terminal says so above the rows, every time, because a count of a subset read as a total is the whole
 # failure this feature can cause.
-sudo "$binary" --database "$database" --certificates "$certificates" report --by host --since 3600 \
-    | head -1 | grep -q "Narrowed to process curl" \
-    || fail "a narrowed report does not say so above its rows."
+#
+# Read from a variable rather than piped into `head`: `head` closes the pipe after one line, the daemon gets
+# EPIPE for the rest of the report, and `pipefail` then fails the pipeline whatever the line said. That is how
+# this assertion first "failed" against output that was correct.
+printed=$(sudo "$binary" --database "$database" --certificates "$certificates" report --by host --since 3600)
+case "${printed%%$'\n'*}" in
+    "Narrowed to process curl"*) ;;
+    *) fail "a narrowed report does not say so above its rows." ;;
+esac
 
 # And the one it cannot narrow. An address is recorded at connect(), where the name was already resolved and
 # thrown away, so "these addresses, but only api.example.com" is a question the data cannot answer.
@@ -516,9 +522,11 @@ sudo "$binary" --database "$database" --certificates "$certificates" demo --into
     | grep -q "Nothing in it happened" || fail "the demonstration does not say what it is."
 sudo "$binary" --database "$demo" --certificates "$certificates" --json report --by host --since 86400 \
     | jq -e '.rows | length >= 3' >/dev/null || fail "the demonstration has nothing to photograph."
-sudo "$binary" --database "$demo" --certificates "$certificates" coverage \
-    | head -1 | grep -q "demonstration database" \
-    || fail "reading a demonstration does not say that is what it is."
+said=$(sudo "$binary" --database "$demo" --certificates "$certificates" coverage)
+case "${said%%$'\n'*}" in
+    "This is a demonstration database."*) ;;
+    *) fail "reading a demonstration does not say that is what it is." ;;
+esac
 # It will not write over anything, and the daemon will not watch into one: real traffic mixed into a
 # demonstration would leave two things nobody can tell apart.
 if sudo "$binary" --database "$database" --certificates "$certificates" demo --into "$demo" >/dev/null 2>&1; then
