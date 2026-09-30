@@ -1903,7 +1903,7 @@ mod tests {
                 rpc_tool: None,
             })
             .unwrap();
-        let view = requests(&mut store, 0, 10).unwrap();
+        let view = requests(&mut store, 0, 10, None).unwrap();
         assert_eq!(view.len(), 1);
         let json = serde_json::to_string(&view[0]).unwrap();
         for expected in [
