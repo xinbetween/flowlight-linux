@@ -838,7 +838,10 @@ mod tests {
 
     // Simulation
 
-    fn history(rows: &[(Option<&str>, Option<&str>, Option<u16>, i64)]) -> Vec<(Facts, i64)> {
+    /// One row of history as these tests write it: agent, host, port, and how many times.
+    type Past<'a> = (Option<&'a str>, Option<&'a str>, Option<u16>, i64);
+
+    fn history(rows: &[Past<'_>]) -> Vec<(Facts, i64)> {
         rows.iter()
             .map(|(agent, host, port, count)| {
                 (
