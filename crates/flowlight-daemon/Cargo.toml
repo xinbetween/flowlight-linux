@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 flowlight-agents.workspace = true
+flowlight-ask.workspace = true
 flowlight-common = { workspace = true, features = ["user"] }
 flowlight-rules.workspace = true
 flowlight-store.workspace = true

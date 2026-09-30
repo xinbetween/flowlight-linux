@@ -93,6 +93,25 @@ pub enum Request {
         #[serde(flatten)]
         change: crate::views::ExportChange,
     },
+    /// Which model answers questions, and what asking one would mean.
+    Model,
+    /// Change which model answers.
+    SetModel {
+        /// The fields to change. Anything left out is left alone.
+        #[serde(flatten)]
+        change: crate::views::AskChange,
+        /// A key for a provider that needs one. Never returned, by anything.
+        ///
+        /// It crosses a socket whose mode is 600 and whose owner the kernel checks, which is the same
+        /// boundary the database is behind. An empty string forgets the one on file.
+        #[serde(default)]
+        key: Option<String>,
+    },
+    /// Ask a question about what this machine has been doing.
+    Question {
+        /// The question, in plain English.
+        question: String,
+    },
     /// Write a rule.
     Write {
         /// `allow`, `ask` or `block`.
@@ -283,7 +302,8 @@ fn handle(line: &str, database: &Path, hello: &Hello) -> Result<String> {
         Request::Write { .. }
         | Request::Forget { .. }
         | Request::SetBudget { .. }
-        | Request::SetExport { .. } => Store::open(database)?,
+        | Request::SetExport { .. }
+        | Request::SetModel { .. } => Store::open(database)?,
         _ => Store::open_read_only(database)?,
     };
 
@@ -318,6 +338,38 @@ fn handle(line: &str, database: &Path, hello: &Hello) -> Result<String> {
             serde_json::to_string(&crate::views::set_budget(&mut store, &change, now)?)?
         }
         Request::Export => serde_json::to_string(&crate::views::export(&mut store)?)?,
+        Request::Model => serde_json::to_string(&crate::views::ask(
+            &mut store,
+            crate::asking::have_key(database),
+        )?)?,
+        Request::SetModel { change, key } => {
+            // The key first, so what comes back describes the state including it.
+            if let Some(key) = key {
+                crate::asking::set_key(database, &key)?;
+            }
+            serde_json::to_string(&crate::views::set_ask(
+                &mut store,
+                &change,
+                crate::asking::have_key(database),
+            )?)?
+        }
+        Request::Question { question } => {
+            let configuration = store.ask()?;
+            let on_file = crate::asking::have_key(database);
+            if let Some(reason) = configuration.why_not(on_file) {
+                anyhow::bail!("{reason}");
+            }
+            let key = crate::asking::key(database)?;
+            let answered = flowlight_ask::answer(
+                &configuration,
+                &key,
+                &question,
+                &mut store,
+                now,
+                &flowlight_ask::window::clock(now),
+            )?;
+            serde_json::to_string(&crate::views::answered(&question, &answered))?
+        }
         Request::SetExport { change } => {
             serde_json::to_string(&crate::views::set_export(&mut store, &change)?)?
         }

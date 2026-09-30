@@ -11,6 +11,7 @@
 //! Needs root, or `CAP_BPF` and `CAP_PERFMON`. There is no version of loading a probe that does not.
 
 mod agent;
+mod asking;
 mod blocking;
 mod control;
 mod exporting;
@@ -266,6 +267,46 @@ enum Command {
         /// Stop sending, keeping the destination and the agreement.
         #[arg(long)]
         off: bool,
+    },
+    /// Which model answers questions about this machine.
+    ///
+    /// Flowlight for Linux has no model of its own: there are no bundled weights, and no default pointing at
+    /// somebody's API. With no options, says what is configured and what asking would mean.
+    Model {
+        /// `local` for a model server on this machine, `compatible` for an OpenAI-shaped endpoint,
+        /// `anthropic`, or `gemini`.
+        #[arg(long, value_parser = ["local", "compatible", "anthropic", "gemini"])]
+        kind: Option<String>,
+        /// Where the model is. A default is filled in for the kinds that have an obvious one.
+        #[arg(long, value_name = "URL")]
+        endpoint: Option<String>,
+        /// Which model to name in the request. There is no default: the wrong guess is a 404 that reads
+        /// like a broken feature.
+        #[arg(long, value_name = "NAME")]
+        model: Option<String>,
+        /// A file holding the key, for a provider that needs one.
+        ///
+        /// A path rather than the key itself, because a key on a command line is a key in the shell's
+        /// history and in every process listing on the machine for as long as the command runs.
+        #[arg(long, value_name = "PATH")]
+        key_file: Option<PathBuf>,
+        /// Forget the key on file.
+        #[arg(long)]
+        forget_key: bool,
+        /// Stop answering questions, keeping what is configured.
+        #[arg(long)]
+        off: bool,
+    },
+    /// Ask a question about what this machine has been doing.
+    ///
+    /// Needs a model, which `model` configures. The model never sees the database: it may name one of a
+    /// fixed list of queries, which Flowlight runs and hands back totals and names.
+    Query {
+        /// The question, in plain English.
+        question: Vec<String>,
+        /// Show the exact body sent to the model, and every query it ran.
+        #[arg(long)]
+        show_work: bool,
     },
     /// What a rule would change, without writing it.
     ///

@@ -159,9 +159,8 @@ Useful flags:
 
 
 Plus subcommands that read the database rather than the kernel — `history --since 6h`, `agents`, `summary`,
-`coverage --since 24h`, `budget` — and six for rules: `block`, `allow`, `ask`, `simulate`, `rules`,
-`forget`. `--json` works on
-all of them.
+`coverage --since 24h`, `budget`, `export`, `model`, `query` — and six for rules: `block`, `allow`, `ask`,
+`simulate`, `rules`, `forget`. `--json` works on all of them.
 
 If it refuses to start, the message says why — an unmounted tracefs, a kernel built without the tracepoint,
 and a policy that forbids loading programs are three different problems and it will not conflate them.
@@ -374,7 +373,7 @@ A native window, GTK4, running **as you** while the daemon runs as root.
 flowlight
 ```
 
-Six pages — **Live**, **Agents**, **Rules**, **Coverage**, **Budget**, **Export** — and a window selector from fifteen
+Seven pages — **Live**, **Agents**, **Rules**, **Coverage**, **Budget**, **Export**, **Ask** — and a window selector from fifteen
 minutes to seven days. On the Agents page each host an agent reached carries the two buttons the macOS build settled
 on: block it **for this agent**, or block it **everywhere**.
 
@@ -400,6 +399,76 @@ sudo ./target/release/flowlightd --web
 ```
 
 and it prints its own warning, because on a shared machine it is a disclosure.
+
+### Ask — with your own model
+
+The one feature that is deliberately not parity with macOS. The macOS build leans on a model the operating
+system provides; Linux has none, so Flowlight does not carry one either. **No bundled weights, and no default
+endpoint pointing at somebody's API.** Until a model is configured, the feature is off and says so:
+
+```console
+$ flowlightd query "what did claude reach today?"
+Error: Ask is off. There is no model in Flowlight for Linux, so one has to be configured: `flowlightd model
+--kind local --model <name>` for a server on this machine, or a provider and a key.
+```
+
+A model server already running on this machine is the case that sends nothing anywhere:
+
+```console
+$ sudo flowlightd model --kind local --model llama3.2
+Your question goes to http://127.0.0.1:11434/v1/chat/completions, which is on this machine or this network.
+Nothing crosses the internet.
+What is sent is the question, the instructions, and the totals and names that Flowlight's own queries return.
+Never a row of history, never a request target, and never anything the model did not ask for.
+The model cannot see the database. It may name one of a fixed list of queries, which Flowlight runs; there is
+no query language and no way to write one.
+
+Ready. `flowlightd query "…"` asks llama3.2 a question.
+
+$ flowlightd query "which hosts are new today, and for which agent?"
+claude reached two hosts today it had never reached before: telemetry.example (14 requests) and
+registry.npmjs.org (3). Nothing else was new.
+
+(from agents, newHosts, agentHosts)
+```
+
+`--kind anthropic`, `--kind gemini` and `--kind compatible --endpoint URL` send somewhere else, and say so.
+
+#### What the model is given, and what it is not
+
+It is given the question, a set of instructions, and the results of queries it names from a fixed list. It is
+not given the database, a table, or a query language. That list is a Rust enum with twelve cases and no `sql`
+one, so "the model never sees your history" is a property of the types rather than a promise:
+
+| | |
+| --- | --- |
+| `totals` | requests, connections, bytes and processes in a window |
+| `topProcesses` `topHosts` | the busiest, with their counts |
+| `newHosts` | hosts reached in this window and never before it |
+| `agents` `agentHosts` `agentTools` | what an agent did, and what it said to MCP servers |
+| `coverage` | what was **not** read |
+| `overTime` | requests and bytes per bucket |
+| `rules` `settings` | how this machine is configured |
+| `howTo` | Flowlight's own guide, so a model never invents a flag |
+
+Every one returns counts, totals and names. None returns a request, a target, a header or a tool's arguments.
+Every window has an end and every list has a limit, so a model cannot ask for the database one page at a time.
+`flowlightd query --show-work "…"` prints the exact body that was sent and every query that ran.
+
+Three more decisions worth stating:
+
+- **A key is a file, not a setting.** It lives beside the database, mode 600, created restricted rather than
+  created and then restricted — and Flowlight refuses to read it if the mode is wider. It is not in the
+  database, because a database gets copied: this one holds a history somebody may reasonably attach to a bug
+  report. `flowlightd model --key-file PATH` puts one there; nothing ever reads one back out.
+- **Plain HTTP only where there is no network to listen on.** `http://` is accepted for loopback, `.local`
+  and the private ranges — that is how somebody points this at their own machine. Anywhere else it is refused,
+  because a key and a question about this machine's own traffic would cross the network in the clear.
+- **Flowlight's connection to the model is recorded like anybody else's**, attributed to `flowlightd`. A tool
+  that hid its own traffic would have no business showing yours.
+
+And one about answers rather than privacy: the queries that produced an answer are printed under it, always.
+An answer with nothing under it is a sentence a model made up, and that is the only way to tell.
 
 ### Export
 
@@ -515,8 +584,8 @@ Stated here rather than discovered later:
 Two milestones, released a feature at a time: **0.1 — see everything, honestly**, then **0.2 — parity with the
 macOS build**. [ROADMAP.md](ROADMAP.md) has the sequence and, more usefully, what this will not do.
 
-One thing in 0.2 is deliberately not parity. macOS has a system model that the Ask feature leans on; Linux has
-none, so on Linux you configure a model — local or remote — or the feature stays off. No bundled weights, and
+One thing in 0.2 is deliberately not parity, and it is done: macOS has a system model that the Ask feature
+leans on, so on Linux you configure one — local or remote — or the feature stays off. No bundled weights, and
 no quiet fallback to somebody's API.
 
 ## Relationship to the macOS build

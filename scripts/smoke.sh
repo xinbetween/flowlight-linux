@@ -24,8 +24,13 @@ database=$(mktemp -d)/flowlight.db
 export_dir=$(mktemp -d)
 export_file=$export_dir/exported.jsonl
 export_second=$export_dir/elsewhere.jsonl
+model_log=$(mktemp)
+model_port_file=$(mktemp)
+model_key=$(mktemp)
 cleanup() {
     rm -f "$output" "$log" "$stored" "$reported" "$coverage_json" "$agents_json"
+    rm -f "$model_log" "$model_port_file" "$model_key"
+    [ -n "${model_server:-}" ] && kill "$model_server" 2>/dev/null
     rm -rf "$(dirname "$fake_agent")"
     [ "${agent_tested:-no}" = yes ] && rm -f "$agent_config"
     sudo rm -rf "$(dirname "$database")" "$export_dir"
@@ -65,7 +70,7 @@ PYTHON
 }
 
 echo "Watching..."
-sudo "$binary" --json --seconds 110 --database "$database" --socket "$socket" --web 127.0.0.1:0 \
+sudo "$binary" --json --seconds 140 --database "$database" --socket "$socket" --web 127.0.0.1:0 \
     --export-seconds 2 >"$output" 2>"$log" &
 watcher=$!
 
@@ -401,6 +406,110 @@ echo "OK: changing where it goes takes the agreement with it"
 
 ask '{"op":"set-export","off":true}' | jq -e '.ok.enabled == false' >/dev/null \
     || fail "export would not turn off."
+
+# Ask: a question about this machine, answered by a model somebody configured. There is no model in
+# Flowlight for Linux -- that is the one deliberate difference from the macOS build -- so the first thing
+# asserted is that asking without one is refused rather than quietly sent somewhere.
+if sudo "$binary" --database "$database" query "what happened today?" 2>/dev/null; then
+    fail "a question was answered with no model configured."
+fi
+sudo "$binary" --database "$database" query "what happened?" 2>&1 | grep -q "no model" \
+    || fail "asking with no model configured did not say that there is no model."
+echo "OK: there is no model until somebody configures one"
+
+# A key and a question about this machine must not cross the network in the clear.
+if sudo "$binary" --database "$database" model --kind compatible \
+    --endpoint "http://a-collector.example/v1/chat/completions" 2>/dev/null; then
+    fail "a plain http endpoint on the internet was accepted."
+fi
+echo "OK: a plain http endpoint that is not local is refused"
+
+# A key goes in a file, mode 600, next to the database -- never in the database, which gets copied.
+printf 'a-smoke-test-key\n' >"$model_key"
+sudo "$binary" --database "$database" model --kind anthropic --key-file "$model_key" >/dev/null
+key_file="$(dirname "$database")/ask.key"
+sudo test -f "$key_file" || fail "the key was not written beside the database."
+key_mode=$(sudo stat -c '%a' "$key_file")
+[ "$key_mode" = 600 ] || fail "the key file is mode $key_mode; anybody on this machine could read it."
+if sudo grep -qF "a-smoke-test-key" "$database"; then
+    fail "the key was written into the database."
+fi
+echo "OK: a key is a file of its own, mode 600, and is not in the database"
+
+sudo "$binary" --database "$database" --json model | jq -e '.key_on_file == true' >/dev/null \
+    || fail "the key on file was not reported."
+if sudo "$binary" --database "$database" --json model | grep -qF "a-smoke-test-key"; then
+    fail "the key was printed back."
+fi
+echo "OK: whether there is a key is reported; the key never is"
+
+sudo "$binary" --database "$database" model --forget-key >/dev/null
+if sudo test -f "$key_file"; then
+    fail "the key was not forgotten."
+fi
+
+# And now a model that is not a model: a loopback server speaking the OpenAI shape, so the whole loop runs
+# against the real daemon, the real socket and the real query runner.
+python3 "$(dirname "$0")/fake-model.py" "$model_log" "$model_port_file" &
+model_server=$!
+for _ in $(seq 40); do
+    if [ -s "$model_port_file" ]; then break; fi
+    sleep 0.25
+done
+model_port=$(cat "$model_port_file")
+[ -n "$model_port" ] || fail "the fake model server never started."
+echo "A model server that is not a model, on port $model_port"
+
+sudo "$binary" --database "$database" model --kind local \
+    --endpoint "http://127.0.0.1:$model_port/v1/chat/completions" --model smoke-model \
+    | grep -q "Nothing crosses the internet" \
+    || fail "a local endpoint was not described as local."
+sudo "$binary" --database "$database" --json model | jq -e '.ready == true and .sends_off_the_machine == false' \
+    >/dev/null || fail "a configured local model is not ready."
+echo "OK: a local model server is configured, and is described as sending nothing anywhere"
+
+answer=$(sudo "$binary" --database "$database" query "how much happened today?")
+printf '%s\n' "$answer"
+printf '%s' "$answer" | grep -q "FLOWLIGHT-SAW" \
+    || fail "the model's answer did not come back."
+printf '%s' "$answer" | grep -q "totals" \
+    || fail "the answer did not say which queries produced it."
+echo "OK: a question goes to the model, the model names a query, Flowlight runs it and the answer comes back"
+
+# The same question over the socket, which is the path the window takes.
+ask "{\"op\":\"question\",\"question\":\"how much happened today?\"}" \
+    | jq -e '.ok.answer | test("FLOWLIGHT-SAW")' >/dev/null \
+    || fail "the socket would not answer a question."
+ask "{\"op\":\"question\",\"question\":\"how much happened today?\"}" \
+    | jq -e '[.ok.calls[] | select(.query == "totals")] | length > 0' >/dev/null \
+    || fail "the socket did not report which queries ran."
+echo "OK: the window's path answers the same question the same way"
+
+# The boundary, end to end: everything the daemon sent to the model, checked for the things a model must
+# never be handed. A request target is the one that matters -- it is in the database and in no query result.
+grep -q '"runQuery"' "$model_log" || fail "the model was never offered Flowlight's query tool."
+grep -q '"totals"' "$model_log" || fail "the model was never told which queries exist."
+for forbidden in "/budget-test-path" "$secret" "$mcp_secret" "a-smoke-test-key"; do
+    if grep -qF "$forbidden" "$model_log"; then
+        fail "'$forbidden' was sent to the model."
+    fi
+done
+# And no SQL, because there is no way to express it: the tool takes a name from a list.
+if grep -qi "SELECT " "$model_log"; then
+    fail "something that looks like SQL was sent to the model."
+fi
+echo "OK: what reached the model was the question, the query list and the totals -- and nothing else"
+
+# A model that answers with a query nobody wrote gets a sentence back, not an empty result. Asserted through
+# the real loop by naming a query that does not exist in a second fake reply would need a second server, so
+# this is the unit-tested half; what is asserted here is the shape of the tool the model was handed.
+sudo "$binary" --database "$database" model --off >/dev/null
+if sudo "$binary" --database "$database" query "anything?" 2>/dev/null; then
+    fail "a question was answered after Ask was turned off."
+fi
+echo "OK: turning it off stops questions being answered"
+# Back on for the rest of the run, without needing to be reconfigured.
+sudo "$binary" --database "$database" model --model smoke-model >/dev/null
 
 echo "Turning payload capture off..."
 before=$(ask '{"op":"requests","since":600,"limit":400}' | jq '[.ok[] | select(.process == "curl")] | length')

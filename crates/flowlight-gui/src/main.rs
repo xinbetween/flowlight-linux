@@ -25,7 +25,7 @@ const REFRESH_SECONDS: u32 = 2;
 const RECENT: usize = 300;
 
 /// How many pages the switcher has.
-const PAGES: usize = 6;
+const PAGES: usize = 7;
 
 /// The windows the picker offers, and what each means in seconds.
 const WINDOWS: &[(&str, i64)] = &[
@@ -65,6 +65,7 @@ fn socket_from_arguments() -> PathBuf {
 /// parameter list that long is one where two of them get swapped.
 struct Pages {
     live: gtk::Box,
+    ask: gtk::Box,
     agents: gtk::Box,
     rules: gtk::Box,
     coverage: gtk::Box,
@@ -80,6 +81,13 @@ struct State {
     /// What each page last drew, so that a second identical answer does not throw away the scroll
     /// position somebody was reading from.
     drawn: RefCell<[String; PAGES]>,
+    /// The questions asked in this window and what came back.
+    ///
+    /// Held here rather than fetched, because a transcript is not something the daemon keeps: a question is
+    /// answered and the answer belongs to whoever asked it.
+    turns: RefCell<Vec<Turn>>,
+    /// Whether a question is in flight, so the page can say so rather than looking broken for a minute.
+    thinking: std::cell::Cell<bool>,
 }
 
 fn build(application: &adw::Application, socket: PathBuf) {
@@ -87,6 +95,8 @@ fn build(application: &adw::Application, socket: PathBuf) {
         socket,
         window: WINDOWS.get(1).map_or(3_600, |(_, seconds)| *seconds),
         drawn: RefCell::new(Default::default()),
+        turns: RefCell::new(Vec::new()),
+        thinking: std::cell::Cell::new(false),
     });
     let window_seconds = Rc::new(RefCell::new(state.window));
 
@@ -98,6 +108,7 @@ fn build(application: &adw::Application, socket: PathBuf) {
         coverage: page(&stack, "coverage", "Coverage", "dialog-question-symbolic"),
         budget: page(&stack, "budget", "Budget", "emblem-important-symbolic"),
         export: page(&stack, "export", "Export", "send-to-symbolic"),
+        ask: page(&stack, "ask", "Ask", "dialog-information-symbolic"),
     };
 
     let picker =
@@ -244,6 +255,22 @@ async fn refresh(
                 Err(err) => say(status, &err),
             }
         }
+        "ask" => match fetch::<protocol::Ask>(socket, r#"{"op":"model"}"#.to_owned()).await {
+            Ok(row) => {
+                // The transcript and the "thinking" flag are part of what is drawn, so a redraw happens when
+                // an answer arrives and not only when the configuration changes.
+                let conversation = Conversation {
+                    model: &row,
+                    turns: &state.turns.borrow(),
+                    thinking: state.thinking.get(),
+                };
+                draw(state, 6, &conversation, &pages.ask, |column| {
+                    render_ask(state, column, &row);
+                });
+                say(status, "");
+            }
+            Err(err) => say(status, &err),
+        },
         "export" => {
             match fetch::<protocol::Export>(socket, r#"{"op":"export"}"#.to_owned()).await {
                 Ok(row) => {
@@ -1094,6 +1121,234 @@ fn render_export(state: &Rc<State>, column: &gtk::Box, row: &protocol::Export) {
     state_of_it.add_suffix(&button);
     agreement.add(&state_of_it);
     column.append(&agreement);
+}
+
+/// One question asked in this window, and what came back.
+#[derive(Debug, Clone, serde::Serialize)]
+struct Turn {
+    question: String,
+    answer: String,
+    /// The queries the model ran, as a line each.
+    work: Vec<String>,
+    /// What went wrong, if the question could not be answered.
+    failure: Option<String>,
+}
+
+/// What the Ask page draws: the configuration and the conversation together.
+#[derive(serde::Serialize)]
+struct Conversation<'a> {
+    model: &'a protocol::Ask,
+    turns: &'a [Turn],
+    thinking: bool,
+}
+
+/// Ask: a question about this machine, answered by a model somebody configured.
+///
+/// The disclosure is above the box you type in, not behind a settings button. There is no model in Flowlight
+/// for Linux, so every question goes somewhere — and where that is should be on the screen where the question
+/// is asked.
+fn render_ask(state: &Rc<State>, column: &gtk::Box, row: &protocol::Ask) {
+    let said = adw::PreferencesGroup::builder()
+        .title("What asking means")
+        .build();
+    for sentence in &row.disclosure {
+        said.add(&adw::ActionRow::builder().title(sentence).build());
+    }
+    if let Some(reason) = &row.why_not {
+        said.add(
+            &adw::ActionRow::builder()
+                .title("Not ready")
+                .subtitle(reason)
+                .build(),
+        );
+    }
+    column.append(&said);
+
+    let asking = adw::PreferencesGroup::builder().title("Ask").build();
+    let entry = adw::EntryRow::builder()
+        .title("Your question")
+        .show_apply_button(true)
+        .sensitive(row.ready && !state.thinking.get())
+        .build();
+    {
+        let state = Rc::clone(state);
+        entry.connect_apply(move |entry| {
+            let asked = entry.text().to_string();
+            if asked.trim().is_empty() {
+                return;
+            }
+            entry.set_text("");
+            ask_the_model(&state, &asked);
+        });
+    }
+    asking.add(&entry);
+    if state.thinking.get() {
+        asking.add(
+            &adw::ActionRow::builder()
+                .title("Thinking…")
+                .subtitle(
+                    "A model running on this machine can take a while over the first question.",
+                )
+                .build(),
+        );
+    }
+    column.append(&asking);
+
+    for turn in state.turns.borrow().iter().rev() {
+        let group = adw::PreferencesGroup::builder()
+            .title(turn.question.clone())
+            .build();
+        match &turn.failure {
+            Some(failure) => group.add(
+                &adw::ActionRow::builder()
+                    .title("That could not be answered")
+                    .subtitle(failure.clone())
+                    .build(),
+            ),
+            None => group.add(
+                &adw::ActionRow::builder()
+                    .title(turn.answer.clone())
+                    .subtitle(if turn.work.is_empty() {
+                        // An answer with no queries under it is a sentence a model made up, and saying so is
+                        // more useful than leaving the space blank.
+                        "No queries were run for this, so it is not an answer about this machine."
+                            .to_owned()
+                    } else {
+                        turn.work.join("  ·  ")
+                    })
+                    .build(),
+            ),
+        }
+        column.append(&group);
+    }
+
+    let configuring = adw::PreferencesGroup::builder()
+        .title("Which model")
+        .description(
+            "Flowlight for Linux has no model of its own. A server on this machine sends nothing anywhere; \
+             a provider needs a key, which goes in a file that only root can read — `flowlightd model \
+             --key-file PATH`.",
+        )
+        .build();
+
+    let kinds: Vec<&str> = row.every_kind.iter().map(String::as_str).collect();
+    let kind = adw::ComboRow::builder()
+        .title("Provider")
+        .model(&gtk::StringList::new(&kinds))
+        .build();
+    kind.set_selected(
+        row.every_kind
+            .iter()
+            .position(|candidate| *candidate == row.kind)
+            .unwrap_or(0) as u32,
+    );
+    {
+        let state = Rc::clone(state);
+        let every = row.every_kind.clone();
+        kind.connect_selected_notify(move |combo| {
+            if let Some(chosen) = every.get(combo.selected() as usize) {
+                change_model(&state, "kind", &format!("\"{chosen}\""));
+            }
+        });
+    }
+    configuring.add(&kind);
+
+    let endpoint = adw::EntryRow::builder()
+        .title("Endpoint")
+        .text(row.endpoint.clone().unwrap_or_default())
+        .show_apply_button(true)
+        .build();
+    {
+        let state = Rc::clone(state);
+        endpoint.connect_apply(move |entry| {
+            let value = serde_json::to_string(&entry.text().to_string())
+                .unwrap_or_else(|_| "\"\"".to_owned());
+            change_model(&state, "endpoint", &value);
+        });
+    }
+    configuring.add(&endpoint);
+
+    let model = adw::EntryRow::builder()
+        .title("Model")
+        .text(row.model.clone().unwrap_or_default())
+        .show_apply_button(true)
+        .build();
+    {
+        let state = Rc::clone(state);
+        model.connect_apply(move |entry| {
+            let value = serde_json::to_string(&entry.text().to_string())
+                .unwrap_or_else(|_| "\"\"".to_owned());
+            change_model(&state, "model", &value);
+        });
+    }
+    configuring.add(&model);
+
+    if row.needs_key {
+        configuring.add(
+            &adw::ActionRow::builder()
+                .title(if row.key_on_file {
+                    "A key is on file"
+                } else {
+                    "No key on file"
+                })
+                // Never an entry for it. A key typed into a window is a key in that window's memory and, the
+                // moment anything goes wrong, in a screenshot.
+                .subtitle("Set it with `sudo flowlightd model --key-file PATH`.")
+                .build(),
+        );
+    }
+    column.append(&configuring);
+}
+
+/// Asks the question, and lets the page redraw when there is an answer.
+fn ask_the_model(state: &Rc<State>, asked: &str) {
+    state.thinking.set(true);
+    *state.drawn.borrow_mut() = Default::default();
+    let socket = state.socket.clone();
+    let request = protocol::question(asked);
+    let asked = asked.to_owned();
+    let state = Rc::clone(state);
+    glib::spawn_future_local(async move {
+        let answered: Result<protocol::Answered, String> = fetch(socket, request).await;
+        let turn = match answered {
+            Ok(answered) => Turn {
+                question: asked,
+                answer: answered.answer,
+                work: answered
+                    .calls
+                    .iter()
+                    .map(|ran| {
+                        if ran.failed {
+                            format!("{} (refused)", ran.query)
+                        } else {
+                            ran.query.clone()
+                        }
+                    })
+                    .collect(),
+                failure: None,
+            },
+            Err(err) => Turn {
+                question: asked,
+                answer: String::new(),
+                work: Vec::new(),
+                failure: Some(err),
+            },
+        };
+        state.turns.borrow_mut().push(turn);
+        state.thinking.set(false);
+        *state.drawn.borrow_mut() = Default::default();
+    });
+}
+
+/// Changes one field of the model configuration.
+fn change_model(state: &Rc<State>, field: &str, value: &str) {
+    let socket = state.socket.clone();
+    let request = protocol::set_model(field, value);
+    let state = Rc::clone(state);
+    glib::spawn_future_local(async move {
+        let _: Result<serde_json::Value, String> = fetch(socket, request).await;
+        *state.drawn.borrow_mut() = Default::default();
+    });
 }
 
 /// Changes one field of the export configuration and lets the next refresh show the result.
