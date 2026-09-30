@@ -19,12 +19,25 @@ echo "== $name"
 
 rpm -i "$package" || fail "the package would not install on $name"
 
-# No dependencies, because a statically linked binary has none. `rpmlib(...)` entries are RPM's own format
-# requirements rather than anything that has to be installed, so they are not what this is about.
-declared=$(rpm -q --requires flowlight | grep -v '^rpmlib' | grep -v '^$' || true)
+# Nothing has to be installed for the binary to run, which is the claim worth checking. Three kinds of entry
+# are RPM bookkeeping rather than that claim, and each is allowed on purpose:
+#
+#   rpmlib(...)         what this file format needs of the rpm reading it, not of the machine
+#   /bin/sh             the scriptlets are shell, and every distribution has a shell
+#   config(flowlight)   what `%config(noreplace)` on the unit file generates, so that an edited unit is not
+#                       overwritten by an upgrade — the same promise the `.deb`'s conffiles make
+#
+# Anything else — a shared library, a package name — would mean the binary is not as portable as v0.5.0 says.
+echo "--- what it requires"
+rpm -q --requires flowlight | sed 's/^/    /'
+declared=$(rpm -q --requires flowlight \
+    | grep -v '^rpmlib(' \
+    | grep -v '^/bin/sh$' \
+    | grep -v '^config(flowlight)' \
+    | grep -v '^[[:space:]]*$' || true)
 if [ -n "$declared" ]; then
-    echo "$declared"
-    fail "the package declares a dependency it does not have"
+    printf 'unexpected: %s\n' "$declared"
+    fail "the package declares a dependency the binary does not have"
 fi
 
 test -x /usr/sbin/flowlightd || fail "the daemon is not where the package said it would be"
