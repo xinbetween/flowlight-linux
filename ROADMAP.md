@@ -1,6 +1,7 @@
 # Roadmap
 
-Two milestones. **0.1 — see everything, honestly**, then **0.2 — parity with the macOS build**.
+Three milestones. **0.1 — see everything, honestly**, then **0.2 — parity with the macOS build**, then
+**0.3 — installing it without a compiler**.
 
 ## 0.1 — see everything, honestly
 
@@ -49,6 +50,25 @@ blocking traffic you cannot attribute, and no point simulating a rule against hi
 | **0.2.8** | **Interception** | Redirect and terminate, for the cases that need a mocked response or refusal of one request rather than a whole connection. Carries the certificate-trust work — Python's certifi, Java's keystore, NSS — and is opt-in for exactly that reason. | [released](https://github.com/xinbetween/flowlight-linux/releases/tag/v0.2.8) |
 | **0.2.9** | **Launching an agent through Flowlight** | The Linux answer to 0.9.7: start an agent in an environment Flowlight already governs, without assuming a terminal, so that a graphical launcher or a supervisor works too. | |
 | **0.2.10** | **Conformance with macOS** | Rule semantics as language-neutral cases, run by both test suites, so that two implementations of "block" cannot quietly come to mean different things. Late on purpose: there has to be something to conform to. | |
+
+## 0.3.x — installing it without a compiler
+
+Today the only way to get this is to clone it and build it, which means a nightly toolchain and `bpf-linker` on
+the machine that runs it. That is a reasonable thing to ask of somebody trying it out and an unreasonable thing
+to ask of everybody else, so the next milestone is `apt install flowlight`.
+
+The good news first: **nothing has to be compiled on the machine that runs it.** The eBPF programs are compiled
+into the binary by `aya-build` and loaded from it, so there are no kernel headers to match, no DKMS, no clang at
+install time, and no module to rebuild when the kernel is upgraded. A package is two binaries, a unit file and a
+directory.
+
+| | | | |
+| --- | --- | --- | --- |
+| **0.3.0** | **A `.deb`** | `flowlightd` and a systemd unit, `amd64` and `arm64`, attached to each release. The unit ships **disabled**: a tool that reads every HTTPS request on a machine must not start doing it because somebody installed it. Two packages, not one — `flowlight` for the daemon, `flowlight-gui` for the window — because a server has no reason to pull in GTK 4 and libadwaita, and the window needs libadwaita 1.5 (Ubuntu 24.04 and later) while the daemon needs only a kernel of 4.18. | |
+| **0.3.1** | **An apt repository** | A signed archive so `apt-get update` finds new versions: an `InRelease` signed with a key published beside it, served as static files. Adding a third-party repository is a decision to trust whoever holds that key for as long as it is in your sources, which is a larger thing to ask than downloading one file — so the `.deb` comes first and stays a first-class way to install. | |
+
+Neither is parity with anything; the macOS build ships a signed `.dmg` and a notarised app, which is the same
+problem solved by a different distribution's rules.
 
 ## What this will not do
 

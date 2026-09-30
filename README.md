@@ -38,6 +38,11 @@ Termination becomes a second, narrower mode that states what it costs.
 Tested on Ubuntu 24.04. Needs root, because loading an eBPF program does — there is no version of this that
 does not.
 
+There is no `.deb` yet, so this is the way in: clone it and build it. A package and an apt repository are
+[0.3 on the roadmap](ROADMAP.md) — worth saying that nothing has to be compiled on the machine that *runs*
+Flowlight even now, because the eBPF programs are compiled into the binary rather than built against the
+running kernel. The nightly toolchain below is a build-time requirement, not a runtime one.
+
 ```sh
 sudo apt-get install -y build-essential curl jq zstd git libgtk-4-dev libadwaita-1-dev
 
