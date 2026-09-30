@@ -336,6 +336,39 @@ of addresses to write down. The daemon says so when it loads such a rule rather 
 unenforced; the rule still matches and is reported when it is reached. `--no-block` turns enforcement off
 entirely.
 
+### What an agent is set up to do
+
+Flowlight reads the MCP servers out of an agent's configuration to compare what it was *given* with what it
+*reached*. The same files say a great deal more, and two parts of it are worth attention before a single
+request has been made:
+
+```console
+$ flowlightd agents --since 24h
+
+claude
+  412 request(s) from 7 process(es), 19 host(s), last 8 seconds ago
+
+  Set up to:
+      12 skill(s)
+       3 command(s)
+    hook        PreToolUse · Bash              /usr/local/bin/audit.sh
+    permission  Bash(git push:*)               allow
+       4 permission(s) that ask or refuse, which are not listed
+```
+
+A **hook** is a program the agent runs on its own behalf, at a moment it chooses. A **permission** is a
+decision somebody made once and has not looked at since. Neither is visible from any amount of watching the
+network — the traffic a hook causes looks exactly like traffic the agent caused, because it is.
+
+So those two are written out and the rest is counted: a person with forty skills does not want forty lines, and
+a person with one hook wants to know what it runs. A permission is flagged only when it **grants** rather than
+refuses, so `Bash(git push:*)` in `allow` stands out and `Bash(rm:*)` in `deny` does not.
+
+What is kept is the name and one line: a hook's command, a permission's decision, a skill's description. Not the
+contents of a skill, which is somebody's writing, and not the body of an instruction file, which is usually most
+of what they know about their own work. Paths are shown as `.claude/settings.json` rather than spelling out
+whose home they are in, because a path with a username in it ends up in a screenshot.
+
 ### Agents
 
 `claude` does not make requests. It spawns `node`, which spawns `bash`, which spawns `git`, which spawns

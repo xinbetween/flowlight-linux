@@ -540,7 +540,7 @@ checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
 name = "flowlight-agents"
-version = "0.4.0"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "serde",
@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "flowlight-ask"
-version = "0.4.0"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "flowlight-store",
@@ -561,14 +561,14 @@ dependencies = [
 
 [[package]]
 name = "flowlight-common"
-version = "0.4.0"
+version = "0.4.2"
 dependencies = [
  "aya",
 ]
 
 [[package]]
 name = "flowlight-daemon"
-version = "0.4.0"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "aya",
@@ -591,7 +591,7 @@ dependencies = [
 
 [[package]]
 name = "flowlight-ebpf"
-version = "0.4.0"
+version = "0.4.2"
 dependencies = [
  "aya-ebpf",
  "flowlight-common",
@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "flowlight-gui"
-version = "0.4.0"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -611,14 +611,14 @@ dependencies = [
 
 [[package]]
 name = "flowlight-owners"
-version = "0.4.0"
+version = "0.4.2"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "flowlight-proxy"
-version = "0.4.0"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "flowlight-agents",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "flowlight-rules"
-version = "0.4.0"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -642,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "flowlight-store"
-version = "0.4.0"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "flowlight-rules",

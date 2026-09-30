@@ -791,6 +791,9 @@ pub fn run(
                 return Ok(());
             }
             let configured = configured_servers();
+            // What each agent is set up to do, read once for all of them: it is a walk of the same
+            // directories either way.
+            let declared = flowlight_agents::workspace::scan(&crate::views::homes());
             for agent in agents {
                 let contacted: Vec<(String, i64)> = store
                     .hosts_for_agent(&agent.agent, now - window, 200)?
@@ -803,10 +806,20 @@ pub fn run(
                     .cloned()
                     .collect();
                 let domains = mcp::merge(&mine, &contacted, mcp::endpoints_for(&agent.agent));
+                let declares: Vec<&flowlight_agents::workspace::Capability> = declared
+                    .iter()
+                    .filter(|capability| {
+                        capability.agent == agent.agent || capability.agent == "any agent"
+                    })
+                    .collect();
                 if json {
-                    writeln!(out, "{}", line(&agent_view(&agent, &mine, &domains)))?;
+                    writeln!(
+                        out,
+                        "{}",
+                        line(&agent_view(&agent, &mine, &domains, &declares))
+                    )?;
                 } else {
-                    write!(out, "{}", agent_report(&agent, &mine, &domains))?;
+                    write!(out, "{}", agent_report(&agent, &mine, &domains, &declares))?;
                 }
             }
         }
@@ -933,6 +946,7 @@ fn agent_report(
     agent: &flowlight_store::AgentRow,
     configured: &[mcp::Server],
     domains: &[mcp::Domain],
+    declares: &[&flowlight_agents::workspace::Capability],
 ) -> String {
     let mut out = format!(
         "\n{}\n  {} request(s) from {} process(es), {} host(s), last {} seconds ago\n",
@@ -960,6 +974,8 @@ fn agent_report(
                 .join(", ")
         ));
     }
+
+    out.push_str(&declared_report(declares));
 
     if domains.is_empty() {
         out.push_str("\n  No hosts reached, and none configured.\n");
@@ -1202,6 +1218,18 @@ struct AgentView<'a> {
     last_seen: i64,
     configured: Vec<ServerView<'a>>,
     domains: Vec<DomainView<'a>>,
+    declares: Vec<CapabilityView<'a>>,
+}
+
+/// One thing an agent is set up to do.
+#[derive(Serialize)]
+struct CapabilityView<'a> {
+    kind: &'a str,
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'a str>,
+    source: &'a str,
+    sensitive: bool,
 }
 
 #[derive(Serialize)]
@@ -1260,6 +1288,7 @@ fn agent_view<'a>(
     agent: &'a flowlight_store::AgentRow,
     configured: &'a [mcp::Server],
     domains: &'a [mcp::Domain],
+    declares: &[&'a flowlight_agents::workspace::Capability],
 ) -> AgentView<'a> {
     AgentView {
         agent: &agent.agent,
@@ -1286,7 +1315,66 @@ fn agent_view<'a>(
                 servers: &domain.servers,
             })
             .collect(),
+        declares: declares
+            .iter()
+            .map(|capability| CapabilityView {
+                kind: capability.kind.as_str(),
+                name: &capability.name,
+                detail: capability.detail.as_deref(),
+                source: &capability.source,
+                sensitive: capability.sensitive,
+            })
+            .collect(),
     }
+}
+
+/// What an agent is set up to do, counted by kind, with the sensitive ones written out.
+///
+/// Counted rather than listed, except for the two that matter. A person with forty skills does not want forty
+/// lines; a person with one hook wants to know what it runs, because a hook is a program the agent starts on
+/// its own behalf and its traffic is indistinguishable from the agent's own.
+fn declared_report(declares: &[&flowlight_agents::workspace::Capability]) -> String {
+    use flowlight_agents::workspace::Kind;
+    if declares.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n  Set up to:\n");
+    for kind in [
+        Kind::Skill,
+        Kind::Subagent,
+        Kind::Command,
+        Kind::Plugin,
+        Kind::Instructions,
+    ] {
+        let many = declares
+            .iter()
+            .filter(|capability| capability.kind == kind)
+            .count();
+        if many > 0 {
+            out.push_str(&format!("    {many:>4} {}(s)\n", kind.as_str()));
+        }
+    }
+    // Written out rather than counted: these are the ones that can act without being asked.
+    for capability in declares.iter().filter(|capability| capability.sensitive) {
+        out.push_str(&format!(
+            "    {:<11} {:<30} {}\n",
+            capability.kind.as_str(),
+            capability.name,
+            capability.detail.as_deref().unwrap_or("")
+        ));
+    }
+    let refusing = declares
+        .iter()
+        .filter(|capability| {
+            capability.kind == Kind::Permission && capability.detail.as_deref() != Some("allow")
+        })
+        .count();
+    if refusing > 0 {
+        out.push_str(&format!(
+            "    {refusing:>4} permission(s) that ask or refuse, which are not listed\n"
+        ));
+    }
+    out
 }
 
 /// Reads `30m`, `6h`, `2d`, or a bare number of seconds.
@@ -1399,7 +1487,7 @@ mod tests {
             ("api.anthropic.com".to_owned(), 27),
         ];
         let domains = mcp::merge(&configured, &contacted, mcp::endpoints_for("claude"));
-        let report = agent_report(&agent, &configured, &domains);
+        let report = agent_report(&agent, &configured, &domains, &[]);
 
         assert!(report.contains("claude"), "{report}");
         assert!(report.contains("unexpected  telemetry.example"), "{report}");
@@ -1427,7 +1515,7 @@ mod tests {
             host: None,
             command: Some("npx".to_owned()),
         }];
-        let report = agent_report(&agent, &configured, &[]);
+        let report = agent_report(&agent, &configured, &[], &[]);
         assert!(report.contains("never touch the network"), "{report}");
         assert!(report.contains("filesystem"), "{report}");
     }
