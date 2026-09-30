@@ -457,17 +457,21 @@ echo "OK: turning it off stops the watching and keeps what was seen"
 sudo "$binary" --database "$database" --certificates "$certificates" --json focus \
     | jq -e '(has("focus") | not)' >/dev/null || fail "something was in focus before anything was asked for."
 
-everything=$(sudo "$binary" --database "$database" --certificates "$certificates" --json report --by host --since 3600 \
+# Sliced by process, where the arithmetic is not a matter of what happened to be reached: narrowed to one
+# process there is exactly one row, whatever else the machine did. Comparing host counts instead was flaky —
+# it asserted that some *other* process had reached a host curl did not, which is a fact about the runner.
+everything=$(sudo "$binary" --database "$database" --certificates "$certificates" --json report --by process --since 3600 \
     | jq '.rows | length')
+[ "$everything" -ge 2 ] \
+    || fail "only one process made a request, so narrowing to one cannot be shown to narrow anything."
 sudo "$binary" --database "$database" --certificates "$certificates" focus --process curl \
     | grep -q "Narrowed to process curl" \
     || fail "narrowing did not say what it narrowed to."
-narrowed=$(sudo "$binary" --database "$database" --certificates "$certificates" --json report --by host --since 3600)
+narrowed=$(sudo "$binary" --database "$database" --certificates "$certificates" --json report --by process --since 3600)
 printf '%s' "$narrowed" | jq -e '.focus == "process:curl" and .narrowed == true' >/dev/null \
     || fail "the report does not say what it was narrowed to."
-if [ "$(printf '%s' "$narrowed" | jq '.rows | length')" -ge "$everything" ]; then
-    fail "narrowing to one process did not narrow anything."
-fi
+printf '%s' "$narrowed" | jq -e '(.rows | length) == 1 and .rows[0].name == "curl"' >/dev/null \
+    || fail "narrowing to one process did not narrow to that process."
 # The terminal says so above the rows, every time, because a count of a subset read as a total is the whole
 # failure this feature can cause.
 #
