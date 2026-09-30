@@ -54,6 +54,8 @@ pub struct Spending {
     day: i64,
     /// Whether the kernel currently believes it is capturing.
     told_kernel: bool,
+    /// Whether a failure to tell it has already been said out loud.
+    complained: bool,
 }
 
 impl Spending {
@@ -79,6 +81,7 @@ impl Spending {
             stopped: HashSet::new(),
             day,
             told_kernel: false,
+            complained: false,
         };
         spending.tell_kernel(budget.reading_payloads(now));
         spending
@@ -150,12 +153,36 @@ impl Spending {
     }
 
     /// Tells the kernel whether to capture, if it does not already know.
+    ///
+    /// A failure here means nothing is captured at all, silently, which is the worst way for this to go
+    /// wrong: the budget says payloads are being read and no payload ever arrives. So it is reported, once,
+    /// with what the kernel actually holds afterwards.
     fn tell_kernel(&mut self, capturing: bool) {
         if self.told_kernel == capturing {
             return;
         }
-        if self.capturing.set(0, u8::from(capturing), 0).is_ok() {
-            self.told_kernel = capturing;
+        match self.capturing.set(0, u8::from(capturing), 0) {
+            Ok(()) => {
+                self.told_kernel = capturing;
+                let held = self.capturing.get(&0, 0).unwrap_or(255);
+                if held != u8::from(capturing) && !self.complained {
+                    self.complained = true;
+                    eprintln!(
+                        "the kernel's capture switch was set to {} and reads back as {held}; payloads \
+                         will not be read",
+                        u8::from(capturing)
+                    );
+                }
+            }
+            Err(err) => {
+                if !self.complained {
+                    self.complained = true;
+                    eprintln!(
+                        "the kernel's capture switch could not be written ({err}); no payloads will be \
+                         read at all"
+                    );
+                }
+            }
         }
     }
 }

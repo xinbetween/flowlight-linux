@@ -40,6 +40,8 @@ fail() {
     sleep 3
     echo "--- what the daemon said:" >&2
     cat "$log" >&2
+    echo "--- what it reported:" >&2
+    tail -40 "$output" >&2
     exit 1
 }
 
