@@ -281,6 +281,57 @@ pub struct Coverage {
     pub unprobed: Vec<Note>,
 }
 
+/// What traffic is sliced by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slice {
+    /// Which process.
+    Process,
+    /// Which host, by name.
+    Host,
+    /// Which address, which is what a connection records.
+    Address,
+    /// Which protocol.
+    Protocol,
+}
+
+impl Slice {
+    /// The name this is asked for under.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Process => "process",
+            Self::Host => "host",
+            Self::Address => "address",
+            Self::Protocol => "protocol",
+        }
+    }
+
+    /// Reads one back, or nothing if it is not one.
+    pub fn parse(text: &str) -> Option<Self> {
+        [Self::Process, Self::Host, Self::Address, Self::Protocol]
+            .into_iter()
+            .find(|slice| slice.as_str() == text.trim().to_lowercase())
+    }
+
+    /// Whether the bytes of this slice mean anything.
+    ///
+    /// They do not for an address: bytes are counted from requests, which record a host, and a connection
+    /// records an address. Showing a column of zeroes would be worse than not showing one.
+    pub fn counts_bytes(self) -> bool {
+        !matches!(self, Self::Address)
+    }
+}
+
+/// One row of a breakdown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Share {
+    /// What it is.
+    pub name: String,
+    /// How many requests or connections.
+    pub events: i64,
+    /// How many bytes, where bytes mean anything.
+    pub bytes: i64,
+}
+
 /// One thing that was noticed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlertRow {
@@ -1434,6 +1485,97 @@ impl Store {
         Ok(())
     }
 
+    /// Traffic sliced one way, busiest first.
+    ///
+    /// One query with the column chosen rather than four queries, because four drift: the first bug that shape
+    /// prevents is a window applied to three of them.
+    pub fn breakdown(&mut self, by: Slice, since: i64, limit: usize) -> Result<Vec<Share>> {
+        self.flush()?;
+        let statement = match by {
+            Slice::Process => {
+                "SELECT process, count(*), coalesce(sum(bytes), 0) FROM requests
+                 WHERE at >= ?1 GROUP BY process ORDER BY sum(bytes) DESC LIMIT ?2"
+            }
+            Slice::Host => {
+                "SELECT host, count(*), coalesce(sum(bytes), 0) FROM requests
+                 WHERE at >= ?1 AND host IS NOT NULL AND host != ''
+                 GROUP BY host ORDER BY sum(bytes) DESC LIMIT ?2"
+            }
+            Slice::Protocol => {
+                "SELECT coalesce(protocol, 'http/1.1'), count(*), coalesce(sum(bytes), 0) FROM requests
+                 WHERE at >= ?1 GROUP BY coalesce(protocol, 'http/1.1')
+                 ORDER BY sum(bytes) DESC LIMIT ?2"
+            }
+            // Addresses come from connections, which is the only place one is recorded: a probe on a TLS
+            // library never sees an address, and the kernel never sees a name.
+            Slice::Address => {
+                "SELECT destination, count(*), 0 FROM connections
+                 WHERE at >= ?1 AND destination IS NOT NULL AND destination != ''
+                 GROUP BY destination ORDER BY count(*) DESC LIMIT ?2"
+            }
+        };
+        let mut prepared = self.connection.prepare(statement)?;
+        let rows = prepared.query_map(params![since, limit as i64], |row| {
+            Ok(Share {
+                name: row.get(0)?,
+                events: row.get(1)?,
+                bytes: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// What one process did over a window, for saying why it stands out.
+    pub fn traffic_of(
+        &mut self,
+        process: &str,
+        since: i64,
+    ) -> Result<flowlight_alerts::profile::Traffic> {
+        self.flush()?;
+        let (hosts, sent, received): (i64, i64, i64) = self.connection.query_row(
+            "SELECT count(DISTINCT host),
+                    coalesce(sum(CASE WHEN direction = 'out' THEN bytes ELSE 0 END), 0),
+                    coalesce(sum(CASE WHEN direction = 'in' THEN bytes ELSE 0 END), 0)
+             FROM requests WHERE at >= ?1 AND process = ?2",
+            params![since, process],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let (connections, addresses): (i64, i64) = self.connection.query_row(
+            "SELECT count(*), count(DISTINCT destination) FROM connections
+             WHERE at >= ?1 AND process = ?2",
+            params![since, process],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        // A connection with no request read from it in the same window is one nothing was read from. Judged
+        // by counting rather than by joining, because the two tables record different events and a join
+        // between them would be inventing a relationship neither of them has.
+        let unread = if hosts == 0 { connections } else { 0 };
+        Ok(flowlight_alerts::profile::Traffic {
+            hosts,
+            addresses,
+            // An address reached by a process that recorded no host for it, in the same window.
+            unnamed: if hosts == 0 { connections } else { 0 },
+            sent,
+            received,
+            unread,
+            connections,
+        })
+    }
+
+    /// The names one process reached, for judging whether they look generated.
+    pub fn names_reached(
+        &mut self,
+        process: &str,
+        since: i64,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .hosts(Some(process), since, limit)?
+            .into_iter()
+            .map(|host| host.host)
+            .collect())
+    }
+
     /// Bytes each process moved in one window, for comparing against what it usually moves.
     pub fn bytes_by_process(&mut self, since: i64, until: i64) -> Result<Vec<(String, i64)>> {
         self.flush()?;
@@ -2444,6 +2586,102 @@ mod tests {
         assert!(store.alerts_since(0, 10).unwrap().is_empty());
         assert_eq!(store.baseline("bytes_hour", "x").unwrap(), None);
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    // Reports
+
+    #[test]
+    fn traffic_is_sliced_busiest_first() {
+        let mut store = Store::in_memory().unwrap();
+        for _ in 0..3 {
+            store
+                .record_request(request(1_000, "node", "api.example", 1_000))
+                .unwrap();
+        }
+        store
+            .record_request(request(1_000, "curl", "other.example", 100))
+            .unwrap();
+        store
+            .record_connection(connection(1_000, "node", "1.2.3.4"))
+            .unwrap();
+        store.flush().unwrap();
+
+        let by_process = store.breakdown(Slice::Process, 0, 10).unwrap();
+        assert_eq!(by_process[0].name, "node");
+        assert_eq!(by_process[0].events, 3);
+        assert_eq!(by_process[0].bytes, 3_000);
+        assert_eq!(by_process[1].name, "curl");
+
+        let by_host = store.breakdown(Slice::Host, 0, 10).unwrap();
+        assert_eq!(by_host[0].name, "api.example");
+
+        // An address comes from a connection, which is the only place one is recorded.
+        let by_address = store.breakdown(Slice::Address, 0, 10).unwrap();
+        assert_eq!(by_address[0].name, "1.2.3.4");
+
+        // A request with no protocol recorded is HTTP/1.1, which is what it was: the column is only set when
+        // a connection turned out to be HTTP/2.
+        let mut plain = request(1_000, "wget", "plain.example", 10);
+        plain.protocol = None;
+        store.record_request(plain).unwrap();
+        store.flush().unwrap();
+        let by_protocol = store.breakdown(Slice::Protocol, 0, 10).unwrap();
+        let named: Vec<&str> = by_protocol.iter().map(|row| row.name.as_str()).collect();
+        assert!(named.contains(&"http/1.1"), "{named:?}");
+        assert!(named.contains(&"http/2"), "{named:?}");
+    }
+
+    /// Bytes are counted from requests, which record a host; a connection records an address. A column of
+    /// zeroes would be worse than no column.
+    #[test]
+    fn a_slice_says_whether_its_bytes_mean_anything() {
+        assert!(Slice::Process.counts_bytes());
+        assert!(Slice::Host.counts_bytes());
+        assert!(!Slice::Address.counts_bytes());
+        for slice in [Slice::Process, Slice::Host, Slice::Address, Slice::Protocol] {
+            assert_eq!(Slice::parse(slice.as_str()), Some(slice));
+        }
+        assert_eq!(Slice::parse("agent"), None);
+    }
+
+    #[test]
+    fn what_one_process_did_is_counted_for_a_window() {
+        let mut store = Store::in_memory().unwrap();
+        let mut out = request(1_000, "node", "api.example", 900);
+        out.direction = "out".to_owned();
+        store.record_request(out).unwrap();
+        let mut back = request(1_000, "node", "api.example", 100);
+        back.direction = "in".to_owned();
+        store.record_request(back).unwrap();
+        store
+            .record_connection(connection(1_000, "node", "1.2.3.4"))
+            .unwrap();
+        store.flush().unwrap();
+
+        let traffic = store.traffic_of("node", 0).unwrap();
+        assert_eq!(traffic.hosts, 1);
+        assert_eq!(traffic.sent, 900);
+        assert_eq!(traffic.received, 100);
+        assert_eq!(traffic.connections, 1);
+        // Something was read from it, so nothing is unread.
+        assert_eq!(traffic.unread, 0);
+        assert_eq!(traffic.unnamed, 0);
+    }
+
+    /// The case Coverage exists to name: connections opened and nothing read from any of them.
+    #[test]
+    fn a_process_nothing_was_read_from_says_so() {
+        let mut store = Store::in_memory().unwrap();
+        for _ in 0..4 {
+            store
+                .record_connection(connection(1_000, "gh", "20.1.2.3"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let traffic = store.traffic_of("gh", 0).unwrap();
+        assert_eq!(traffic.connections, 4);
+        assert_eq!(traffic.unread, 4);
+        assert_eq!(traffic.hosts, 0);
     }
 
     // Alerts

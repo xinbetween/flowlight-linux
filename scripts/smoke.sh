@@ -71,7 +71,7 @@ PYTHON
 }
 
 echo "Watching..."
-sudo "$binary" --json --seconds 400 --database "$database" --socket "$socket" --web 127.0.0.1:0 \
+sudo "$binary" --json --seconds 440 --database "$database" --socket "$socket" --web 127.0.0.1:0 \
     --certificates "$certificates" \
     --export-seconds 2 >"$output" 2>"$log" &
 watcher=$!
@@ -414,6 +414,56 @@ echo "OK: changing where it goes takes the agreement with it"
 
 ask '{"op":"set-export","off":true}' | jq -e '.ok.enabled == false' >/dev/null \
     || fail "export would not turn off."
+
+# Reports: traffic sliced one way, with the processes that do not look like the rest named and the arithmetic
+# behind each reason shown.
+for slice in process host address protocol; do
+    sudo "$binary" --database "$database" --certificates "$certificates" --json report --by "$slice" --since 3600 \
+        | jq -e '.rows | length > 0' >/dev/null \
+        || fail "a report by $slice had nothing in it."
+done
+echo "OK: traffic can be sliced by process, host, address and protocol"
+
+report=$(sudo "$binary" --database "$database" --certificates "$certificates" --json report --by process --since 3600)
+printf '%s' "$report" | jq -e '[.rows[] | select(.name == "curl")] | length == 1' >/dev/null \
+    || fail "the report does not name the process that made the requests."
+# A share is a share of something, so the shares of everything have to come to about a hundred.
+printf '%s' "$report" | jq -e '([.rows[].share] | add) > 95' >/dev/null \
+    || fail "the shares do not add up to the window."
+echo "OK: a share is a share of the window"
+
+# Bytes come from requests, which record a host; a connection records an address. A column of zeroes would be
+# worse than no column, so the slice says whether its bytes mean anything.
+sudo "$binary" --database "$database" --certificates "$certificates" --json report --by address --since 3600 \
+    | jq -e '.counts_bytes == false' >/dev/null \
+    || fail "a report by address claims its bytes mean something."
+sudo "$binary" --database "$database" --certificates "$certificates" --json report --by process --since 3600 \
+    | jq -e '.counts_bytes == true' >/dev/null \
+    || fail "a report by process claims its bytes mean nothing."
+echo "OK: a slice says whether its bytes mean anything"
+
+# gh is written in Go, so nothing of its traffic can be read. That is the case Coverage exists to name, and a
+# report should name it too when somebody is looking at one process rather than at the machine.
+if [ "$go_tested" = yes ]; then
+    printf '%s' "$report" \
+        | jq -e '[.standing[] | select(.process == "gh")] | length == 1' >/dev/null \
+        || fail "a process nothing could be read from was not named as standing out."
+    printf '%s' "$report" \
+        | jq -e '[.standing[] | select(.process == "gh") | .reasons[] | select(test("nothing was read"))] | length > 0' \
+        >/dev/null || fail "the reason given does not say what it noticed."
+    echo "OK: a process nothing could be read from is named, with the reason"
+fi
+
+# Every reason carries its arithmetic, which is the rule the whole feature rests on.
+printf '%s' "$report" | jq -e '[.standing[].reasons[] | select((. | length) < 20)] | length == 0' >/dev/null \
+    || fail "a reason was given with nothing to back it up."
+echo "OK: every reason carries the numbers behind it"
+
+# A slice nobody defined is refused rather than guessed at.
+if sudo "$binary" --database "$database" --certificates "$certificates" report --by agent 2>/dev/null; then
+    fail "a report by something that is not a slice was accepted."
+fi
+echo "OK: a slice nobody defined is refused"
 
 # Alerts: things worth saying, each carrying the arithmetic behind it. The event-driven ones are assertable
 # here; the statistical ones need days of history and are unit-tested against numbers instead.

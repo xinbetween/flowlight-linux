@@ -954,6 +954,124 @@ pub fn alerts(store: &mut Store, since: i64, limit: usize) -> Result<Vec<AlertVi
         .collect())
 }
 
+/// Traffic sliced one way, and the processes that do not look like the rest.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ReportView {
+    /// What it is sliced by.
+    pub by: String,
+    /// Whether the bytes column means anything for this slice.
+    pub counts_bytes: bool,
+    /// The rows, busiest first.
+    pub rows: Vec<ShareView>,
+    /// Everything in the window, so a share can be a share of something.
+    pub total_events: i64,
+    /// Bytes in the window.
+    pub total_bytes: i64,
+    /// The processes worth a second look, and why.
+    pub standing: Vec<StandingView>,
+}
+
+/// One row of a breakdown.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ShareView {
+    /// What it is.
+    pub name: String,
+    /// How many requests or connections.
+    pub events: i64,
+    /// How many bytes.
+    pub bytes: i64,
+    /// What share of the window this is, as a percentage of events.
+    pub share: f64,
+}
+
+/// One process that does not look like the rest, and why.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StandingView {
+    /// What it is called.
+    pub process: String,
+    /// The reasons, strongest first, each with its arithmetic.
+    pub reasons: Vec<String>,
+    /// The sum of their weights — an ordering, and not a score of anything.
+    pub weight: u32,
+}
+
+/// Traffic sliced one way, with the outliers named.
+pub fn report(store: &mut Store, by: &str, since: i64, limit: usize) -> Result<ReportView> {
+    use anyhow::Context as _;
+    let slice = flowlight_store::Slice::parse(by)
+        .with_context(|| format!("`{by}` is not one of: process, host, address, protocol"))?;
+    let rows = store.breakdown(slice, since, rows(limit))?;
+    let total_events: i64 = rows.iter().map(|row| row.events).sum();
+    let total_bytes: i64 = rows.iter().map(|row| row.bytes).sum();
+
+    // The outliers are always judged by process, whatever the slice: "this host is not like the others" is a
+    // statement about a host's operator, which Flowlight has no business making.
+    let mut counts: Vec<i64> = Vec::new();
+    let processes = store.processes(since)?;
+    for row in &processes {
+        counts.push(row.hosts);
+    }
+    let usual = flowlight_alerts::profile::median(&mut counts);
+
+    // Every process that made a request, and every process that opened connections nothing was read from.
+    // The second list is the point: a process with no requests is invisible to `processes`, which is built
+    // from requests — and "nothing could be read from this one" is precisely the thing worth saying about it.
+    let mut candidates: Vec<String> = processes
+        .iter()
+        .take(20)
+        .map(|row| row.process.clone())
+        .collect();
+    for unread in store.coverage(since)?.unread {
+        if !candidates.contains(&unread.process) {
+            candidates.push(unread.process);
+        }
+    }
+
+    let mut standing = Vec::new();
+    for process in &candidates {
+        let traffic = store.traffic_of(process, since)?;
+        let names = store.names_reached(process, since, 40)?;
+        let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
+        let judged = flowlight_alerts::profile::standing(process, traffic, usual, &borrowed);
+        if judged.reasons.is_empty() {
+            continue;
+        }
+        standing.push(StandingView {
+            process: judged.process,
+            reasons: judged
+                .reasons
+                .into_iter()
+                .map(|reason| reason.said)
+                .collect(),
+            weight: judged.weight,
+        });
+    }
+    // Heaviest first, and stable, so two processes with the same reasons keep the order the store gave them
+    // rather than swapping between two runs of the same question.
+    standing.sort_by_key(|judged| std::cmp::Reverse(judged.weight));
+
+    Ok(ReportView {
+        by: slice.as_str().to_owned(),
+        counts_bytes: slice.counts_bytes(),
+        rows: rows
+            .into_iter()
+            .map(|row| ShareView {
+                share: if total_events > 0 {
+                    row.events as f64 * 100.0 / total_events as f64
+                } else {
+                    0.0
+                },
+                name: row.name,
+                events: row.events,
+                bytes: row.bytes,
+            })
+            .collect(),
+        total_events,
+        total_bytes,
+        standing,
+    })
+}
+
 /// One thing a candidate rule would change.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ChangeView {

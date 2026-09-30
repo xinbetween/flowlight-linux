@@ -418,6 +418,18 @@ enum Command {
     },
     /// Every guardrail, with how often each has refused something.
     Guardrails,
+    /// Traffic sliced one way, and the processes that do not look like the rest.
+    Report {
+        /// `process`, `host`, `address` or `protocol`.
+        #[arg(long, default_value = "process", value_parser = ["process", "host", "address", "protocol"])]
+        by: String,
+        /// How far back to look: `30m`, `6h`, `2d`, or a number of seconds.
+        #[arg(long, value_name = "WINDOW", default_value = "24h")]
+        since: String,
+        /// At most this many rows.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// What was noticed, and the numbers behind each of it.
     ///
     /// A spike against what a process usually moves, a host nothing had reached before, a port nothing usually
