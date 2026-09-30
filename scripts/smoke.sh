@@ -71,7 +71,7 @@ PYTHON
 }
 
 echo "Watching..."
-sudo "$binary" --json --seconds 320 --database "$database" --socket "$socket" --web 127.0.0.1:0 \
+sudo "$binary" --json --seconds 400 --database "$database" --socket "$socket" --web 127.0.0.1:0 \
     --certificates "$certificates" \
     --export-seconds 2 >"$output" 2>"$log" &
 watcher=$!
@@ -414,6 +414,44 @@ echo "OK: changing where it goes takes the agreement with it"
 
 ask '{"op":"set-export","off":true}' | jq -e '.ok.enabled == false' >/dev/null \
     || fail "export would not turn off."
+
+# Who operates an address. Off until it is asked for, because it is the one thing Flowlight does that tells a
+# third party anything — so the first assertion is that it is off and says what asking would mean.
+sudo "$binary" --database "$database" --certificates "$certificates" --json owners \
+    | jq -e '.asking == false and (.disclosure | length >= 4)' >/dev/null \
+    || fail "looking up owners was not off, or does not say what asking would mean."
+sudo "$binary" --database "$database" --certificates "$certificates" owners \
+    | grep -q "What is sent is an address" \
+    || fail "the disclosure does not say what leaves."
+echo "OK: nobody is asked who operates anything until it is asked for"
+
+# Nothing was learnt while it was off, however many connections were made.
+sudo "$binary" --database "$database" --certificates "$certificates" --json owners \
+    | jq -e '.owners | length == 0' >/dev/null \
+    || fail "something was looked up while the feature was off."
+echo "OK: nothing was looked up while it was off"
+
+sudo "$binary" --database "$database" --certificates "$certificates" owners --on >/dev/null
+sudo "$binary" --database "$database" --certificates "$certificates" --json owners \
+    | jq -e '.asking == true and (.unknown > 0)' >/dev/null \
+    || fail "turning it on did not take, or there is nothing for it to look up."
+echo "OK: turned on, and there are addresses waiting to be looked up"
+
+# The daemon asks a few a minute. It has been running for a while by now, so give it one pass.
+await "looked up who operates" 90
+learnt=$(sudo "$binary" --database "$database" --certificates "$certificates" --json owners)
+printf '%s\n' "$learnt" | jq -c '.owners[:3]'
+printf '%s' "$learnt" | jq -e '[.owners[] | select(.asn > 0)] | length > 0' >/dev/null \
+    || fail "nothing was learnt about who operates anything."
+printf '%s' "$learnt" | jq -e '[.owners[] | select(.name == "this network")] | length == 0' >/dev/null \
+    || fail "this network was counted as an operator."
+echo "OK: who operates the addresses this machine reached was looked up"
+
+sudo "$binary" --database "$database" --certificates "$certificates" owners --off >/dev/null
+sudo "$binary" --database "$database" --certificates "$certificates" --json owners \
+    | jq -e '.asking == false and ((.owners | length) > 0)' >/dev/null \
+    || fail "turning it off lost what had already been learnt."
+echo "OK: turning it off keeps what was already learnt"
 
 # Launching an agent through Flowlight. The claim is not that it works — the scan already marks agents — but
 # that the mark is in the kernel *before* the agent runs. So this asks the sharpest question there is: a rule

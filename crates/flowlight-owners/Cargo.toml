@@ -1,0 +1,15 @@
+[package]
+name = "flowlight-owners"
+description = "Who operates an address, for the traffic that has no hostname. A DNS client small enough to read, and a cache."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+
+[lints]
+workspace = true

@@ -165,7 +165,7 @@ Useful flags:
 
 Plus subcommands that read the database rather than the kernel — `history --since 6h`, `agents`, `summary`,
 `coverage --since 24h`, `budget`, `export`, `model`, `query`, `intercept`, `trust`, `mock`, `mocks`,
-`forget-mock`, `guardrail`, `guardrails`, `forget-guardrail` — and six for rules: `block`, `allow`, `ask`,
+`forget-mock`, `guardrail`, `guardrails`, `forget-guardrail`, `owners` — and six for rules: `block`, `allow`, `ask`,
 `simulate`, `rules`, `forget`. `--json` works on all
 of them. One subcommand is not like the others: `launch` runs as you rather than as root, because the agent it
 starts has to.
@@ -762,6 +762,39 @@ Three more things are true of it, because they are the ones that go wrong:
   a record of a batch being sent is a record in the next batch, for ever.
 
 The Export page in the window says the same sentences, and its Agree button opens a dialog containing them.
+
+### Who operates an address
+
+Every connection Flowlight records at `connect()` has an address and no name: the name was resolved and thrown
+away before the kernel saw it. Coverage can say how many such connections a process made. Saying *whose* they
+were is the difference between a number and a lead.
+
+```console
+$ sudo flowlightd owners --on
+$ flowlightd owners
+  AS13335   Cloudflare, Inc.                         4 address(es), 31 connection(s)
+  AS16509   Amazon.com, Inc.                         2 address(es), 9 connection(s)
+  AS15169   Google LLC                               1 address(es), 3 connection(s)
+```
+
+**This is the one thing Flowlight does that tells a third party anything**, so it is off until it is asked for
+and it says what asking means first:
+
+- The question is a DNS lookup of Team Cymru's public routing data, sent to this machine's own resolver.
+- What is sent is **an address**. Not which process reached it, not when, not how often.
+- An address on this machine or this network is never asked about: the answer is already known, and the
+  question would be about your network.
+- Four addresses a minute at most, busiest first, never the same one twice — a resolver asked about every
+  connection as it happened would be a second, chattier record of this machine's traffic leaving it.
+
+The DNS client is written out rather than pulled in: a resolver crate brings an async runtime, a configuration
+language and a cache of its own, for a feature that asks two short questions a minute. What is here is a query
+builder and a parser, both pure, both tested against bytes — including a reply that points its compression
+pointer forwards, which is how a parser is made to loop for ever.
+
+An address nobody announces is recorded as such rather than left unknown, because otherwise it would be asked
+about again on every pass for ever. A resolver that is temporarily unreachable is a different thing and is
+*not* recorded, so it is asked again later — conflating the two would make a transient failure permanent.
 
 ### Coverage: what was *not* seen
 

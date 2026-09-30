@@ -133,6 +133,17 @@ pub enum Request {
     },
     /// Every guardrail, with how often each has refused something.
     Guardrails,
+    /// Who operates the addresses this machine has reached.
+    Owners {
+        /// How far back, in seconds.
+        #[serde(default = "a_day")]
+        since: i64,
+    },
+    /// Start or stop asking who operates an address.
+    SetOwners {
+        /// Whether to ask.
+        asking: bool,
+    },
     /// Write a guardrail.
     WriteGuardrail {
         /// What it refuses.
@@ -454,7 +465,8 @@ fn handle(
         | Request::WriteMock { .. }
         | Request::ForgetMock { .. }
         | Request::WriteGuardrail { .. }
-        | Request::ForgetGuardrail { .. } => Store::open(database)?,
+        | Request::ForgetGuardrail { .. }
+        | Request::SetOwners { .. } => Store::open(database)?,
         _ => Store::open_read_only(database)?,
     };
 
@@ -501,6 +513,17 @@ fn handle(
             crate::history::authority_paths(database, certificates),
         )?)?,
         Request::Guardrails => serde_json::to_string(&crate::views::guardrails(&mut store)?)?,
+        Request::Owners { since } => serde_json::to_string(&crate::views::owners(
+            &mut store,
+            crate::views::window(now, since),
+        )?)?,
+        Request::SetOwners { asking } => {
+            store.set_owner_lookup(asking)?;
+            serde_json::to_string(&crate::views::owners(
+                &mut store,
+                crate::views::window(now, 86_400),
+            )?)?
+        }
         Request::WriteGuardrail { guardrail } => {
             serde_json::to_string(&crate::views::write_guardrail(&mut store, &guardrail, now)?)?
         }
