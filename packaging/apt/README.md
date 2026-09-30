@@ -12,6 +12,11 @@ Three files build it and one secret publishes it.
 archive, **proves it works with a throwaway key it generates and discards**, and then — only if the repository
 has a `GPG_SIGNING_KEY` — signs the real one and deploys it to GitHub Pages.
 
+It runs **after the `Release` workflow finishes**, not when the release is published. A release exists for
+several minutes before it has any packages attached, because attaching them is the last thing `Release` does —
+so triggering on the release itself meant this ran, found nothing to serve, and stopped. Dispatching it by hand
+with a tag works at any time, which is what to do when a release needed a second attempt.
+
 The proof is the part worth keeping. It generates a key, signs a copy of the archive, adds it to `apt` over
 `file://` with `signed-by`, runs `apt-get update` and installs `flowlight` from it. That runs on every dispatch
 whether or not a real key exists, so the machinery is known to work before it is ever asked to publish, and a
