@@ -217,6 +217,65 @@ pub struct Ran {
     pub failed: bool,
 }
 
+/// Whether connections are terminated, and whose.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct Intercept {
+    /// Whether the feature is on.
+    pub enabled: bool,
+    /// Whether anything is actually being terminated.
+    pub running: bool,
+    /// Where the proxy listens.
+    pub port: u16,
+    /// The agents in scope. Empty means nobody.
+    pub agents: Vec<String>,
+    /// Hosts never terminated.
+    pub never: Vec<String>,
+    /// Why nothing is being terminated, when nothing is.
+    pub why_not: Option<String>,
+    /// What turning it on would mean, in sentences.
+    pub disclosure: Vec<String>,
+    /// Where the certificate is, when there is one.
+    pub certificate: Option<String>,
+    /// Where the bundle is.
+    pub bundle: Option<String>,
+}
+
+/// One canned answer.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct Mock {
+    /// Its identifier.
+    pub id: i64,
+    /// Whether it answers.
+    pub enabled: bool,
+    /// The host or pattern.
+    pub subject: String,
+    /// The path glob.
+    pub path: String,
+    /// The method, or empty for any.
+    pub method: String,
+    /// The status.
+    pub status: u16,
+    /// How long it waits first.
+    pub delay: u32,
+    /// Whether it calls itself a refusal.
+    pub refusal: bool,
+    /// The header names. Never their values.
+    pub headers: Vec<String>,
+    /// How many bytes of body.
+    pub body_bytes: usize,
+    /// Why.
+    pub note: Option<String>,
+}
+
+/// Interception and its canned answers together, which is what one page draws.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct Interception {
+    /// The configuration.
+    pub intercept: Intercept,
+    /// The answers.
+    pub mocks: Vec<Mock>,
+}
+
 /// One thing a candidate rule would change.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Change {
@@ -401,6 +460,16 @@ pub fn set_model(field: &str, value: &str) -> String {
 pub fn question(asked: &str) -> String {
     let asked = serde_json::to_string(asked).unwrap_or_else(|_| "\"\"".to_owned());
     format!(r#"{{"op":"question","question":{asked}}}"#)
+}
+
+/// Builds the request that changes what is intercepted.
+pub fn set_intercept(field: &str, value: &str) -> String {
+    format!(r#"{{"op":"set-intercept","{field}":{value}}}"#)
+}
+
+/// Builds the request that removes a canned answer.
+pub fn forget_mock(id: i64) -> String {
+    format!(r#"{{"op":"forget-mock","id":{id}}}"#)
 }
 
 /// Builds the request that asks what a rule would change without writing it.

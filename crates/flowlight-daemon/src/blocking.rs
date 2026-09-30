@@ -104,7 +104,7 @@ impl Blocking {
     /// The number this agent is known by in the kernel, assigning one if it has none.
     ///
     /// Identifiers start at one, because zero means everyone.
-    fn identity(&mut self, agent: &str) -> u32 {
+    pub fn identity(&mut self, agent: &str) -> u32 {
         let next = self.identities.len() as u32 + 1;
         *self
             .identities

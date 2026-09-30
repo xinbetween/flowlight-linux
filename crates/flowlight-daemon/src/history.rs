@@ -12,8 +12,31 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Where the certificate authority's files are, if there is one yet.
+///
+/// Both as strings, because everything that shows them shows them to a person.
+pub fn authority_paths(database: &Path, certificates: &Path) -> Option<(String, String)> {
+    let keys = flowlight_proxy::Authority::keys_for(database);
+    if !flowlight_proxy::Authority::exists(&keys, certificates) {
+        return None;
+    }
+    Some((
+        flowlight_proxy::Authority::certificate_path(certificates)
+            .display()
+            .to_string(),
+        flowlight_proxy::Authority::bundle_path(certificates)
+            .display()
+            .to_string(),
+    ))
+}
+
 /// Answers one question and exits.
-pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()> {
+pub fn run(
+    command: &Command,
+    database: &Path,
+    certificates: &Path,
+    json: bool,
+) -> anyhow::Result<()> {
     // A rule can be written before anything has been watched — that is a reasonable order to do things in,
     // and refusing would mean telling somebody to start a daemon in order to configure it. Every other
     // command is a question about history, and a missing database is the answer to it.
@@ -26,6 +49,10 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
             | Command::Budget { .. }
             | Command::Export { .. }
             | Command::Model { .. }
+            | Command::Intercept { .. }
+            | Command::Mock { .. }
+            | Command::ForgetMock { .. }
+            | Command::Trust { .. }
     );
     if !writes && !database.exists() {
         bail!(
@@ -310,6 +337,209 @@ pub fn run(command: &Command, database: &Path, json: bool) -> anyhow::Result<()>
                         .collect();
                     writeln!(out, "\n(from {})", names.join(", "))?;
                 }
+            }
+        }
+        Command::Intercept {
+            on,
+            off,
+            agents,
+            never,
+        } => {
+            let asked = *on || *off || !agents.is_empty() || !never.is_empty();
+            let view = if asked {
+                crate::views::set_intercept(
+                    &mut store,
+                    &crate::views::InterceptChange {
+                        on: *on,
+                        off: *off,
+                        agents: (!agents.is_empty()).then(|| agents.clone()),
+                        never: (!never.is_empty()).then(|| never.clone()),
+                    },
+                    authority_paths(database, certificates),
+                )?
+            } else {
+                crate::views::intercept(&mut store, authority_paths(database, certificates))?
+            };
+            if json {
+                writeln!(out, "{}", line(&view))?;
+            } else {
+                for sentence in &view.disclosure {
+                    writeln!(out, "{sentence}")?;
+                }
+                match &view.why_not {
+                    Some(reason) => writeln!(out, "\nNothing is being terminated: {reason}")?,
+                    None => writeln!(
+                        out,
+                        "\nIn force on port {}. Anything in scope has to trust Flowlight's certificate — \
+                         `flowlightd trust` says how.",
+                        view.port
+                    )?,
+                }
+                if let Some(certificate) = &view.certificate {
+                    writeln!(out, "The certificate is at {certificate}")?;
+                }
+                if asked {
+                    eprintln!("\nA running flowlightd picks this up within a couple of seconds.");
+                }
+            }
+        }
+        Command::Trust { install, remove } => {
+            let Some((certificate, bundle)) = authority_paths(database, certificates) else {
+                bail!(
+                    "there is no certificate authority yet. One is made the first time the daemon starts \
+                     with interception available."
+                );
+            };
+            if *install && *remove {
+                bail!("--install and --remove ask for opposite things");
+            }
+            if *install {
+                writeln!(
+                    out,
+                    "{}",
+                    crate::trusting::install(Path::new(&certificate))?
+                )?;
+            } else if *remove {
+                writeln!(out, "{}", crate::trusting::remove()?)?;
+            }
+            let steps = crate::trusting::steps(Path::new(&certificate), Path::new(&bundle));
+            if json {
+                #[derive(serde::Serialize)]
+                struct TrustView {
+                    certificate: String,
+                    bundle: String,
+                    installed: bool,
+                    steps: Vec<StepView>,
+                }
+                #[derive(serde::Serialize)]
+                struct StepView {
+                    what: String,
+                    present: bool,
+                    automatic: bool,
+                    how: String,
+                }
+                writeln!(
+                    out,
+                    "{}",
+                    line(&TrustView {
+                        certificate: certificate.clone(),
+                        bundle: bundle.clone(),
+                        installed: crate::trusting::is_installed(),
+                        steps: steps
+                            .into_iter()
+                            .map(|step| StepView {
+                                what: step.what,
+                                present: step.present,
+                                automatic: step.automatic,
+                                how: step.how,
+                            })
+                            .collect(),
+                    })
+                )?;
+            } else {
+                writeln!(out, "The certificate is at {certificate}")?;
+                writeln!(
+                    out,
+                    "A bundle of this machine's roots plus it is at {bundle}\n"
+                )?;
+                for step in &steps {
+                    writeln!(
+                        out,
+                        "{} — {}{}",
+                        step.what,
+                        if step.present {
+                            "present on this machine"
+                        } else {
+                            "not found on this machine"
+                        },
+                        if step.automatic {
+                            ", and Flowlight can do it"
+                        } else {
+                            ""
+                        }
+                    )?;
+                    writeln!(out, "    {}\n", step.how)?;
+                }
+            }
+        }
+        Command::Mock {
+            subject,
+            path,
+            method,
+            status,
+            headers,
+            body,
+            delay,
+            refusal,
+            note,
+        } => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs() as i64);
+            let wrote = crate::views::write_mock(
+                &mut store,
+                &crate::views::MockWrite {
+                    subject: subject.clone(),
+                    path: Some(path.clone()),
+                    method: Some(method.clone()),
+                    status: Some(*status),
+                    headers: Some(headers.join("\n")),
+                    body: Some(body.clone()),
+                    delay: Some(*delay),
+                    refusal: *refusal,
+                    enabled: Some(true),
+                    note: note.clone(),
+                },
+                now,
+            )?;
+            if json {
+                writeln!(out, "{}", line(&wrote))?;
+            } else {
+                writeln!(out, "{wrote}")?;
+                let intercept = store.intercept()?;
+                if let Some(reason) = intercept.why_not() {
+                    // Written, and it will do nothing until interception is on. Saying so here beats
+                    // somebody watching a rule that cannot fire.
+                    writeln!(out, "\nThis cannot answer anything yet: {reason}")?;
+                }
+            }
+        }
+        Command::Mocks => {
+            let rows = crate::views::mocks(&mut store)?;
+            if rows.is_empty() && !json {
+                eprintln!("No canned answers. `flowlightd mock <host>` writes one.");
+                return Ok(());
+            }
+            for row in &rows {
+                if json {
+                    writeln!(out, "{}", line(row))?;
+                } else {
+                    writeln!(
+                        out,
+                        "{:>4}  {} {}{}  → {}{}{}",
+                        row.id,
+                        if row.method.is_empty() {
+                            "ANY"
+                        } else {
+                            &row.method
+                        },
+                        row.subject,
+                        row.path,
+                        row.status,
+                        if row.refusal { " (refusal)" } else { "" },
+                        if row.enabled { "" } else { " [off]" }
+                    )?;
+                }
+            }
+        }
+        Command::ForgetMock { id } => {
+            let removed = store.forget_mock(*id)?;
+            if json {
+                writeln!(out, "{}", line(&removed))?;
+            } else if removed {
+                writeln!(out, "forgotten")?;
+            } else {
+                bail!("there is no canned answer {id}");
             }
         }
         Command::Simulate {

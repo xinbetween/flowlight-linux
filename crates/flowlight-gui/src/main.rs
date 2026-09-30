@@ -71,6 +71,7 @@ struct Pages {
     coverage: gtk::Box,
     budget: gtk::Box,
     export: gtk::Box,
+    intercept: gtk::Box,
 }
 
 /// What the window is currently looking at.
@@ -109,6 +110,7 @@ fn build(application: &adw::Application, socket: PathBuf) {
         budget: page(&stack, "budget", "Budget", "emblem-important-symbolic"),
         export: page(&stack, "export", "Export", "send-to-symbolic"),
         ask: page(&stack, "ask", "Ask", "dialog-information-symbolic"),
+        intercept: page(&stack, "intercept", "Intercept", "media-record-symbolic"),
     };
 
     let picker =
@@ -271,6 +273,25 @@ async fn refresh(
             }
             Err(err) => say(status, &err),
         },
+        "intercept" => {
+            // Two questions for one page, because the configuration and the answers it uses are read
+            // together and half of them is not worth drawing.
+            let mocks =
+                fetch::<Vec<protocol::Mock>>(socket.clone(), r#"{"op":"mocks"}"#.to_owned());
+            match fetch::<protocol::Intercept>(socket, r#"{"op":"intercept"}"#.to_owned()).await {
+                Ok(intercept) => {
+                    let row = protocol::Interception {
+                        intercept,
+                        mocks: mocks.await.unwrap_or_default(),
+                    };
+                    draw(state, 7, &row, &pages.intercept, |column| {
+                        render_intercept(state, column, &row);
+                    });
+                    say(status, "");
+                }
+                Err(err) => say(status, &err),
+            }
+        }
         "export" => {
             match fetch::<protocol::Export>(socket, r#"{"op":"export"}"#.to_owned()).await {
                 Ok(row) => {
@@ -1344,6 +1365,197 @@ fn ask_the_model(state: &Rc<State>, asked: &str) {
 fn change_model(state: &Rc<State>, field: &str, value: &str) {
     let socket = state.socket.clone();
     let request = protocol::set_model(field, value);
+    let state = Rc::clone(state);
+    glib::spawn_future_local(async move {
+        let _: Result<serde_json::Value, String> = fetch(socket, request).await;
+        *state.drawn.borrow_mut() = Default::default();
+    });
+}
+
+/// Intercept: the one page whose switch changes what an application sees.
+///
+/// The disclosure is above the switch, and the switch is the last thing on the page rather than the first. A
+/// page that led with "terminate my agents' connections" and explained afterwards would be a page people flick
+/// and then wonder about.
+fn render_intercept(state: &Rc<State>, column: &gtk::Box, row: &protocol::Interception) {
+    let said = adw::PreferencesGroup::builder()
+        .title(if row.intercept.running {
+            "What is happening"
+        } else {
+            "What turning this on would mean"
+        })
+        .build();
+    for sentence in &row.intercept.disclosure {
+        said.add(&adw::ActionRow::builder().title(sentence).build());
+    }
+    if let Some(reason) = &row.intercept.why_not {
+        said.add(
+            &adw::ActionRow::builder()
+                .title("Nothing is being terminated")
+                .subtitle(reason)
+                .build(),
+        );
+    }
+    column.append(&said);
+
+    let answers = adw::PreferencesGroup::builder()
+        .title("Canned answers")
+        .description(
+            "The first one that matches a request answers it; everything else goes to the server untouched. \
+             A host with no answer is never terminated at all, so no certificate is presented for it.",
+        )
+        .build();
+    if row.mocks.is_empty() {
+        answers.add(
+            &adw::ActionRow::builder()
+                .title("None")
+                .subtitle("`flowlightd mock <host> --status 503` writes one.")
+                .build(),
+        );
+    }
+    for mock in &row.mocks {
+        let line = adw::ActionRow::builder()
+            .title(format!(
+                "{} {}{}",
+                if mock.method.is_empty() {
+                    "ANY"
+                } else {
+                    &mock.method
+                },
+                mock.subject,
+                mock.path
+            ))
+            .subtitle(format!(
+                "answers {}{}{}{}",
+                mock.status,
+                if mock.refusal { ", as a refusal" } else { "" },
+                if mock.delay > 0 {
+                    format!(", after {} second(s)", mock.delay)
+                } else {
+                    String::new()
+                },
+                if mock.enabled {
+                    ""
+                } else {
+                    " — switched off"
+                }
+            ))
+            .build();
+        let forget = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Forget this answer")
+            .valign(gtk::Align::Center)
+            .build();
+        forget.add_css_class("flat");
+        {
+            let state = Rc::clone(state);
+            let id = mock.id;
+            forget.connect_clicked(move |_| {
+                let socket = state.socket.clone();
+                let request = protocol::forget_mock(id);
+                let state = Rc::clone(&state);
+                glib::spawn_future_local(async move {
+                    let _: Result<serde_json::Value, String> = fetch(socket, request).await;
+                    *state.drawn.borrow_mut() = Default::default();
+                });
+            });
+        }
+        line.add_suffix(&forget);
+        answers.add(&line);
+    }
+    column.append(&answers);
+
+    let scope = adw::PreferencesGroup::builder()
+        .title("Scope")
+        .description(
+            "Interception applies to the agents named here and to nothing else on this machine. Empty means \
+             nobody.",
+        )
+        .build();
+    for (title, values, field) in [
+        (
+            "Agents, separated by commas",
+            row.intercept.agents.clone(),
+            "agents",
+        ),
+        (
+            "Never terminate, separated by commas",
+            row.intercept.never.clone(),
+            "never",
+        ),
+    ] {
+        let entry = adw::EntryRow::builder()
+            .title(title)
+            .text(values.join(", "))
+            .show_apply_button(true)
+            .build();
+        let state = Rc::clone(state);
+        entry.connect_apply(move |entry| {
+            let named: Vec<String> = entry
+                .text()
+                .split(',')
+                .map(|part| part.trim().to_owned())
+                .filter(|part| !part.is_empty())
+                .collect();
+            let value = serde_json::to_string(&named).unwrap_or_else(|_| "[]".to_owned());
+            change_intercept(&state, field, &value);
+        });
+        scope.add(&entry);
+    }
+    column.append(&scope);
+
+    let certificate = adw::PreferencesGroup::builder()
+        .title("The certificate")
+        .description(
+            "Anything in scope has to trust it, or it will refuse the connection — which is what a pinned \
+             certificate is supposed to do. `sudo flowlightd trust` says what to tell each thing.",
+        )
+        .build();
+    certificate.add(
+        &adw::ActionRow::builder()
+            .title("Certificate")
+            .subtitle(
+                row.intercept
+                    .certificate
+                    .clone()
+                    .unwrap_or_else(|| "not made yet".to_owned()),
+            )
+            .build(),
+    );
+    if let Some(bundle) = &row.intercept.bundle {
+        certificate.add(
+            &adw::ActionRow::builder()
+                .title("This machine's roots plus it")
+                .subtitle(bundle.clone())
+                .build(),
+        );
+    }
+    column.append(&certificate);
+
+    // Last, and with the disclosure above it.
+    let switch = adw::PreferencesGroup::builder().title("Switch").build();
+    let on = adw::SwitchRow::builder()
+        .title("Terminate connections from the agents above")
+        .subtitle(
+            "Off by default. This is the only thing Flowlight does that changes what an application sees.",
+        )
+        .active(row.intercept.enabled)
+        .build();
+    {
+        let state = Rc::clone(state);
+        on.connect_active_notify(move |switch| {
+            let field = if switch.is_active() { "on" } else { "off" };
+            change_intercept(&state, field, "true");
+        });
+    }
+    switch.add(&on);
+    column.append(&switch);
+}
+
+/// Changes one field of the interception configuration.
+fn change_intercept(state: &Rc<State>, field: &str, value: &str) {
+    let socket = state.socket.clone();
+    let request = protocol::set_intercept(field, value);
     let state = Rc::clone(state);
     glib::spawn_future_local(async move {
         let _: Result<serde_json::Value, String> = fetch(socket, request).await;

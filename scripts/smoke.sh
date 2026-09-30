@@ -27,13 +27,14 @@ export_second=$export_dir/elsewhere.jsonl
 model_log=$(mktemp)
 model_port_file=$(mktemp)
 model_key=$(mktemp)
+certificates=$(mktemp -d)/flowlight
 cleanup() {
     rm -f "$output" "$log" "$stored" "$reported" "$coverage_json" "$agents_json"
     rm -f "$model_log" "$model_port_file" "$model_key"
     [ -n "${model_server:-}" ] && kill "$model_server" 2>/dev/null
     rm -rf "$(dirname "$fake_agent")"
     [ "${agent_tested:-no}" = yes ] && rm -f "$agent_config"
-    sudo rm -rf "$(dirname "$database")" "$export_dir"
+    sudo rm -rf "$(dirname "$database")" "$export_dir" "$(dirname "$certificates")"
     return 0
 }
 trap cleanup EXIT
@@ -70,7 +71,8 @@ PYTHON
 }
 
 echo "Watching..."
-sudo "$binary" --json --seconds 140 --database "$database" --socket "$socket" --web 127.0.0.1:0 \
+sudo "$binary" --json --seconds 220 --database "$database" --socket "$socket" --web 127.0.0.1:0 \
+    --certificates "$certificates" \
     --export-seconds 2 >"$output" 2>"$log" &
 watcher=$!
 
@@ -127,7 +129,7 @@ echo "OK: nothing is served without the right token"
 
 # Loopback is not a permission boundary, so the page must never leave it. Asked of a running daemon rather
 # than trusted to a unit test, because the flag is the thing a person actually types.
-refusal=$(sudo "$binary" --database "$database" --web 0.0.0.0:0 --seconds 1 2>&1 || true)
+refusal=$(sudo "$binary" --database "$database" --certificates "$certificates" --web 0.0.0.0:0 --seconds 1 2>&1 || true)
 if printf '%s' "$refusal" | grep -q loopback; then
     echo "OK: the web page refuses to be served on a routable address"
 else
@@ -261,7 +263,7 @@ if curl -sS --max-time 8 "https://$blocked_address/" -o /dev/null 2>/dev/null; t
     fi
     echo "OK: a connection from something the agent started was refused"
 
-    sudo "$binary" --database "$database" rules
+    sudo "$binary" --database "$database" --certificates "$certificates" rules
     scoped_rule=$(ask '{"op":"rules"}' | jq -r '.ok[] | select(.scope == "agent:claude") | .id')
     ask "{\"op\":\"forget\",\"id\":$scoped_rule}" | jq -e '.ok == true' >/dev/null \
         || fail "the socket would not forget a rule."
@@ -269,7 +271,7 @@ if curl -sS --max-time 8 "https://$blocked_address/" -o /dev/null 2>/dev/null; t
 
     # And now for everyone, which is the simpler half and the one somebody will try first.
     echo "Blocking $blocked_address for everyone..."
-    sudo "$binary" --database "$database" block "$blocked_address" --port 443 --note "smoke test"
+    sudo "$binary" --database "$database" --certificates "$certificates" block "$blocked_address" --port 443 --note "smoke test"
     sleep 4
     if curl -sS --max-time 8 "https://$blocked_address/" -o /dev/null 2>/dev/null; then
         fail "a blocked address was still reachable."
@@ -413,22 +415,144 @@ echo "OK: changing where it goes takes the agreement with it"
 ask '{"op":"set-export","off":true}' | jq -e '.ok.enabled == false' >/dev/null \
     || fail "export would not turn off."
 
+# Interception: the one thing Flowlight does that changes what an application sees. Off, and off by default,
+# so the first thing asserted is that it is off and says so.
+sudo "$binary" --database "$database" --certificates "$certificates" --json intercept \
+    | jq -e '.enabled == false and .running == false and (.why_not | test("off"))' >/dev/null \
+    || fail "interception was not off to begin with."
+sudo "$binary" --database "$database" --certificates "$certificates" intercept | grep -q "is not watching" \
+    || fail "the disclosure does not distinguish interception from watching."
+echo "OK: interception is off until somebody turns it on"
+
+# A certificate authority, made on this machine the first time the daemon started with interception available.
+certificate=$(sudo "$binary" --database "$database" --certificates "$certificates" --json intercept | jq -r '.certificate // empty')
+[ -n "$certificate" ] || fail "no certificate authority was made."
+sudo test -f "$certificate" || fail "the certificate is not at $certificate."
+# The keys are beside the database, in the directory only root may enter.
+keys="$(dirname "$database")/intercept"
+ca_mode=$(sudo stat -c '%a' "$keys/flowlight-ca.key")
+[ "$ca_mode" = 600 ] || fail "the authority's key is mode $ca_mode; anybody who can read it can impersonate every site on the internet."
+leaf_mode=$(sudo stat -c '%a' "$keys/leaf.key")
+[ "$leaf_mode" = 600 ] || fail "the shared leaf key is mode $leaf_mode."
+keys_mode=$(sudo stat -c '%a' "$keys")
+[ "$keys_mode" = 700 ] || fail "the keys' directory is mode $keys_mode."
+echo "OK: the keys are beside the database, readable by nobody else"
+
+# And the certificate is the other way round, because an agent runs as a person who has to read it. Asserted
+# as that person rather than with sudo, which is the whole point.
+[ -r "$certificate" ] || fail "the certificate at $certificate is not readable by the user an agent runs as."
+published_mode=$(stat -c '%a' "$(dirname "$certificate")")
+[ "$published_mode" = 755 ] || fail "the certificate's directory is mode $published_mode; it has to be readable."
+echo "OK: the certificate is published where the person an agent runs as can read it"
+
+bundle=$(sudo "$binary" --database "$database" --certificates "$certificates" --json intercept | jq -r '.bundle // empty')
+[ -r "$bundle" ] || fail "the bundle at $bundle is not readable by the user an agent runs as."
+roots=$(grep -c "BEGIN CERTIFICATE" "$bundle")
+[ "$roots" -gt 1 ] || fail "the bundle holds only $roots certificate(s); it must be this machine's roots plus Flowlight's."
+echo "OK: the bundle is this machine's roots plus Flowlight's, so nothing else stops working"
+
+# `trust` says what it can do and what it cannot, and never touches a store without being asked.
+sudo "$binary" --database "$database" --certificates "$certificates" --json trust | jq -e '.steps | length >= 6' >/dev/null \
+    || fail "trust does not list what has to be told."
+sudo "$binary" --database "$database" --certificates "$certificates" --json trust \
+    | jq -e '[.steps[] | select(.what == "Node")] | .[0].how | test("NODE_EXTRA_CA_CERTS")' >/dev/null \
+    || fail "trust does not say how to tell Node."
+sudo "$binary" --database "$database" --certificates "$certificates" --json trust | jq -e '.installed == false' >/dev/null \
+    || fail "trust reported the certificate as installed before anybody asked for it."
+echo "OK: trust says what it can do and has not done any of it"
+
+# A canned answer. Written before interception is on, which is the order somebody would do it in, so the
+# answer has to say that it cannot fire yet.
+sudo "$binary" --database "$database" --certificates "$certificates" mock "$target_host" --path '/mocked*' --status 503 \
+    --header 'Retry-After: 30' --body '{"error":"mocked by flowlight"}' --note "smoke test" \
+    | grep -q "cannot answer anything yet" \
+    || fail "a canned answer written while interception is off did not say that it cannot fire."
+sudo "$binary" --database "$database" --certificates "$certificates" --json mocks \
+    | jq -e '.subject == "'"$target_host"'" and .status == 503 and .path == "/mocked*"' >/dev/null \
+    || fail "the canned answer was not stored."
+echo "OK: a canned answer is written, and says it cannot fire until interception is on"
+
+# A mock for `*` is refused: it would answer every request from every agent in scope, which is not a test of
+# anything and is very hard to notice.
+if sudo "$binary" --database "$database" --certificates "$certificates" mock '*' --status 500 2>/dev/null; then
+    fail "a canned answer for every host was accepted."
+fi
+echo "OK: a canned answer has to name a host"
+
+# And now the whole thing, against a real kernel: scope it to the fake agent, turn it on, and make a request
+# from that agent.
+if [ "$agent_tested" = yes ]; then
+    sudo "$binary" --database "$database" --certificates "$certificates" intercept --agent claude --on >/dev/null
+    sudo "$binary" --database "$database" --certificates "$certificates" --json intercept \
+        | jq -e '.running == true and (.agents | index("claude"))' >/dev/null \
+        || fail "interception would not turn on."
+    # The daemon reads this on the same two-second timer as the rules.
+    sleep 4
+    await "Connections from claude"
+
+    # curl trusting Flowlight's bundle, run as the fake agent so the kernel's scope matches. `sleep 3` because
+    # an agent is noticed by a scan that runs once a second, and its mark has to be in the kernel before it
+    # connects.
+    mocked=$("$fake_agent" -c "sleep 3; curl -sS --cacert '$bundle' -o /dev/null -w '%{http_code}' --max-time 15 'https://$target_host/mocked-path' 2>/dev/null; exit \$?" || true)
+    printf 'the agent got: %s\n' "$mocked"
+    [ "$mocked" = 503 ] || fail "a mocked request answered $mocked; it should have been the canned 503."
+    echo "OK: a request from an agent in scope was answered by Flowlight rather than by the server"
+
+    # The answer names itself, so a log kept elsewhere on this machine can also tell.
+    headers=$("$fake_agent" -c "sleep 1; curl -sS --cacert '$bundle' -D - -o /dev/null --max-time 15 'https://$target_host/mocked-path' 2>/dev/null; exit \$?" || true)
+    printf '%s' "$headers" | grep -qi "X-Flowlight-Mock" \
+        || fail "the canned answer did not name itself in the response."
+    printf '%s' "$headers" | grep -qi "Retry-After: 30" \
+        || fail "the canned answer's own headers were not sent."
+    echo "OK: the answer says it came from Flowlight and carries the headers the rule named"
+
+    # A path no answer covers is not terminated at all: no certificate is presented for it, so the real one is
+    # what curl sees — and curl trusting only Flowlight's bundle still works, because the bundle holds the
+    # machine's roots too.
+    passed=$("$fake_agent" -c "sleep 1; curl -sS --cacert '$bundle' -o /dev/null -w '%{http_code}' --max-time 15 'https://$target_host/' 2>/dev/null; exit \$?" || true)
+    printf 'a path nothing mocks got: %s\n' "$passed"
+    case "$passed" in
+        2*|3*|4*) echo "OK: a request no answer covers reached the real server" ;;
+        *) fail "a request no answer covers came back as $passed; it should have reached the server." ;;
+    esac
+
+    # And nothing outside the scope is touched. `curl` is not an agent, so its connection is never redirected
+    # and it does not need Flowlight's certificate at all.
+    outside=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "https://$target_host/mocked-path" || true)
+    [ "$outside" != 503 ] \
+        || fail "a process outside the scope was intercepted."
+    echo "OK: a process outside the scope is not intercepted, and needs no certificate"
+
+    # What Flowlight did is recorded. Not what it passed through: a note per connection would bury the ones
+    # that matter.
+    ask '{"op":"requests","since":600,"limit":400}' >/dev/null
+    sudo "$binary" --database "$database" --certificates "$certificates" --json coverage --since 600 >/dev/null
+
+    sudo "$binary" --database "$database" --certificates "$certificates" intercept --off >/dev/null
+    sleep 4
+    after=$("$fake_agent" -c "sleep 1; curl -sS --cacert '$bundle' -o /dev/null -w '%{http_code}' --max-time 15 'https://$target_host/mocked-path' 2>/dev/null; exit \$?" || true)
+    [ "$after" != 503 ] || fail "a request was still mocked after interception was turned off."
+    echo "OK: turning it off stops the redirect"
+else
+    echo "SKIP: there is no fake agent here, so interception's scope could not be exercised"
+fi
+
 # Ask: a question about this machine, answered by a model somebody configured. There is no model in
 # Flowlight for Linux -- that is the one deliberate difference from the macOS build -- so the first thing
 # asserted is that asking without one is refused rather than quietly sent somewhere.
-if sudo "$binary" --database "$database" query "what happened today?" 2>/dev/null; then
+if sudo "$binary" --database "$database" --certificates "$certificates" query "what happened today?" 2>/dev/null; then
     fail "a question was answered with no model configured."
 fi
 # Captured rather than piped: `pipefail` is on, the command is supposed to fail, and a pipeline that
 # reports the failure of the thing it is asserting about tells you nothing.
-refusal=$(sudo "$binary" --database "$database" query "what happened?" 2>&1 || true)
+refusal=$(sudo "$binary" --database "$database" --certificates "$certificates" query "what happened?" 2>&1 || true)
 printf '%s\n' "$refusal"
 printf '%s' "$refusal" | grep -q "no model" \
     || fail "asking with no model configured did not say that there is no model."
 echo "OK: there is no model until somebody configures one"
 
 # A key and a question about this machine must not cross the network in the clear.
-if sudo "$binary" --database "$database" model --kind compatible \
+if sudo "$binary" --database "$database" --certificates "$certificates" model --kind compatible \
     --endpoint "http://a-collector.example/v1/chat/completions" 2>/dev/null; then
     fail "a plain http endpoint on the internet was accepted."
 fi
@@ -436,7 +560,7 @@ echo "OK: a plain http endpoint that is not local is refused"
 
 # A key goes in a file, mode 600, next to the database -- never in the database, which gets copied.
 printf 'a-smoke-test-key\n' >"$model_key"
-sudo "$binary" --database "$database" model --kind anthropic --key-file "$model_key" >/dev/null
+sudo "$binary" --database "$database" --certificates "$certificates" model --kind anthropic --key-file "$model_key" >/dev/null
 key_file="$(dirname "$database")/ask.key"
 sudo test -f "$key_file" || fail "the key was not written beside the database."
 key_mode=$(sudo stat -c '%a' "$key_file")
@@ -446,14 +570,14 @@ if sudo grep -qF "a-smoke-test-key" "$database"; then
 fi
 echo "OK: a key is a file of its own, mode 600, and is not in the database"
 
-sudo "$binary" --database "$database" --json model | jq -e '.key_on_file == true' >/dev/null \
+sudo "$binary" --database "$database" --certificates "$certificates" --json model | jq -e '.key_on_file == true' >/dev/null \
     || fail "the key on file was not reported."
-if sudo "$binary" --database "$database" --json model | grep -qF "a-smoke-test-key"; then
+if sudo "$binary" --database "$database" --certificates "$certificates" --json model | grep -qF "a-smoke-test-key"; then
     fail "the key was printed back."
 fi
 echo "OK: whether there is a key is reported; the key never is"
 
-sudo "$binary" --database "$database" model --forget-key >/dev/null
+sudo "$binary" --database "$database" --certificates "$certificates" model --forget-key >/dev/null
 if sudo test -f "$key_file"; then
     fail "the key was not forgotten."
 fi
@@ -470,15 +594,15 @@ model_port=$(cat "$model_port_file")
 [ -n "$model_port" ] || fail "the fake model server never started."
 echo "A model server that is not a model, on port $model_port"
 
-sudo "$binary" --database "$database" model --kind local \
+sudo "$binary" --database "$database" --certificates "$certificates" model --kind local \
     --endpoint "http://127.0.0.1:$model_port/v1/chat/completions" --model smoke-model \
     | grep -q "Nothing crosses the internet" \
     || fail "a local endpoint was not described as local."
-sudo "$binary" --database "$database" --json model | jq -e '.ready == true and .sends_off_the_machine == false' \
+sudo "$binary" --database "$database" --certificates "$certificates" --json model | jq -e '.ready == true and .sends_off_the_machine == false' \
     >/dev/null || fail "a configured local model is not ready."
 echo "OK: a local model server is configured, and is described as sending nothing anywhere"
 
-answer=$(sudo "$binary" --database "$database" query "how much happened today?")
+answer=$(sudo "$binary" --database "$database" --certificates "$certificates" query "how much happened today?")
 printf '%s\n' "$answer"
 printf '%s' "$answer" | grep -q "FLOWLIGHT-SAW" \
     || fail "the model's answer did not come back."
@@ -513,13 +637,13 @@ echo "OK: what reached the model was the question, the query list and the totals
 # A model that answers with a query nobody wrote gets a sentence back, not an empty result. Asserted through
 # the real loop by naming a query that does not exist in a second fake reply would need a second server, so
 # this is the unit-tested half; what is asserted here is the shape of the tool the model was handed.
-sudo "$binary" --database "$database" model --off >/dev/null
-if sudo "$binary" --database "$database" query "anything?" 2>/dev/null; then
+sudo "$binary" --database "$database" --certificates "$certificates" model --off >/dev/null
+if sudo "$binary" --database "$database" --certificates "$certificates" query "anything?" 2>/dev/null; then
     fail "a question was answered after Ask was turned off."
 fi
 echo "OK: turning it off stops questions being answered"
 # Back on for the rest of the run, without needing to be reconfigured.
-sudo "$binary" --database "$database" model --model smoke-model >/dev/null
+sudo "$binary" --database "$database" --certificates "$certificates" model --model smoke-model >/dev/null
 
 echo "Turning payload capture off..."
 before=$(ask '{"op":"requests","since":600,"limit":400}' | jq '[.ok[] | select(.process == "curl")] | length')
@@ -631,7 +755,7 @@ echo "OK: the credential appears nowhere in the output"
 # Storage. The database is the reason a question can be asked an hour later, so the check is not "a file
 # appeared" but "the request that was just read comes back out of it".
 echo "--- what the database remembers:"
-sudo "$binary" --database "$database" history --since 10m --json | tee "$stored"
+sudo "$binary" --database "$database" --certificates "$certificates" history --since 10m --json | tee "$stored"
 
 if ! jq -s -e 'map(select(.process == "curl" and .method == "GET")) | length > 0' "$stored" >/dev/null; then
     echo "FAIL: the request was read and then not stored." >&2
@@ -646,8 +770,8 @@ fi
 echo "OK: the credential was not stored either"
 
 echo "--- what Flowlight says it could not see:"
-sudo "$binary" --database "$database" coverage --since 10m | tee "$reported"
-sudo "$binary" --database "$database" --json coverage --since 10m > "$coverage_json"
+sudo "$binary" --database "$database" --certificates "$certificates" coverage --since 10m | tee "$reported"
+sudo "$binary" --database "$database" --certificates "$certificates" --json coverage --since 10m > "$coverage_json"
 
 if ! grep -q "0 record(s) were lost by the kernel" "$reported"; then
     echo "FAIL: the kernel dropped records, or the line that would say so is missing." >&2
@@ -673,8 +797,8 @@ if [ "$agent_tested" = yes ]; then
     echo "OK: a request from an agent's child was attributed to the agent"
 
     echo "--- what each agent reached, against what it was configured to reach:"
-    sudo "$binary" --database "$database" agents --since 10m | tee /dev/stderr
-    sudo "$binary" --database "$database" --json agents --since 10m > "$agents_json"
+    sudo "$binary" --database "$database" --certificates "$certificates" agents --since 10m | tee /dev/stderr
+    sudo "$binary" --database "$database" --certificates "$certificates" --json agents --since 10m > "$agents_json"
     if ! jq -s -e "map(select(.agent == \"claude\")) | length > 0" "$agents_json" >/dev/null; then
         echo "FAIL: the agent was not listed." >&2
         exit 1
@@ -705,9 +829,9 @@ if [ "$block_tested" = yes ]; then
     fi
     echo "OK: Coverage accounts for what was refused"
 
-    id=$(sudo "$binary" --database "$database" --json rules | jq -rs '.[0].id')
-    sudo "$binary" --database "$database" forget "$id"
-    if sudo "$binary" --database "$database" rules 2>&1 | grep -q "$blocked_address"; then
+    id=$(sudo "$binary" --database "$database" --certificates "$certificates" --json rules | jq -rs '.[0].id')
+    sudo "$binary" --database "$database" --certificates "$certificates" forget "$id"
+    if sudo "$binary" --database "$database" --certificates "$certificates" rules 2>&1 | grep -q "$blocked_address"; then
         echo "FAIL: the rule survived being removed." >&2
         exit 1
     fi

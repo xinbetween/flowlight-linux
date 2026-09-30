@@ -1,0 +1,22 @@
+[package]
+name = "flowlight-proxy"
+description = "The certificate authority and terminating proxy behind Flowlight's interception, which is off unless it is asked for."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+flowlight-rules.workspace = true
+flowlight-store.workspace = true
+anyhow.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
+webpki-roots.workspace = true
+
+[lints]
+workspace = true
