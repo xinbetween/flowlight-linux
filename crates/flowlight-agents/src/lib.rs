@@ -15,6 +15,10 @@
 //!   configuration is the thing worth a second look.
 //! - [`wire`] — **what did it actually say?** MCP is JSON-RPC, so the method and the name of the tool are
 //!   in plaintext a uprobe has already copied. Never the arguments.
+//! - [`workspace`] — **what is it set up to do?** Skills, subagents, commands, hooks, permissions and
+//!   plugins, read out of the same files [`mcp`] reads. A hook is a program the agent runs on its own behalf
+//!   and a permission is a decision somebody made once, and neither is visible from any amount of watching
+//!   the network.
 //! - [`launch`] — **what does it need to be started with?** Which variables an agent reads at launch and
 //!   nowhere else, and what to call an agent somebody is starting. The forking lives in the daemon; the
 //!   deciding lives here.
@@ -27,3 +31,4 @@ pub mod ancestry;
 pub mod launch;
 pub mod mcp;
 pub mod wire;
+pub mod workspace;

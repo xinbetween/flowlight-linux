@@ -453,6 +453,56 @@ sudo "$binary" --database "$database" --certificates "$certificates" --json owne
     || fail "turning it off lost what had already been learnt."
 echo "OK: turning it off keeps what was already learnt"
 
+# What an agent is set up to do, read out of its own configuration. A hook is a program the agent runs on its
+# own behalf and a permission is a decision somebody made once — neither is visible from any amount of watching
+# the network, because a hook's traffic looks exactly like the agent's own.
+if [ "$agent_tested" = yes ]; then
+    workspace="$agent_home/.claude"
+    mkdir -p "$workspace/skills/smoke" "$workspace/commands"
+    printf -- '---\nname: smoke\ndescription: A skill written by the smoke test\n---\n\nTHE-BODY-IS-NOT-READ\n' \
+        >"$workspace/skills/smoke/SKILL.md"
+    printf 'Reviews a change.\n' >"$workspace/commands/review.md"
+    printf '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"command":"/usr/local/bin/smoke-hook"}]}]},\n"permissions":{"allow":["Bash(git push:*)"],"deny":["Bash(rm:*)"]}}\n' \
+        >"$workspace/settings.json"
+
+    declared=$(sudo "$binary" --database "$database" --certificates "$certificates" --json agents --since 3600 \
+        | jq -c 'select(.agent == "claude") | .declares')
+    printf 'claude declares: %s\n' "$declared"
+    printf '%s' "$declared" | jq -e '[.[] | select(.kind == "skill" and .name == "smoke")] | length == 1' >/dev/null \
+        || fail "the skill was not read."
+    printf '%s' "$declared" | jq -e '[.[] | select(.kind == "command" and .name == "review")] | length == 1' >/dev/null \
+        || fail "the command was not read."
+
+    # A hook is written out with what it runs, and called sensitive.
+    printf '%s' "$declared" \
+        | jq -e '[.[] | select(.kind == "hook" and .sensitive == true and (.detail | test("smoke-hook")))] | length == 1' \
+        >/dev/null || fail "the hook was not read, or was not called sensitive."
+
+    # A permission that grants is flagged; one that refuses is not.
+    printf '%s' "$declared" \
+        | jq -e '[.[] | select(.kind == "permission" and .name == "Bash(git push:*)" and .sensitive == true)] | length == 1' \
+        >/dev/null || fail "a permission that grants something was not flagged."
+    printf '%s' "$declared" \
+        | jq -e '[.[] | select(.name == "Bash(rm:*)" and .sensitive == false)] | length == 1' >/dev/null \
+        || fail "a permission that refuses something was flagged as if it granted it."
+    echo "OK: what an agent is set up to do is read, and what can act without asking is flagged"
+
+    # The description, never the body: a skill is somebody's writing.
+    if printf '%s' "$declared" | grep -qF "THE-BODY-IS-NOT-READ"; then
+        fail "a skill's body was read."
+    fi
+    printf '%s' "$declared" | jq -e '[.[] | select(.detail == "A skill written by the smoke test")] | length == 1' \
+        >/dev/null || fail "the skill's description was not read."
+    echo "OK: a skill's description is kept and its body is not"
+
+    # And the path says which file without saying whose home it is in.
+    printf '%s' "$declared" | jq -e '[.[] | select(.source | startswith("/home"))] | length == 0' >/dev/null \
+        || fail "a path spells out somebody's home directory."
+    echo "OK: a path says which file without saying whose home it is in"
+
+    rm -rf "$workspace/skills" "$workspace/commands" "$workspace/settings.json"
+fi
+
 # Launching an agent through Flowlight. The claim is not that it works — the scan already marks agents — but
 # that the mark is in the kernel *before* the agent runs. So this asks the sharpest question there is: a rule
 # scoped to the agent, and a connection made with no pause at all.

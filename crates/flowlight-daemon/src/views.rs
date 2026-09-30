@@ -115,6 +115,27 @@ pub struct AgentView {
     pub domains: Vec<DomainView>,
     /// What it actually said to them.
     pub tools: Vec<ToolView>,
+    /// What it is set up to do, read out of its own configuration.
+    ///
+    /// Beside what it did, on purpose: a hook that runs a command and a request that command made are the
+    /// same event seen from two ends, and only one of them is visible on the network.
+    pub declares: Vec<CapabilityView>,
+}
+
+/// One thing an agent is set up to do.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CapabilityView {
+    /// `skill`, `subagent`, `command`, `hook`, `permission`, `plugin` or `instructions`.
+    pub kind: String,
+    /// What it is called.
+    pub name: String,
+    /// One line about it: a hook's command, a permission's decision, a skill's description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Where it was found, without whose home it is in.
+    pub source: String,
+    /// Whether it can run a command or reach the network without being asked.
+    pub sensitive: bool,
 }
 
 /// One thing an agent said to an MCP server.
@@ -1039,6 +1060,8 @@ pub fn agents(store: &mut Store, since: i64, homes: &[PathBuf]) -> Result<Vec<Ag
         .iter()
         .flat_map(|(agent, path)| mcp::read(agent, path))
         .collect();
+    // Read once for every agent rather than once per agent: it is a walk of the same directories either way.
+    let declared = flowlight_agents::workspace::scan(homes);
     let mut views = Vec::new();
     for row in store.agents(since)? {
         let contacted: Vec<(String, i64)> = store
@@ -1053,6 +1076,18 @@ pub fn agents(store: &mut Store, since: i64, homes: &[PathBuf]) -> Result<Vec<Ag
             .collect();
         let tools = store.tools_for_agent(&row.agent, since, 100)?;
         let domains = mcp::merge(&mine, &contacted, mcp::endpoints_for(&row.agent));
+        let declares: Vec<CapabilityView> = declared
+            .iter()
+            // `.agents` holds things any agent can load, so they count for whichever agents are here.
+            .filter(|capability| capability.agent == row.agent || capability.agent == "any agent")
+            .map(|capability| CapabilityView {
+                kind: capability.kind.as_str().to_owned(),
+                name: capability.name.clone(),
+                detail: capability.detail.clone(),
+                source: capability.source.clone(),
+                sensitive: capability.sensitive,
+            })
+            .collect();
         views.push(AgentView {
             agent: row.agent,
             requests: row.requests,
@@ -1084,6 +1119,7 @@ pub fn agents(store: &mut Store, since: i64, homes: &[PathBuf]) -> Result<Vec<Ag
                     last_seen: row.last_seen,
                 })
                 .collect(),
+            declares,
         });
     }
     Ok(views)
