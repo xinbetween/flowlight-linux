@@ -771,8 +771,11 @@ Stated here rather than discovered later:
 
 ## Where it is going
 
-Two milestones, released a feature at a time: **0.1 — see everything, honestly**, then **0.2 — parity with the
-macOS build**. [ROADMAP.md](ROADMAP.md) has the sequence and, more usefully, what this will not do.
+Four milestones, released a feature at a time: **0.1 — see everything, honestly**, then **0.2 — parity with the
+macOS build**, then **0.3 — installing it without a compiler**, then **0.4 — the parity the first pass missed**.
+That last one exists because 0.2 was built from the macOS build's roadmap and 0.4 was built by reading its source
+tree, and the second list is longer: guardrails on agents' tools, alerts, who owns an address, and the rest.
+[ROADMAP.md](ROADMAP.md) has the sequence and, more usefully, what this will not do.
 
 One thing in 0.2 is deliberately not parity, and it is done: macOS has a system model that the Ask feature
 leans on, so on Linux you configure one — local or remote — or the feature stays off. No bundled weights, and
