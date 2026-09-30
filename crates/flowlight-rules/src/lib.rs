@@ -261,14 +261,20 @@ impl Rule {
     }
 
     /// Whether this rule applies to a connection.
-    fn applies(&self, facts: &Facts) -> bool {
+    ///
+    /// Public because simulation asks the same question of the same rules, and a second implementation of
+    /// "does this apply" is a second thing to keep in step with the macOS build.
+    pub fn applies(&self, facts: &Facts) -> bool {
         if !self.scope.covers(facts.agent.as_deref()) {
             return false;
         }
-        if let Some(port) = self.port
-            && port != facts.port
-        {
-            return false;
+        // A rule naming a port cannot be judged against a fact that has none. Treating "unknown" as "the
+        // port I meant" would make a simulation claim changes that may not happen, and treating it as "not
+        // the port I meant" is the answer that cannot mislead.
+        match (self.port, facts.port) {
+            (Some(mine), Some(theirs)) if mine != theirs => return false,
+            (Some(_), None) => return false,
+            _ => {}
         }
         match (&facts.host, &facts.address) {
             // A connection we know the name of is judged by name, and by address only if no name matched:
@@ -286,7 +292,7 @@ impl Rule {
 }
 
 /// What is known about a connection when it is judged.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Facts {
     /// The agent that caused it, if any.
     pub agent: Option<String>,
@@ -294,8 +300,13 @@ pub struct Facts {
     pub host: Option<String>,
     /// The address, as text.
     pub address: Option<String>,
-    /// The port.
-    pub port: u16,
+    /// The port, when it is known.
+    ///
+    /// At `connect()` it always is. Replaying history is another matter: a stored request records the host
+    /// it went to and not the port, because the port is not something a probe on a TLS library ever sees.
+    /// A rule naming a port therefore cannot be judged against such a row, and does not pretend to be —
+    /// see [`Rule::applies`].
+    pub port: Option<u16>,
 }
 
 /// The answer, and where it came from.
@@ -428,6 +439,78 @@ pub fn table(rules: &[Rule]) -> Table {
     table
 }
 
+/// One thing a candidate rule would change, and how often it happened.
+///
+/// Aggregated rather than listed. A day of traffic is thousands of rows and a handful of distinct answers,
+/// and "this would have blocked 1,284 requests to `api.example.com`" is the sentence somebody can act on.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Change {
+    /// The host or address this is about, whichever the history recorded.
+    pub subject: String,
+    /// The agent, if the traffic belonged to one.
+    pub agent: Option<String>,
+    /// The port, when the history recorded one.
+    pub port: Option<u16>,
+    /// What happens today.
+    pub before: Action,
+    /// What would happen with the candidate rule in place.
+    pub after: Action,
+    /// How many times this traffic occurred in the window.
+    pub occurrences: i64,
+}
+
+/// What adding a rule would change, judged against traffic that actually happened.
+///
+/// Every piece of history is decided twice — once with the rules as they are, once with the candidate added
+/// — and only the answers that move are reported. That is the whole idea, and it is the difference between
+/// a rule somebody can enable and a rule nobody dares to: the macOS build learned that the long way round.
+///
+/// Note what this is not. It is a claim about the past, not a promise about the future: a host that was not
+/// reached yesterday does not appear, and a name that resolves elsewhere tomorrow will behave differently.
+/// Reporting only what is derivable from evidence is the point.
+pub fn simulate(existing: &[Rule], candidate: &Rule, history: &[(Facts, i64)]) -> Vec<Change> {
+    let mut with_candidate: Vec<Rule> = existing.to_vec();
+    // An identifier already in use would make the verdict ambiguous about which rule decided.
+    let mut candidate = candidate.clone();
+    if existing.iter().any(|rule| rule.id == candidate.id) {
+        candidate.id = existing.iter().map(|rule| rule.id).max().unwrap_or(0) + 1;
+    }
+    with_candidate.push(candidate);
+
+    let mut changes: Vec<Change> = Vec::new();
+    for (facts, occurrences) in history {
+        let before = decide(facts, existing);
+        let after = decide(facts, &with_candidate);
+        if before.action == after.action {
+            continue;
+        }
+        let Some(subject) = facts.host.clone().or_else(|| facts.address.clone()) else {
+            continue;
+        };
+        let change = Change {
+            subject,
+            agent: facts.agent.clone(),
+            port: facts.port,
+            before: before.action,
+            after: after.action,
+            occurrences: *occurrences,
+        };
+        match changes.iter_mut().find(|existing| {
+            existing.subject == change.subject
+                && existing.agent == change.agent
+                && existing.port == change.port
+                && existing.before == change.before
+                && existing.after == change.after
+        }) {
+            Some(existing) => existing.occurrences += change.occurrences,
+            None => changes.push(change),
+        }
+    }
+    // Busiest first: the thing that would change most is the thing worth reading about.
+    changes.sort_by(|a, b| b.occurrences.cmp(&a.occurrences).then(a.cmp(b)));
+    changes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,7 +530,7 @@ mod tests {
             agent: agent.map(|text| text.to_owned()),
             host: host.map(|text| text.to_owned()),
             address: address.map(|text| text.to_owned()),
-            port,
+            port: Some(port),
         }
     }
 
@@ -751,6 +834,142 @@ mod tests {
     #[test]
     fn a_table_of_no_rules_is_empty_rather_than_anything_else() {
         assert_eq!(table(&[]), Table::default());
+    }
+
+    // Simulation
+
+    fn history(rows: &[(Option<&str>, Option<&str>, Option<u16>, i64)]) -> Vec<(Facts, i64)> {
+        rows.iter()
+            .map(|(agent, host, port, count)| {
+                (
+                    Facts {
+                        agent: agent.map(|text| text.to_owned()),
+                        host: host.map(|text| text.to_owned()),
+                        address: None,
+                        port: *port,
+                    },
+                    *count,
+                )
+            })
+            .collect()
+    }
+
+    /// The whole idea: a number somebody can act on before the rule is real.
+    #[test]
+    fn a_candidate_rule_says_what_it_would_have_changed() {
+        let past = history(&[
+            (Some("claude"), Some("telemetry.example"), None, 1_284),
+            (Some("claude"), Some("api.anthropic.com"), None, 40),
+        ]);
+        let candidate = rule(9, Action::Block, "everyone", "telemetry.example", None);
+        let changes = simulate(&[], &candidate, &past);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].subject, "telemetry.example");
+        assert_eq!(changes[0].before, Action::Allow);
+        assert_eq!(changes[0].after, Action::Block);
+        assert_eq!(changes[0].occurrences, 1_284);
+    }
+
+    /// A rule that changes nothing is the commonest thing anybody types, and saying "nothing" is the whole
+    /// value of asking first.
+    #[test]
+    fn a_rule_that_changes_nothing_reports_nothing() {
+        let past = history(&[(None, Some("example.com"), None, 10)]);
+        let candidate = rule(9, Action::Block, "everyone", "somewhere.else", None);
+        assert!(simulate(&[], &candidate, &past).is_empty());
+        // And one that agrees with what is already there.
+        let existing = [rule(1, Action::Block, "everyone", "example.com", None)];
+        let same = rule(9, Action::Block, "everyone", "example.com", None);
+        assert!(simulate(&existing, &same, &past).is_empty());
+    }
+
+    /// An exception is a change in the other direction, and is exactly as worth previewing.
+    #[test]
+    fn an_exception_reports_what_it_would_let_through() {
+        let past = history(&[(Some("claude"), Some("mcp.sentry.dev"), None, 12)]);
+        let existing = [rule(1, Action::Block, "everyone", "mcp.sentry.dev", None)];
+        let candidate = rule(9, Action::Allow, "agent:claude", "mcp.sentry.dev", None);
+        let changes = simulate(&existing, &candidate, &past);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].before, Action::Block);
+        assert_eq!(changes[0].after, Action::Allow);
+    }
+
+    /// The rule that already exists must keep deciding: a candidate is added to the book, not put in place
+    /// of it, or every simulation would report the rest of the rules being switched off.
+    #[test]
+    fn the_rules_that_are_there_still_decide() {
+        let past = history(&[
+            (None, Some("a.example"), None, 5),
+            (None, Some("b.example"), None, 5),
+        ]);
+        let existing = [rule(1, Action::Block, "everyone", "a.example", None)];
+        let candidate = rule(9, Action::Block, "everyone", "b.example", None);
+        let changes = simulate(&existing, &candidate, &past);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].subject, "b.example");
+    }
+
+    /// A candidate whose identifier collides with a real rule would make the verdict ambiguous about which
+    /// of the two decided.
+    #[test]
+    fn a_candidate_that_reuses_an_identifier_is_given_another() {
+        let past = history(&[(None, Some("a.example"), None, 5)]);
+        let existing = [rule(1, Action::Allow, "everyone", "a.example", None)];
+        let candidate = rule(1, Action::Block, "everyone", "a.example", None);
+        let changes = simulate(&existing, &candidate, &past);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].after, Action::Block);
+    }
+
+    /// A stored request records the host and not the port, because a probe on a TLS library never sees one.
+    /// A rule naming a port must not claim it would have changed such a request.
+    #[test]
+    fn a_rule_naming_a_port_claims_nothing_about_history_without_one() {
+        let past = history(&[(None, Some("example.com"), None, 10)]);
+        let candidate = rule(9, Action::Block, "everyone", "example.com", Some(443));
+        assert!(simulate(&[], &candidate, &past).is_empty());
+
+        // And where the port is known, it decides.
+        let with_ports = history(&[(None, Some("example.com"), Some(443), 10)]);
+        assert_eq!(simulate(&[], &candidate, &with_ports).len(), 1);
+    }
+
+    /// A day of traffic is thousands of rows and a handful of distinct answers.
+    #[test]
+    fn the_same_change_seen_twice_is_counted_once() {
+        let past = history(&[
+            (Some("claude"), Some("a.example"), None, 100),
+            (Some("claude"), Some("a.example"), None, 40),
+        ]);
+        let candidate = rule(9, Action::Block, "everyone", "a.example", None);
+        let changes = simulate(&[], &candidate, &past);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].occurrences, 140);
+    }
+
+    /// The thing that would change most is the thing worth reading about first.
+    #[test]
+    fn the_busiest_change_is_reported_first() {
+        let past = history(&[
+            (None, Some("quiet.example"), None, 2),
+            (None, Some("busy.example"), None, 900),
+        ]);
+        let candidate = rule(9, Action::Block, "everyone", "*", None);
+        let changes = simulate(&[], &candidate, &past);
+        assert_eq!(
+            changes.first().map(|c| c.subject.as_str()),
+            Some("busy.example")
+        );
+    }
+
+    /// Traffic with neither a name nor an address cannot be described, so it is left out rather than
+    /// reported as a change to nothing.
+    #[test]
+    fn history_with_nothing_to_name_is_left_out() {
+        let past = [(Facts::default(), 10)];
+        let candidate = rule(9, Action::Block, "everyone", "*", None);
+        assert!(simulate(&[], &candidate, &past).is_empty());
     }
 
     // Round-tripping, because these go through a database

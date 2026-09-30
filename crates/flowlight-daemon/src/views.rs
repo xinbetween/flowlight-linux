@@ -142,6 +142,25 @@ pub struct RuleView {
     pub created: i64,
 }
 
+/// One thing a candidate rule would change.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ChangeView {
+    /// The host or address this is about.
+    pub subject: String,
+    /// The agent, if the traffic belonged to one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The port, when the history recorded one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// What happens today.
+    pub before: String,
+    /// What would happen with the rule in place.
+    pub after: String,
+    /// How many times this traffic occurred in the window.
+    pub occurrences: i64,
+}
+
 /// What was seen, and what was not.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 pub struct CoverageView {
@@ -319,6 +338,77 @@ pub fn rules(store: &mut Store) -> Result<Vec<RuleView>> {
         .collect())
 }
 
+/// What adding a rule would change, judged against traffic that actually happened.
+///
+/// A claim about the past, not a promise about the future: a host that was not reached in the window does
+/// not appear, and a name that resolves elsewhere tomorrow will behave differently. Reporting only what is
+/// derivable from evidence is the point.
+pub fn simulate(
+    store: &mut Store,
+    action: &str,
+    subject: &str,
+    port: u16,
+    agent: Option<&str>,
+    since: i64,
+) -> Result<Vec<ChangeView>> {
+    use anyhow::Context as _;
+    let action = flowlight_rules::Action::parse(action)
+        .with_context(|| format!("`{action}` is not allow, ask or block"))?;
+    let scope = agent.map_or(flowlight_rules::Scope::Everyone, |agent| {
+        flowlight_rules::Scope::Agent(agent.to_owned())
+    });
+
+    let existing: Vec<flowlight_rules::Rule> = store
+        .rules()?
+        .into_iter()
+        .filter_map(|row| {
+            Some(flowlight_rules::Rule {
+                id: row.id,
+                action: flowlight_rules::Action::parse(&row.action)?,
+                scope: flowlight_rules::Scope::parse(&row.scope)?,
+                subject: flowlight_rules::Subject::parse(&row.subject),
+                port: (row.port != 0).then_some(row.port),
+            })
+        })
+        .collect();
+    // An identifier no rule has, so that the verdict can never be attributed to it by accident.
+    let candidate = flowlight_rules::Rule {
+        id: existing.iter().map(|rule| rule.id).max().unwrap_or(0) + 1,
+        action,
+        scope,
+        subject: flowlight_rules::Subject::parse(subject),
+        port: (port != 0).then_some(port),
+    };
+
+    let history: Vec<(flowlight_rules::Facts, i64)> = store
+        .traffic_since(since)?
+        .into_iter()
+        .map(|row| {
+            (
+                flowlight_rules::Facts {
+                    agent: row.agent,
+                    host: row.host,
+                    address: row.address,
+                    port: row.port,
+                },
+                row.occurrences,
+            )
+        })
+        .collect();
+
+    Ok(flowlight_rules::simulate(&existing, &candidate, &history)
+        .into_iter()
+        .map(|change| ChangeView {
+            subject: change.subject,
+            agent: change.agent,
+            port: change.port,
+            before: change.before.as_str().to_owned(),
+            after: change.after.as_str().to_owned(),
+            occurrences: change.occurrences,
+        })
+        .collect())
+}
+
 /// What was seen, and what was not.
 pub fn coverage(store: &mut Store, since: i64) -> Result<CoverageView> {
     let coverage = store.coverage(since)?;
@@ -419,6 +509,58 @@ mod tests {
             assert!(json.contains(expected), "{expected} missing from {json}");
         }
         assert!(!json.contains("status"), "{json}");
+    }
+
+    /// The sentence somebody can act on before the rule is real.
+    #[test]
+    fn a_simulation_says_what_a_rule_would_have_changed() {
+        let mut store = Store::in_memory().unwrap();
+        let mut row = flowlight_store::RequestRow {
+            at: 1_000,
+            process: "node".to_owned(),
+            confidence: "path".to_owned(),
+            pid: 1,
+            agent: Some("claude".to_owned()),
+            direction: "out".to_owned(),
+            protocol: None,
+            method: Some("POST".to_owned()),
+            target: Some("/x".to_owned()),
+            host: Some("telemetry.example".to_owned()),
+            status: None,
+            bytes: 10,
+            truncated: false,
+            unreadable: None,
+        };
+        store.record_request(row.clone()).unwrap();
+        store.record_request(row.clone()).unwrap();
+        row.host = Some("api.anthropic.com".to_owned());
+        store.record_request(row).unwrap();
+
+        let changes = simulate(&mut store, "block", "telemetry.example", 0, None, 0).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].subject, "telemetry.example");
+        assert_eq!(changes[0].before, "allow");
+        assert_eq!(changes[0].after, "block");
+        assert_eq!(changes[0].occurrences, 2);
+    }
+
+    /// The commonest thing anybody types, and saying "nothing" is the whole value of asking first.
+    #[test]
+    fn a_rule_that_would_change_nothing_says_nothing() {
+        let mut store = Store::in_memory().unwrap();
+        assert!(
+            simulate(&mut store, "block", "somewhere.else", 0, None, 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// An action this version does not understand must be refused before anything is simulated, or the
+    /// answer describes a rule nobody could write.
+    #[test]
+    fn an_action_that_is_not_one_is_refused() {
+        let mut store = Store::in_memory().unwrap();
+        assert!(simulate(&mut store, "maybe", "example.com", 0, None, 0).is_err());
     }
 
     #[test]

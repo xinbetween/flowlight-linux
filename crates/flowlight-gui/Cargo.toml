@@ -16,7 +16,9 @@ path = "src/main.rs"
 anyhow.workspace = true
 async-channel = "2"
 gtk = { package = "gtk4", version = "0.11" }
-adw = { package = "libadwaita", version = "0.9", features = ["v1_4"] }
+# `v1_5` for `AlertDialog`, which Ubuntu 24.04 has: it ships libadwaita 1.5. The older `MessageDialog` would
+# work on 1.4 and is deprecated from 1.6, so this is the version that is current on both sides.
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
 serde.workspace = true
 serde_json.workspace = true
 

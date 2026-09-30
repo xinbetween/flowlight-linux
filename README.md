@@ -135,7 +135,7 @@ Useful flags:
 | `--summary-days N` | days of the daily summary. Default 90 |
 
 Plus subcommands that read the database rather than the kernel — `history --since 6h`, `agents`, `summary`,
-`coverage --since 24h` — and five for rules: `block`, `allow`, `ask`, `rules`, `forget`. `--json` works on
+`coverage --since 24h` — and six for rules: `block`, `allow`, `ask`, `simulate`, `rules`, `forget`. `--json` works on
 all of them.
 
 If it refuses to start, the message says why — an unmounted tracefs, a kernel built without the tracepoint,
@@ -227,6 +227,33 @@ claude/curl              pid 18422    ⊘ 198.51.100.7:443
 
 Rules live in the database, so they survive restarts and can be written before the daemon starts. A running
 daemon picks a change up within a couple of seconds. Refusals appear in the live view and in Coverage.
+
+#### Trying a rule before writing it
+
+```sh
+sudo ./target/release/flowlightd simulate block telemetry.example.com --since 24h
+```
+
+```text
+412 request(s) or connection(s) in the last 24h would have been decided differently:
+
+     allow → block    telemetry.example.com                        398  (claude)
+     allow → block    198.51.100.7:443                              14
+
+This is a claim about the past, not a promise about the future. A host that was not reached in this
+window does not appear here.
+```
+
+Every piece of traffic in the window is decided twice — once with the rules as they are, once with the
+candidate added — and only the answers that move are reported. The commonest answer is "nothing", and that
+is the useful one: it means either a rule you already have covers it, or this machine has never reached it.
+
+The window's block buttons do this for you: clicking one shows what it would have changed and writes the
+rule only if you say so. A rule nobody can preview is a rule nobody enables.
+
+One honest limit. A stored request records the host it went to and **not the port**, because a probe on a TLS
+library never sees one. So a rule naming a port claims nothing about a request — only about a connection,
+where the port is known. Saying "this might have changed" would be worse than saying nothing.
 
 #### What `ask` means here
 
