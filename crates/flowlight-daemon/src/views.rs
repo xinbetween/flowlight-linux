@@ -634,6 +634,8 @@ mod tests {
                 bytes: 3_800,
                 truncated: true,
                 unreadable: None,
+                rpc_method: None,
+                rpc_tool: None,
             })
             .unwrap();
         let view = requests(&mut store, 0, 10).unwrap();
@@ -751,6 +753,8 @@ mod tests {
             bytes: 10,
             truncated: false,
             unreadable: None,
+            rpc_method: None,
+            rpc_tool: None,
         };
         store.record_request(row.clone()).unwrap();
         store.record_request(row.clone()).unwrap();
@@ -809,6 +813,8 @@ mod tests {
             bytes: 10,
             truncated: false,
             unreadable: None,
+            rpc_method: None,
+            rpc_tool: None,
         };
         store.record_request(row.clone()).unwrap();
         row.host = Some("telemetry.example".to_owned());

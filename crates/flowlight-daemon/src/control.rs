@@ -504,6 +504,8 @@ mod tests {
                     bytes: 10,
                     truncated: false,
                     unreadable: None,
+                    rpc_method: None,
+                    rpc_tool: None,
                 })
                 .unwrap();
             store.flush().unwrap();
