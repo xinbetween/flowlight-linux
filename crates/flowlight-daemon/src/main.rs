@@ -424,6 +424,23 @@ enum Command {
     },
     /// Every guardrail, with how often each has refused something.
     Guardrails,
+    /// Which language Flowlight says things in.
+    ///
+    /// The sentences somebody is asked to agree to — what export sends, what a question to a model carries,
+    /// what interception changes — in one of nine languages. English is the one the program is tested
+    /// against; the other eight are translations, and a disclosure shown in one of them says so.
+    ///
+    /// A setting rather than a guess, because the daemon renders these sentences and the daemon's
+    /// environment is not the reader's: it runs as root from a unit file, while the person reading is at a
+    /// desktop with their own locale.
+    Language {
+        /// A tag: `en`, `de`, `es`, `fr`, `it`, `ja`, `ko`, `pt`, `zh-Hans`.
+        #[arg(value_name = "TAG")]
+        language: Option<String>,
+        /// Follow the environment again instead of a fixed language.
+        #[arg(long, conflicts_with = "language")]
+        auto: bool,
+    },
     /// What is attached by something other than the network: USB, Bluetooth, and volumes.
     ///
     /// Off until it is asked for. Not because it needs a permission Flowlight does not have, but because it
@@ -795,7 +812,8 @@ fn main() -> anyhow::Result<()> {
         Some(store) => {
             eprintln!("storing to {}", args.database.display());
             let budget = spending::begin_session(store, now())?;
-            for line in budget.describe(now()) {
+            let language = store.speaking().unwrap_or_default();
+            for line in budget.describe(now(), language) {
                 eprintln!("  {line}");
             }
             match take_budget_maps(&mut ebpf) {
@@ -858,6 +876,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     if let Some(store) = store.as_mut() {
+        let language = store.speaking().unwrap_or_default();
         match store.export() {
             // Said out loud on every start, like the budget, and for the same reason: a tool that sends what
             // it saw somewhere else should never be quiet about doing it.
@@ -877,7 +896,10 @@ fn main() -> anyhow::Result<()> {
                 );
             }
             Ok(export) => {
-                if let Some(reason) = export.why_not().filter(|_| export.destination.is_some()) {
+                if let Some(reason) = export
+                    .why_not(language)
+                    .filter(|_| export.destination.is_some())
+                {
                     eprintln!("not exporting: {reason}");
                 }
             }
@@ -1163,7 +1185,8 @@ fn run(
         {
             spending.set(budget, now());
             eprintln!("the budget changed:");
-            for line in budget.describe(now()) {
+            let language = store.speaking().unwrap_or_default();
+            for line in budget.describe(now(), language) {
                 eprintln!("  {line}");
             }
         }
@@ -1185,14 +1208,15 @@ fn run(
                 (Ok(intercept), Ok(mocks), Ok(guardrails)) => {
                     // The agent numbering is the blocking module's, shared on purpose: two numberings for one
                     // agent would be a scope naming a different process from the rules.
+                    let language = store.speaking().unwrap_or_default();
                     match intercepting.apply(&intercept, mocks, guardrails, |agent| {
                         enforcing.identity(agent)
                     }) {
                         Ok(true) => {
-                            for line in intercept.disclose() {
+                            for line in intercept.disclose(language) {
                                 eprintln!("  {line}");
                             }
-                            if let Some(reason) = intercept.why_not() {
+                            if let Some(reason) = intercept.why_not(language) {
                                 eprintln!("not intercepting: {reason}");
                             }
                         }

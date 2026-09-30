@@ -133,6 +133,14 @@ pub enum Request {
     },
     /// Every guardrail, with how often each has refused something.
     Guardrails,
+    /// Which language Flowlight says things in.
+    Language,
+    /// Choose one, or follow the environment when it is nothing.
+    SetLanguage {
+        /// A tag, or nothing to go back to the environment's.
+        #[serde(default)]
+        language: Option<String>,
+    },
     /// What is attached by something other than the network.
     Devices {
         /// Everything ever seen, rather than only what is attached now.
@@ -509,7 +517,8 @@ fn handle(
         | Request::WriteGuardrail { .. }
         | Request::ForgetGuardrail { .. }
         | Request::SetOwners { .. }
-        | Request::SetDevices { .. } => Store::open(database)?,
+        | Request::SetDevices { .. }
+        | Request::SetLanguage { .. } => Store::open(database)?,
         _ => Store::open_read_only(database)?,
     };
 
@@ -556,6 +565,11 @@ fn handle(
             crate::history::authority_paths(database, certificates),
         )?)?,
         Request::Guardrails => serde_json::to_string(&crate::views::guardrails(&mut store)?)?,
+        Request::Language => serde_json::to_string(&crate::views::language(&mut store)?)?,
+        Request::SetLanguage { language } => serde_json::to_string(&crate::views::set_language(
+            &mut store,
+            language.as_deref(),
+        )?)?,
         Request::Devices { all } => {
             serde_json::to_string(&crate::views::devices(&mut store, all)?)?
         }
@@ -612,7 +626,7 @@ fn handle(
         Request::Question { question } => {
             let configuration = store.ask()?;
             let on_file = crate::asking::have_key(database);
-            if let Some(reason) = configuration.why_not(on_file) {
+            if let Some(reason) = configuration.why_not(on_file, store.speaking()?) {
                 anyhow::bail!("{reason}");
             }
             let key = crate::asking::key(database)?;

@@ -12,6 +12,7 @@ publish = false
 flowlight-alerts.workspace = true
 flowlight-devices.workspace = true
 flowlight-rules.workspace = true
+flowlight-text.workspace = true
 anyhow.workspace = true
 rusqlite = { version = "0.40", features = ["bundled"] }
 sha2.workspace = true

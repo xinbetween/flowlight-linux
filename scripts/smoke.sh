@@ -450,6 +450,45 @@ sudo "$binary" --database "$database" --certificates "$certificates" --json devi
     | jq -e '.watching == false' >/dev/null || fail "turning it off did not take."
 echo "OK: turning it off stops the watching and keeps what was seen"
 
+# Nine languages. What is asserted is not the wording — that is what the unit tests are for — but that the
+# sentences somebody is asked to agree to actually change language, that the facts inside them survive being
+# translated, and that a translated disclosure says it is a translation.
+sudo "$binary" --database "$database" --certificates "$certificates" --json language \
+    | jq -e '.language == "en" and (.every | length == 9) and (has("caveat") | not)' >/dev/null \
+    || fail "the language is not English by default, or there are not nine of them."
+
+english=$(ask '{"op":"export"}' | jq -r '.ok.disclosure | join(" ")')
+printf '%s' "$english" | grep -q "is bound to exactly that" \
+    || fail "the English disclosure is not the English one."
+
+sudo "$binary" --database "$database" --certificates "$certificates" --json language de \
+    | jq -e '.language == "de" and .translated == true and (.caveat | length > 20)' >/dev/null \
+    || fail "setting a language did not take."
+
+german=$(ask '{"op":"export"}' | jq -r '.ok.disclosure | join(" ")')
+printf '%s' "$german" | grep -q "Zustimmung gilt genau dafür" \
+    || fail "the disclosure did not change language."
+# The destination is the fact the disclosure exists to carry. A translation that drops it reads perfectly
+# well and says nothing, which is the failure worth a test rather than a proofread.
+printf '%s' "$german" | grep -q "$export_second" \
+    || fail "the translated disclosure lost the destination."
+printf '%s' "$german" | grep -q "englische Fassung" \
+    || fail "a translated disclosure does not say that it is a translation."
+
+# A language nobody has a catalogue for is refused rather than quietly answered in English.
+if sudo "$binary" --database "$database" --certificates "$certificates" language tlh >/dev/null 2>&1; then
+    fail "a language this build does not have was accepted."
+fi
+# And simplified Chinese is not served to somebody who asked for traditional.
+if sudo "$binary" --database "$database" --certificates "$certificates" language zh-Hant >/dev/null 2>&1; then
+    fail "traditional Chinese was answered with the simplified catalogue."
+fi
+
+sudo "$binary" --database "$database" --certificates "$certificates" --json language --auto \
+    | jq -e '(.setting | not) and .language == "en"' >/dev/null \
+    || fail "going back to the environment did not take."
+echo "OK: the sentences somebody agrees to are said in nine languages, and say which one binds"
+
 # Reports: traffic sliced one way, with the processes that do not look like the rest named and the arithmetic
 # behind each reason shown.
 for slice in process host address protocol; do

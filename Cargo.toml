@@ -13,6 +13,7 @@ members = [
     "crates/flowlight-gui",
     "crates/flowlight-rules",
     "crates/flowlight-store",
+    "crates/flowlight-text",
 ]
 
 # Only the crate that builds anywhere is a default member. `flowlight-ebpf` compiles for
@@ -29,10 +30,11 @@ default-members = [
     "crates/flowlight-proxy",
     "crates/flowlight-rules",
     "crates/flowlight-store",
+    "crates/flowlight-text",
 ]
 
 [workspace.package]
-version = "0.4.8"
+version = "0.4.9"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/xinbetween/flowlight-linux"
@@ -49,6 +51,7 @@ flowlight-common = { path = "crates/flowlight-common", default-features = false 
 flowlight-agents = { path = "crates/flowlight-agents" }
 flowlight-rules = { path = "crates/flowlight-rules" }
 flowlight-store = { path = "crates/flowlight-store" }
+flowlight-text = { path = "crates/flowlight-text" }
 aya = "0.14"
 aya-build = "0.2"
 aya-ebpf = "0.2"

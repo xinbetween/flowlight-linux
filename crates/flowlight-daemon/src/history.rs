@@ -57,6 +57,7 @@ pub fn run(
             | Command::ForgetGuardrail { .. }
             | Command::Owners { .. }
             | Command::Devices { .. }
+            | Command::Language { .. }
     );
     if !writes && !database.exists() {
         bail!(
@@ -283,7 +284,8 @@ pub fn run(
             }
             let configuration = store.ask()?;
             let key_on_file = crate::asking::have_key(database);
-            if let Some(reason) = configuration.why_not(key_on_file) {
+            let language = store.speaking()?;
+            if let Some(reason) = configuration.why_not(key_on_file, language) {
                 bail!("{reason}");
             }
             let key = crate::asking::key(database)?;
@@ -314,7 +316,11 @@ pub fn run(
             } else {
                 if *show_work {
                     for body in &sent {
-                        writeln!(out, "--- sent to {}:", configuration.kind.described())?;
+                        writeln!(
+                            out,
+                            "--- sent to {}:",
+                            configuration.kind.described(language)
+                        )?;
                         writeln!(out, "{body}")?;
                     }
                     for ran in &answered.calls {
@@ -501,7 +507,7 @@ pub fn run(
             } else {
                 writeln!(out, "{wrote}")?;
                 let intercept = store.intercept()?;
-                if let Some(reason) = intercept.why_not() {
+                if let Some(reason) = intercept.why_not(store.speaking()?) {
                     // Written, and it will do nothing until interception is on. Saying so here beats
                     // somebody watching a rule that cannot fire.
                     writeln!(out, "\nThis cannot answer anything yet: {reason}")?;
@@ -539,7 +545,7 @@ pub fn run(
                 let intercept = store.intercept()?;
                 let covered = agent.trim().is_empty()
                     || intercept.agents.iter().any(|named| named == agent.trim());
-                if let Some(reason) = intercept.why_not() {
+                if let Some(reason) = intercept.why_not(store.speaking()?) {
                     writeln!(out, "\nThis cannot refuse anything yet: {reason}")?;
                 } else if !covered {
                     writeln!(
@@ -549,6 +555,48 @@ pub fn run(
                         agent.trim(),
                         agent.trim()
                     )?;
+                }
+            }
+        }
+        Command::Language { language, auto } => {
+            let view = if *auto {
+                crate::views::set_language(&mut store, None)?
+            } else if let Some(tag) = language {
+                crate::views::set_language(&mut store, Some(tag))?
+            } else {
+                crate::views::language(&mut store)?
+            };
+            if json {
+                writeln!(out, "{}", line(&view))?;
+            } else {
+                for candidate in &view.every {
+                    writeln!(
+                        out,
+                        "  {} {:<10} {}",
+                        if candidate.tag == view.language {
+                            "*"
+                        } else {
+                            " "
+                        },
+                        candidate.tag,
+                        candidate.endonym
+                    )?;
+                }
+                writeln!(
+                    out,
+                    "\n{}",
+                    match &view.setting {
+                        Some(tag) => format!("Set to {tag}."),
+                        None => format!(
+                            "Following the environment, which says {}. `flowlightd language <tag>` fixes it.",
+                            view.language
+                        ),
+                    }
+                )?;
+                // The caveat, here as well as at the foot of every disclosure. Somebody choosing a language
+                // should be told what choosing it means before they read anything in it.
+                if let Some(caveat) = &view.caveat {
+                    writeln!(out, "\n{caveat}")?;
                 }
             }
         }

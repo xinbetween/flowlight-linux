@@ -1050,6 +1050,34 @@ Stated here rather than discovered later:
 - **More than four kilobytes of any one call.** Captured buffers are cut there and the line says
   `[truncated]` when they were.
 
+## Nine languages, for the sentences that matter
+
+```console
+$ sudo flowlightd language
+  * en         English
+    de         Deutsch
+    ...
+    zh-Hans    简体中文
+
+$ sudo flowlightd language de
+```
+
+What is translated is everything somebody is asked to **agree to**, or told they **cannot** do: what export
+sends and where, what a question to a model carries, what interception changes, what an address lookup asks and
+of whom, what is attached over USB and Bluetooth, and the statement of what is captured and kept that is printed
+at every start. An agreement read in a language you are guessing at is not an agreement.
+
+What is not translated is the tables, the running log, and the window's own buttons — a host is a host in every
+language, and the window's chrome is the next piece of work rather than a promise made here.
+
+**English is the wording this is tested against.** The other eight are machine-drafted and have not been read by
+a native speaker, so every disclosure shown in one of them ends by saying so and pointing at the English. A
+translation that quietly presents itself as authoritative is worse than no translation.
+
+It is a setting rather than a guess, because the daemon renders these sentences and the daemon's environment is
+not the reader's: it runs as root from a unit file, while the person reading is at a desktop with their own
+locale. `language --auto` follows the environment again.
+
 ## Where it is going
 
 Four milestones, released a feature at a time: **0.1 — see everything, honestly**, then **0.2 — parity with the
