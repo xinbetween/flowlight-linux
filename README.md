@@ -1050,6 +1050,42 @@ Stated here rather than discovered later:
 - **More than four kilobytes of any one call.** Captured buffers are cut there and the line says
   `[truncated]` when they were.
 
+## One thing at a time, the rules people write first, and something to photograph
+
+```console
+$ sudo flowlightd focus --process claude
+Narrowed to process claude. Every count below is a count of that, not of this machine. …
+
+$ sudo flowlightd starters
+metadata   block  0 of 4 in place
+    A cloud instance metadata service hands out this machine's credentials to whatever asks it from this
+    machine, with no authentication of any kind. …
+    169.254.169.254, metadata.google.internal, 169.254.170.2, fd00:ec2::254
+…
+Nothing above is written. `flowlightd starters --apply <name>` writes one.
+
+$ sudo flowlightd demo --into /tmp/demo.db
+Wrote 54 request(s) and 73 connection(s) to /tmp/demo.db. Nothing in it happened.
+```
+
+**A focus** narrows `history` and `report` to one process or one host and says so above the rows, because a
+count of a subset read as a total is the one mistake it could cause. Coverage is deliberately not narrowed: its
+job is to say what was *missed*, over everything. Neither is what a model sees when you ask it a question, for
+the same reason. The slice by address cannot be narrowed to a host at all — an address is recorded at
+`connect()`, where the name was already resolved and thrown away — so that combination returns nothing and says
+why, rather than quietly showing the whole machine.
+
+**Starter rules** are the ones people arrive at after watching an agent for a week: the metadata service, the
+pastebins, the webhook endpoints, DNS over HTTPS, the tunnels. Each says why in a sentence. Listing them writes
+nothing, and they are applied one at a time — there is no `--all`, because that would write twenty-eight rules
+nobody read. None of them is an `allow`, and none of them names everything; both are tested rather than
+promised.
+
+**A demonstration** is an afternoon that did not happen, written to a file that must not already exist and
+marked as a demonstration for as long as it exists. Every command reading one says so first, and the daemon
+refuses to watch into one: real traffic mixed into a demonstration would leave two things nobody can tell
+apart, and the one people would believe is the wrong one.
+
 ## Nine languages, for the sentences that matter
 
 ```console

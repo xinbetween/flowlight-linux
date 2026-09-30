@@ -133,6 +133,27 @@ pub enum Request {
     },
     /// Every guardrail, with how often each has refused something.
     Guardrails,
+    /// What every terminal answer is narrowed to.
+    ///
+    /// Readable and writable here so that a window can show what a terminal narrowed and change it. The
+    /// answers this socket gives are never narrowed by it — see where they are built.
+    Focus,
+    /// Narrow it, or stop narrowing it.
+    SetFocus {
+        /// `process:<name>`, `host:<name>`, or nothing to show everything again.
+        #[serde(default)]
+        focus: Option<String>,
+    },
+    /// The rules people write first, and how much of each is already written.
+    Starters,
+    /// Write one starter's rules.
+    ApplyStarter {
+        /// Which one.
+        starter: String,
+        /// For one agent rather than for everything on this machine.
+        #[serde(default)]
+        agent: Option<String>,
+    },
     /// Which language Flowlight says things in.
     Language,
     /// Choose one, or follow the environment when it is nothing.
@@ -518,7 +539,9 @@ fn handle(
         | Request::ForgetGuardrail { .. }
         | Request::SetOwners { .. }
         | Request::SetDevices { .. }
-        | Request::SetLanguage { .. } => Store::open(database)?,
+        | Request::SetLanguage { .. }
+        | Request::SetFocus { .. }
+        | Request::ApplyStarter { .. } => Store::open(database)?,
         _ => Store::open_read_only(database)?,
     };
 
@@ -526,19 +549,26 @@ fn handle(
         Request::Hello => unreachable!("answered above"),
         // Both answered before the database was opened, because neither needs it.
         Request::Mark { .. } => unreachable!("answered above"),
+        // Never narrowed by the focus, here or in the window. A focus is what somebody at a terminal is
+        // looking at, and it says so above every answer it narrowed; a window that quietly showed a subset
+        // because of a setting made elsewhere would be the same trap without the sentence. A window that
+        // wants to narrow has `focus` to read and its own filtering to do it with.
         Request::Requests { since, limit } => serde_json::to_string(&crate::views::requests(
             &mut store,
             crate::views::window(now, since),
             limit,
+            None,
         )?)?,
         Request::Processes { since } => serde_json::to_string(&crate::views::processes(
             &mut store,
             crate::views::window(now, since),
+            None,
         )?)?,
         Request::Hosts { process, since } => serde_json::to_string(&crate::views::hosts(
             &mut store,
             &process,
             crate::views::window(now, since),
+            None,
         )?)?,
         Request::Agents { since } => serde_json::to_string(&crate::views::agents(
             &mut store,
@@ -565,6 +595,14 @@ fn handle(
             crate::history::authority_paths(database, certificates),
         )?)?,
         Request::Guardrails => serde_json::to_string(&crate::views::guardrails(&mut store)?)?,
+        Request::Focus => serde_json::to_string(&crate::views::focus(&mut store)?)?,
+        Request::SetFocus { focus } => {
+            serde_json::to_string(&crate::views::set_focus(&mut store, focus.as_deref())?)?
+        }
+        Request::Starters => serde_json::to_string(&crate::views::starters(&mut store)?)?,
+        Request::ApplyStarter { starter, agent } => serde_json::to_string(
+            &crate::views::apply_starter(&mut store, &starter, agent.as_deref())?,
+        )?,
         Request::Language => serde_json::to_string(&crate::views::language(&mut store)?)?,
         Request::SetLanguage { language } => serde_json::to_string(&crate::views::set_language(
             &mut store,
@@ -582,6 +620,7 @@ fn handle(
             &by,
             crate::views::window(now, since),
             limit,
+            None,
         )?)?,
         Request::Alerts { since, limit } => serde_json::to_string(&crate::views::alerts(
             &mut store,

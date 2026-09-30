@@ -424,6 +424,53 @@ enum Command {
     },
     /// Every guardrail, with how often each has refused something.
     Guardrails,
+    /// Narrow every answer to one process or one host, until it is cleared.
+    ///
+    /// `history` and `report` then show that and nothing else, and say so above the rows: every count under a
+    /// focus is a count of a subset, and a subset read as a total is the mistake worth one line of output.
+    ///
+    /// Coverage is deliberately not narrowed. Its job is to say what was *missed*, over everything, and a
+    /// narrowed Coverage would hide the thing it exists to show.
+    Focus {
+        /// One process, by the name Flowlight calls it.
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["host", "clear"])]
+        process: Option<String>,
+        /// One host, as it was recorded.
+        #[arg(long, value_name = "HOST", conflicts_with = "clear")]
+        host: Option<String>,
+        /// Show everything again.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// The rules people write first, and a way to write them.
+    ///
+    /// Nothing is written by listing them. `--apply <name>` writes one starter's rules, one starter at a
+    /// time: there is no `--all`, because a command that writes twenty-eight rules because somebody liked the
+    /// idea of starter rules is a command that writes rules nobody read.
+    Starters {
+        /// Write this one's rules.
+        #[arg(long, value_name = "NAME")]
+        apply: Option<String>,
+        /// Write them for one agent rather than for everything on this machine.
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
+    },
+    /// Write a demonstration database: an afternoon that did not happen, to photograph.
+    ///
+    /// Every screenshot of Flowlight is otherwise a screenshot of whoever took it — the hosts their agent
+    /// reached, the repositories it cloned, the paths it asked for.
+    ///
+    /// It writes to a file that does not exist yet, marks it as a demonstration for as long as it exists, and
+    /// the daemon refuses to watch into one. Real traffic written into a demonstration would leave two things
+    /// nobody can tell apart, and the one people would believe is the wrong one.
+    Demo {
+        /// Where to write it. Must not exist.
+        #[arg(long, value_name = "PATH")]
+        into: std::path::PathBuf,
+        /// How far back the afternoon reaches.
+        #[arg(long, default_value_t = 6)]
+        hours: i64,
+    },
     /// Which language Flowlight says things in.
     ///
     /// The sentences somebody is asked to agree to — what export sends, what a question to a model carries,
@@ -664,6 +711,21 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(command) = &args.command {
         return history::run(command, &args.database, &args.certificates, args.json);
+    }
+
+    // Refused rather than mixed, and refused before a single probe is loaded. Writing real traffic into a
+    // demonstration would leave two things nobody can tell apart, and the one people would believe is the
+    // wrong one — so this is a refusal to start rather than a warning printed while it starts anyway.
+    if !args.no_store
+        && args.database.exists()
+        && Store::open_read_only(&args.database)
+            .is_ok_and(|store| store.is_demonstration().unwrap_or(false))
+    {
+        bail!(
+            "{} is a demonstration database. Nothing in it happened, and nothing that happens will be \
+             written to it. Name another with --database, or delete that file.",
+            args.database.display()
+        );
     }
 
     // Checked here, before anything is loaded or attached, so that a mistyped address fails in a tenth of a

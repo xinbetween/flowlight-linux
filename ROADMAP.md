@@ -93,10 +93,14 @@ free version, and the status column links to the release it actually shipped in.
 | **0.4.5** | **Devices** | The channels that are not the network: what is attached over USB and what is paired over Bluetooth, and when that changed. Arrivals, departures and what a thing is — never how much went through it, because neither channel accounts for throughput per process on any platform. Off until it is switched on, like the macOS build, and for the same reason: it widens what is watched, and that should be a decision rather than a surprise in an update. | [released as v0.4.7](https://github.com/xinbetween/flowlight-linux/releases/tag/v0.4.7) |
 | **0.4.6** | **Nine languages** | The macOS build ships in German, Spanish, French, Italian, Japanese, Korean, Portuguese and simplified Chinese as well as English. Sentences are the interface here — the disclosures, the coverage explanations, the reason a rule did not bite — so translating it is translating most of what it says, which is why it is a release of its own and not a chore attached to another one. **What v0.4.9 translates** is everything somebody is asked to agree to or told they cannot do: the four disclosures, every reason a feature is not doing anything, and the startup statement of what is captured and kept. **What it does not** is the tables, the running log, and the window's own buttons and headings — a host is a host in every language, and the window is the next piece of work rather than a promise made here. The eight translations are machine-drafted and have not been read by a native speaker, and every disclosure shown in one of them says so. | [released as v0.4.9](https://github.com/xinbetween/flowlight-linux/releases/tag/v0.4.9) |
 
-Smaller than a release each, and recorded so they are not lost: a focus mode that narrows every screen to one
-process or one destination; starter rules for the things everybody blocks first; a demonstration mode, which is
-how a tool that watches a private machine gets screenshotted at all; and the window's own chrome in the nine
-languages the sentences are already in.
+Smaller than a release each, and therefore shipped as one: a focus mode that narrows every terminal answer to
+one process or one host, starter rules for the things everybody blocks first, and a demonstration mode, which is
+how a tool that watches a private machine gets screenshotted at all — all three in
+[v0.4.11](https://github.com/xinbetween/flowlight-linux/releases/tag/v0.4.11).
+
+What is left, and recorded so it is not lost: **the window's own chrome in the nine languages the sentences are
+already in**. The disclosures a person agrees to are translated; the buttons and headings around them are not,
+and that is the next piece of work rather than a thing this claims to have done.
 
 ### What this has that the macOS build does not
 

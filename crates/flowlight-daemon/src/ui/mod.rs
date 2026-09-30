@@ -173,19 +173,23 @@ fn requests(database: &Path, query: &str) -> Result<String> {
     let limit = parameter(query, "limit")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(200);
+    // The page on loopback is not narrowed by the focus either, for the reason the socket is not: it has no
+    // way to say that it was.
     ask(database, query, |store, since| {
-        views::requests(store, since, limit)
+        views::requests(store, since, limit, None)
     })
 }
 
 fn processes(database: &Path, query: &str) -> Result<String> {
-    ask(database, query, views::processes)
+    ask(database, query, |store, since| {
+        views::processes(store, since, None)
+    })
 }
 
 fn hosts(database: &Path, query: &str) -> Result<String> {
     let process = parameter(query, "process").unwrap_or_default();
     ask(database, query, |store, since| {
-        views::hosts(store, &process, since)
+        views::hosts(store, &process, since, None)
     })
 }
 

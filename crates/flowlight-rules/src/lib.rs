@@ -39,6 +39,8 @@
 
 extern crate alloc;
 
+pub mod starters;
+
 use alloc::borrow::ToOwned as _;
 use alloc::string::String;
 use alloc::vec::Vec;
