@@ -56,6 +56,7 @@ pub fn run(
             | Command::Guardrail { .. }
             | Command::ForgetGuardrail { .. }
             | Command::Owners { .. }
+            | Command::Devices { .. }
     );
     if !writes && !database.exists() {
         bail!(
@@ -547,6 +548,52 @@ pub fn run(
                          `flowlightd intercept --agent {}` adds it.",
                         agent.trim(),
                         agent.trim()
+                    )?;
+                }
+            }
+        }
+        Command::Devices { on, off, all } => {
+            if *on {
+                store.set_watching_devices(true)?;
+            }
+            if *off {
+                store.set_watching_devices(false)?;
+            }
+            let view = crate::views::devices(&mut store, *all)?;
+            if json {
+                writeln!(out, "{}", line(&view))?;
+            } else {
+                for sentence in &view.disclosure {
+                    writeln!(out, "{sentence}")?;
+                }
+                writeln!(
+                    out,
+                    "\n{}",
+                    if view.watching {
+                        "Watching."
+                    } else {
+                        "Not watching. `flowlightd devices --on` starts."
+                    }
+                )?;
+                if view.devices.is_empty() {
+                    writeln!(
+                        out,
+                        "Nothing recorded yet.{}",
+                        if view.watching {
+                            " The daemon looks every few seconds."
+                        } else {
+                            ""
+                        }
+                    )?;
+                }
+                for device in &view.devices {
+                    writeln!(
+                        out,
+                        "  {:<10} {:<40} {}{}",
+                        device.channel,
+                        device.name,
+                        device.detail.as_deref().unwrap_or(""),
+                        if device.attached { "" } else { "  [gone]" }
                     )?;
                 }
             }

@@ -182,8 +182,8 @@ Useful flags:
 
 Plus subcommands that read the database rather than the kernel — `history --since 6h`, `agents`, `summary`,
 `coverage --since 24h`, `budget`, `export`, `model`, `query`, `intercept`, `trust`, `mock`, `mocks`,
-`forget-mock`, `guardrail`, `guardrails`, `forget-guardrail`, `owners`, `alerts`, `report` — and six for
-rules: `block`, `allow`, `ask`,
+`forget-mock`, `guardrail`, `guardrails`, `forget-guardrail`, `owners`, `alerts`, `report`, `devices` — and
+six for rules: `block`, `allow`, `ask`,
 `simulate`, `rules`, `forget`. `--json` works on all
 of them. One subcommand is not like the others: `launch` runs as you rather than as root, because the agent it
 starts has to.
@@ -846,6 +846,44 @@ pointer forwards, which is how a parser is made to loop for ever.
 An address nobody announces is recorded as such rather than left unknown, because otherwise it would be asked
 about again on every pass for ever. A resolver that is temporarily unreachable is a different thing and is
 *not* recorded, so it is asked again later — conflating the two would make a transient failure permanent.
+
+### The channels that are not the network
+
+What is plugged in over USB, what is paired over Bluetooth, and which removable volumes are mounted — and when
+any of that changed.
+
+```console
+$ sudo flowlightd devices --on
+$ flowlightd devices
+  usb        K2 Keyboard                          Keychron, 05ac:024f
+  bluetooth  Somebody's Headphones                11:22:33:44:55:66
+  volume     /media/me/My Drive                   /dev/sdb1, vfat
+```
+
+**Never how much went through any of it.** Linux accounts for bytes per socket, which is what makes the network
+half of Flowlight possible; it does not account for them per USB device or per Bluetooth peripheral in any way a
+process can be attributed. So this reports what is connected and when it appeared, and says nothing about
+throughput rather than implying a number it does not have.
+
+Off until it is asked for — not because it needs a permission Flowlight does not have, but because it widens
+what is watched, and that should be a decision rather than a surprise in an upgrade.
+
+Everything is read from the files the kernel already publishes. No D-Bus client for BlueZ and no udev library:
+those would be a runtime dependency and a connection to a system service, for a feature that lists what is
+plugged in. Reading files is also testable against a directory written by hand, which is how every judgement
+here is tested.
+
+Three details that are easy to get wrong:
+
+- **A USB device is keyed on what it is, not where it is plugged in.** Vendor, product and serial — a keyboard
+  moved to another port is the same keyboard.
+- **Interfaces and root hubs are not devices.** `1-2:1.0` is one of the functions a device offers and `usb1` is
+  part of the machine; listing them would report a keyboard three times and a motherboard as something somebody
+  plugged in.
+- **Removability is asked of the disk, not guessed from the path.** `/sys/block/sdb/removable` is the kernel's
+  own answer, and it is right for a drive mounted at `/opt/data` as much as for one where a desktop put it.
+
+The store remembers rather than the daemon, so a device attached before a restart is not an arrival after one.
 
 ### Reports
 

@@ -281,6 +281,25 @@ pub struct Coverage {
     pub unprobed: Vec<Note>,
 }
 
+/// One device, and when it was seen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceRow {
+    /// How it is attached.
+    pub channel: String,
+    /// What the kernel calls it.
+    pub id: String,
+    /// What a person would call it.
+    pub name: String,
+    /// What else is known.
+    pub detail: Option<String>,
+    /// When it was first seen.
+    pub first: i64,
+    /// When it was last seen.
+    pub last: i64,
+    /// Whether it is here now.
+    pub attached: bool,
+}
+
 /// What traffic is sliced by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Slice {
@@ -502,7 +521,7 @@ impl Store {
     }
 
     /// The schema this version of the code expects.
-    pub const SCHEMA: i64 = 12;
+    pub const SCHEMA: i64 = 13;
 
     /// Creates the schema, or brings an older one up to it.
     ///
@@ -561,6 +580,15 @@ impl Store {
             CREATE TABLE IF NOT EXISTS intercept (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS devices (
+                id       TEXT PRIMARY KEY,
+                channel  TEXT    NOT NULL,
+                name     TEXT    NOT NULL,
+                detail   TEXT,
+                first    INTEGER NOT NULL,
+                last     INTEGER NOT NULL,
+                attached INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS alerts (
                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1391,6 +1419,105 @@ impl Store {
     /// Writes the interception configuration.
     pub fn set_intercept(&mut self, intercept: &Intercept) -> Result<()> {
         intercept::write(&self.connection, intercept)
+    }
+
+    /// Whether Flowlight watches the channels that are not the network.
+    ///
+    /// Off until it is asked for. Not because it needs a permission Flowlight does not have — it does not —
+    /// but because turning it on widens what is watched, and that should be a decision rather than a surprise
+    /// in an upgrade.
+    pub fn watching_devices(&self) -> Result<bool> {
+        Ok(self
+            .connection
+            .query_row("SELECT value FROM meta WHERE key = 'devices'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .is_some_and(|value| value == "1"))
+    }
+
+    /// Turns it on or off.
+    pub fn set_watching_devices(&mut self, wanted: bool) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('devices', ?1)",
+            params![if wanted { "1" } else { "0" }],
+        )?;
+        Ok(())
+    }
+
+    /// Records what is attached now, and returns what changed.
+    ///
+    /// The store is what remembers, rather than the daemon: a device attached before a restart is not an
+    /// arrival after one, and the alternative is a list that announces everything every time it starts.
+    pub fn record_devices(
+        &mut self,
+        attached: &[flowlight_devices::Device],
+        now: i64,
+    ) -> Result<flowlight_devices::Changed> {
+        let before = self.devices(true)?;
+        let changed = flowlight_devices::changed(&before, attached);
+
+        let transaction = self.connection.transaction()?;
+        {
+            let mut seen = transaction.prepare(
+                "INSERT INTO devices (id, channel, name, detail, first, last, attached)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1)
+                 ON CONFLICT(id) DO UPDATE SET last = ?5, attached = 1, name = ?3, detail = ?4",
+            )?;
+            for device in attached {
+                seen.execute(params![
+                    device.id,
+                    device.channel.as_str(),
+                    device.name,
+                    device.detail,
+                    now
+                ])?;
+            }
+            let mut gone = transaction.prepare("UPDATE devices SET attached = 0 WHERE id = ?1")?;
+            for device in &changed.departed {
+                gone.execute(params![device.id])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    /// What is attached, or everything ever seen.
+    pub fn devices(&self, attached_only: bool) -> Result<Vec<flowlight_devices::Device>> {
+        let mut statement = self.connection.prepare(
+            "SELECT channel, id, name, detail FROM devices
+             WHERE (?1 = 0 OR attached = 1) ORDER BY channel, name",
+        )?;
+        let rows = statement.query_map(params![i64::from(attached_only)], |row| {
+            Ok(flowlight_devices::Device {
+                channel: flowlight_devices::Channel::parse(&row.get::<_, String>(0)?)
+                    .unwrap_or(flowlight_devices::Channel::Usb),
+                id: row.get(1)?,
+                name: row.get(2)?,
+                detail: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// When each device was first and last seen, and whether it is here now.
+    pub fn device_history(&mut self) -> Result<Vec<DeviceRow>> {
+        let mut statement = self.connection.prepare(
+            "SELECT channel, id, name, detail, first, last, attached FROM devices
+             ORDER BY attached DESC, last DESC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(DeviceRow {
+                channel: row.get(0)?,
+                id: row.get(1)?,
+                name: row.get(2)?,
+                detail: row.get(3)?,
+                first: row.get(4)?,
+                last: row.get(5)?,
+                attached: row.get::<_, i64>(6)? != 0,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Writes down something worth saying.
@@ -2584,8 +2711,89 @@ mod tests {
         assert!(store.guardrails().unwrap().is_empty());
         assert_eq!(store.owner("1.1.1.1").unwrap(), None);
         assert!(store.alerts_since(0, 10).unwrap().is_empty());
+        assert!(store.devices(false).unwrap().is_empty());
         assert_eq!(store.baseline("bytes_hour", "x").unwrap(), None);
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    // Devices
+
+    fn device(id: &str, name: &str) -> flowlight_devices::Device {
+        flowlight_devices::Device {
+            channel: flowlight_devices::Channel::Usb,
+            id: id.to_owned(),
+            name: name.to_owned(),
+            detail: None,
+        }
+    }
+
+    /// Off until it is asked for: turning it on widens what is watched, and that should be a decision rather
+    /// than a surprise in an upgrade.
+    #[test]
+    fn watching_the_other_channels_is_off_until_it_is_asked_for() {
+        let mut store = Store::in_memory().unwrap();
+        assert!(!store.watching_devices().unwrap());
+        store.set_watching_devices(true).unwrap();
+        assert!(store.watching_devices().unwrap());
+    }
+
+    /// A device attached before a restart is not an arrival after one, which is why the store remembers
+    /// rather than the daemon.
+    #[test]
+    fn what_was_already_there_is_not_an_arrival() {
+        let mut store = Store::in_memory().unwrap();
+        let keyboard = device("usb:1:2:", "A keyboard");
+
+        let first = store
+            .record_devices(std::slice::from_ref(&keyboard), 1_000)
+            .unwrap();
+        assert_eq!(first.arrived.len(), 1);
+
+        // Seen again: not news.
+        let again = store
+            .record_devices(std::slice::from_ref(&keyboard), 2_000)
+            .unwrap();
+        assert!(again.is_quiet());
+
+        // Taken away.
+        let gone = store.record_devices(&[], 3_000).unwrap();
+        assert_eq!(gone.departed.len(), 1);
+        assert_eq!(gone.departed[0].id, "usb:1:2:");
+        assert!(store.devices(true).unwrap().is_empty());
+        // And still remembered.
+        assert_eq!(store.devices(false).unwrap().len(), 1);
+
+        // Plugged in again: an arrival, and the same device rather than a second one.
+        let back = store.record_devices(&[keyboard], 4_000).unwrap();
+        assert_eq!(back.arrived.len(), 1);
+        assert_eq!(store.devices(false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn when_a_device_was_first_and_last_seen_is_kept() {
+        let mut store = Store::in_memory().unwrap();
+        store.record_devices(&[device("a", "One")], 1_000).unwrap();
+        store.record_devices(&[device("a", "One")], 5_000).unwrap();
+        let history = store.device_history().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].first, 1_000);
+        assert_eq!(history[0].last, 5_000);
+        assert!(history[0].attached);
+    }
+
+    /// A device whose name the kernel filled in later is the same device, renamed rather than added.
+    #[test]
+    fn a_name_that_arrives_late_updates_rather_than_duplicates() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .record_devices(&[device("a", "1d6b:0002")], 1_000)
+            .unwrap();
+        store
+            .record_devices(&[device("a", "A keyboard")], 2_000)
+            .unwrap();
+        let devices = store.devices(true).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "A keyboard");
     }
 
     // Reports

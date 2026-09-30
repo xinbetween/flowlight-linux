@@ -71,7 +71,7 @@ PYTHON
 }
 
 echo "Watching..."
-sudo "$binary" --json --seconds 440 --database "$database" --socket "$socket" --web 127.0.0.1:0 \
+sudo "$binary" --json --seconds 470 --database "$database" --socket "$socket" --web 127.0.0.1:0 \
     --certificates "$certificates" \
     --export-seconds 2 >"$output" 2>"$log" &
 watcher=$!
@@ -414,6 +414,41 @@ echo "OK: changing where it goes takes the agreement with it"
 
 ask '{"op":"set-export","off":true}' | jq -e '.ok.enabled == false' >/dev/null \
     || fail "export would not turn off."
+
+# Devices: the channels that are not the network. Off until asked for, like everything here that widens what
+# is watched.
+sudo "$binary" --database "$database" --certificates "$certificates" --json devices \
+    | jq -e '.watching == false and (.disclosure | length >= 3)' >/dev/null \
+    || fail "watching devices was not off, or does not say what it would do."
+sudo "$binary" --database "$database" --certificates "$certificates" devices \
+    | grep -q "Never how much went through any of it" \
+    || fail "the disclosure does not say what it cannot report."
+echo "OK: the other channels are not watched until they are asked for"
+
+sudo "$binary" --database "$database" --certificates "$certificates" --json devices \
+    | jq -e '.devices | length == 0' >/dev/null \
+    || fail "something was recorded while the feature was off."
+
+sudo "$binary" --database "$database" --certificates "$certificates" devices --on >/dev/null
+sleep 8
+attached=$(sudo "$binary" --database "$database" --certificates "$certificates" --json devices)
+printf '%s\n' "$attached" | jq -c '.devices[:4]'
+printf '%s' "$attached" | jq -e '.watching == true' >/dev/null || fail "turning it on did not take."
+
+# A cloud runner has no keyboard plugged in, and may have no USB at all. What can be asserted everywhere is
+# that the reading happened and said something truthful rather than inventing a device — so this checks the
+# shape of whatever was found, and that nothing claims a byte count.
+printf '%s' "$attached" \
+    | jq -e '[.devices[] | select((.channel | test("^(usb|bluetooth|volume)$")) | not)] | length == 0' \
+    >/dev/null || fail "a device was recorded on a channel that does not exist."
+printf '%s' "$attached" | jq -e '[.devices[] | select(has("bytes"))] | length == 0' >/dev/null \
+    || fail "a device claimed a byte count, which nothing here can honestly report."
+echo "OK: what is attached is read, and nothing claims a throughput it cannot know"
+
+sudo "$binary" --database "$database" --certificates "$certificates" devices --off >/dev/null
+sudo "$binary" --database "$database" --certificates "$certificates" --json devices \
+    | jq -e '.watching == false' >/dev/null || fail "turning it off did not take."
+echo "OK: turning it off stops the watching and keeps what was seen"
 
 # Reports: traffic sliced one way, with the processes that do not look like the rest named and the arithmetic
 # behind each reason shown.

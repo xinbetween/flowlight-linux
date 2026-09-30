@@ -1072,6 +1072,78 @@ pub fn report(store: &mut Store, by: &str, since: i64, limit: usize) -> Result<R
     })
 }
 
+/// What is attached by something other than the network.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DevicesView {
+    /// Whether Flowlight is watching these channels.
+    pub watching: bool,
+    /// What it says about them.
+    pub disclosure: Vec<String>,
+    /// The devices.
+    pub devices: Vec<DeviceView>,
+}
+
+/// One device.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DeviceView {
+    /// `usb`, `bluetooth` or `volume`.
+    pub channel: String,
+    /// What the kernel calls it.
+    pub id: String,
+    /// What a person would call it.
+    pub name: String,
+    /// What else is known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// When it was first seen.
+    pub first: i64,
+    /// When it was last seen.
+    pub last: i64,
+    /// Whether it is here now.
+    pub attached: bool,
+}
+
+/// What Flowlight says about these channels before it watches them.
+pub fn device_disclosure() -> Vec<String> {
+    vec![
+        "These are the channels that are not the network: what is plugged in over USB, what is paired over \
+         Bluetooth, and which removable volumes are mounted."
+            .to_owned(),
+        "What is reported is what is connected and when that changed. Never how much went through any of \
+         it: Linux does not account for bytes per device in any way a process can be attributed, and a \
+         number nobody can stand behind is worse than no number."
+            .to_owned(),
+        "Everything is read from the files the kernel already publishes in /sys and /proc. Nothing is asked \
+         of a system service, and nothing leaves this machine."
+            .to_owned(),
+        "Off until it is asked for — not because it needs a permission Flowlight does not have, but because \
+         it widens what is watched."
+            .to_owned(),
+    ]
+}
+
+/// What is attached, described.
+pub fn devices(store: &mut Store, all: bool) -> Result<DevicesView> {
+    Ok(DevicesView {
+        watching: store.watching_devices()?,
+        disclosure: device_disclosure(),
+        devices: store
+            .device_history()?
+            .into_iter()
+            .filter(|row| all || row.attached)
+            .map(|row| DeviceView {
+                channel: row.channel,
+                id: row.id,
+                name: row.name,
+                detail: row.detail,
+                first: row.first,
+                last: row.last,
+                attached: row.attached,
+            })
+            .collect(),
+    })
+}
+
 /// One thing a candidate rule would change.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ChangeView {

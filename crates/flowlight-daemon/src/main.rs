@@ -92,6 +92,12 @@ const RULES: Duration = Duration::from_secs(2);
 /// Where cgroup v2 is mounted on anything current.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
+/// How often the channels that are not the network are looked at.
+///
+/// Five seconds. Fast enough that plugging something in and looking at the screen shows it; slow enough that a
+/// directory listing every five seconds is not something anybody would notice.
+const DEVICES: Duration = Duration::from_secs(5);
+
 /// How often the closed hours and days are judged against what is usual.
 ///
 /// A minute. The judging itself only happens when a window has closed, so this is how long after an hour ends
@@ -418,6 +424,24 @@ enum Command {
     },
     /// Every guardrail, with how often each has refused something.
     Guardrails,
+    /// What is attached by something other than the network: USB, Bluetooth, and volumes.
+    ///
+    /// Off until it is asked for. Not because it needs a permission Flowlight does not have, but because it
+    /// widens what is watched, and that should be a decision rather than a surprise in an upgrade.
+    ///
+    /// Never how much went through any of it: Linux does not account for bytes per device in any way a
+    /// process can be attributed, and a number nobody can stand behind is worse than no number.
+    Devices {
+        /// Start watching.
+        #[arg(long)]
+        on: bool,
+        /// Stop watching. What was already seen is kept.
+        #[arg(long)]
+        off: bool,
+        /// Everything ever seen, rather than only what is attached now.
+        #[arg(long)]
+        all: bool,
+    },
     /// Traffic sliced one way, and the processes that do not look like the rest.
     Report {
         /// `process`, `host`, `address` or `protocol`.
@@ -1060,6 +1084,7 @@ fn run(
     let mut next_owners = Instant::now() + OWNERS;
     let owners = flowlight_owners::Lookup::new();
     let mut next_alerts = Instant::now() + ALERTS;
+    let mut next_devices = Instant::now();
     // What has been seen before, read once. A host recorded before a restart is not new after one.
     let mut noticing = store.as_deref_mut().map(|store| {
         let seen = alerting::Seen::new(store, now());
@@ -1232,6 +1257,36 @@ fn run(
             }
         }
 
+        if let Some(store) = store.as_deref_mut()
+            && Instant::now() >= next_devices
+        {
+            next_devices = Instant::now() + DEVICES;
+            if store.watching_devices().unwrap_or(false) {
+                let attached = flowlight_devices::attached(Path::new("/sys"), Path::new("/proc"));
+                match store.record_devices(&attached, now()) {
+                    Ok(changed) if !changed.is_quiet() => {
+                        for device in &changed.arrived {
+                            eprintln!(
+                                "{} attached: {}{}",
+                                device.channel.as_str(),
+                                device.name,
+                                device
+                                    .detail
+                                    .as_deref()
+                                    .map(|detail| format!(" ({detail})"))
+                                    .unwrap_or_default()
+                            );
+                        }
+                        for device in &changed.departed {
+                            eprintln!("{} gone: {}", device.channel.as_str(), device.name);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => eprintln!("could not record what is attached: {err:#}"),
+                }
+            }
+        }
+
         if let (Some(store), Some(seen)) = (store.as_deref_mut(), noticing.as_mut())
             && Instant::now() >= next_alerts
         {
@@ -1309,7 +1364,8 @@ fn run(
                 .min(next_agent_scan)
                 .min(next_export)
                 .min(next_owners)
-                .min(next_alerts),
+                .min(next_alerts)
+                .min(next_devices),
             None => next_scan
                 .min(next_sweep)
                 .min(next_flush)
@@ -1317,7 +1373,8 @@ fn run(
                 .min(next_agent_scan)
                 .min(next_export)
                 .min(next_owners)
-                .min(next_alerts),
+                .min(next_alerts)
+                .min(next_devices),
         };
         let timeout = until.saturating_duration_since(Instant::now());
 
