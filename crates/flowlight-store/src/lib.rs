@@ -38,7 +38,7 @@ pub mod intercept;
 pub use ask::Ask;
 pub use budget::{Budget, Paths};
 pub use export::Export;
-pub use flowlight_rules::Mock;
+pub use flowlight_rules::{Guardrail, Mock};
 pub use intercept::Intercept;
 
 use anyhow::{Context as _, Result};
@@ -421,7 +421,7 @@ impl Store {
     }
 
     /// The schema this version of the code expects.
-    pub const SCHEMA: i64 = 9;
+    pub const SCHEMA: i64 = 10;
 
     /// Creates the schema, or brings an older one up to it.
     ///
@@ -480,6 +480,19 @@ impl Store {
             CREATE TABLE IF NOT EXISTS intercept (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS guardrails (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                created  INTEGER NOT NULL,
+                enabled  INTEGER NOT NULL,
+                agent    TEXT    NOT NULL,
+                server   TEXT    NOT NULL,
+                tool     TEXT    NOT NULL,
+                resource TEXT    NOT NULL,
+                note     TEXT,
+                hits     INTEGER NOT NULL DEFAULT 0,
+                last_hit INTEGER,
+                UNIQUE(agent, server, tool, resource)
             );
             CREATE TABLE IF NOT EXISTS mocks (
                 id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1276,6 +1289,98 @@ impl Store {
         intercept::write(&self.connection, intercept)
     }
 
+    /// Every guardrail, in the order they are tried.
+    ///
+    /// Oldest first, because the first that refuses decides. There is one action, so nothing a later one says
+    /// could change the answer — but the order still has to be stable, or which guardrail is *named* in a
+    /// refusal would change between two runs that refused the same call.
+    pub fn guardrails(&mut self) -> Result<Vec<Guardrail>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, enabled, agent, server, tool, resource, note FROM guardrails ORDER BY id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(Guardrail {
+                id: row.get(0)?,
+                enabled: row.get::<_, i64>(1)? != 0,
+                agent: row.get(2)?,
+                server: row.get(3)?,
+                tool: row.get(4)?,
+                resource: row.get(5)?,
+                note: row.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Writes a guardrail, replacing whatever was said about the same agent, server, tool and resource.
+    pub fn put_guardrail(&mut self, guardrail: &Guardrail, now: i64) -> Result<Wrote> {
+        let (agent, server, tool, resource) = (
+            guardrail.agent.trim(),
+            guardrail.server.trim().to_lowercase(),
+            guardrail.tool.trim(),
+            guardrail.resource.trim(),
+        );
+        let existing: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT enabled FROM guardrails
+                 WHERE agent = ?1 AND server = ?2 AND tool = ?3 AND resource = ?4",
+                params![agent, server, tool, resource],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let wrote = match existing {
+            Some(enabled) if (enabled != 0) == guardrail.enabled => Wrote::Unchanged,
+            Some(_) => Wrote::Changed,
+            None => Wrote::Added,
+        };
+        self.connection.execute(
+            "INSERT INTO guardrails (created, enabled, agent, server, tool, resource, note)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(agent, server, tool, resource) DO UPDATE SET enabled = ?2, note = ?7",
+            params![
+                now,
+                i64::from(guardrail.enabled),
+                agent,
+                server,
+                tool,
+                resource,
+                guardrail.note,
+            ],
+        )?;
+        Ok(wrote)
+    }
+
+    /// Removes a guardrail. Returns whether there was one.
+    pub fn forget_guardrail(&mut self, id: i64) -> Result<bool> {
+        Ok(self
+            .connection
+            .execute("DELETE FROM guardrails WHERE id = ?1", params![id])?
+            > 0)
+    }
+
+    /// Counts a call this guardrail refused.
+    ///
+    /// Kept on the guardrail rather than only in the notes, because "this one has never fired" and "this one
+    /// fires forty times an hour" are the two things anybody wants to know about a list of them, and neither
+    /// is answerable by reading the list.
+    pub fn record_guardrail_hit(&mut self, id: i64, now: i64) -> Result<()> {
+        self.connection.execute(
+            "UPDATE guardrails SET hits = hits + 1, last_hit = ?2 WHERE id = ?1",
+            params![id, now],
+        )?;
+        Ok(())
+    }
+
+    /// How often each guardrail has refused something, and when it last did.
+    pub fn guardrail_hits(&mut self) -> Result<Vec<(i64, i64, Option<i64>)>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, hits, last_hit FROM guardrails ORDER BY id")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Every canned answer, in the order they are tried.
     ///
     /// Oldest first, because the first match answers and the order somebody wrote them in is the order they
@@ -2047,7 +2152,113 @@ mod tests {
         assert!(!store.ask().unwrap().enabled);
         assert!(!store.intercept().unwrap().enabled);
         assert!(store.mocks().unwrap().is_empty());
+        assert!(store.guardrails().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    // Guardrails
+
+    fn guardrail(agent: &str, server: &str, tool: &str) -> Guardrail {
+        Guardrail {
+            id: 0,
+            enabled: true,
+            agent: agent.to_owned(),
+            server: server.to_owned(),
+            tool: tool.to_owned(),
+            resource: String::new(),
+            note: Some("a test".to_owned()),
+        }
+    }
+
+    #[test]
+    fn a_guardrail_written_is_a_guardrail_read_back() {
+        let mut store = Store::in_memory().unwrap();
+        assert_eq!(
+            store
+                .put_guardrail(&guardrail("claude", "MCP.Example.com", "write_file"), 1_000)
+                .unwrap(),
+            Wrote::Added
+        );
+        let stored = store.guardrails().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].agent, "claude");
+        // Stored lowercased, because a host is a host however it was typed and two spellings would be two
+        // guardrails about one server.
+        assert_eq!(stored[0].server, "mcp.example.com");
+        assert_eq!(stored[0].tool, "write_file");
+        assert!(stored[0].id > 0);
+    }
+
+    #[test]
+    fn a_second_guardrail_about_the_same_thing_replaces_the_first() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .put_guardrail(&guardrail("claude", "", "write_file"), 1_000)
+            .unwrap();
+        assert_eq!(
+            store
+                .put_guardrail(&guardrail("claude", "", "write_file"), 1_000)
+                .unwrap(),
+            Wrote::Unchanged
+        );
+        let mut off = guardrail("claude", "", "write_file");
+        off.enabled = false;
+        assert_eq!(store.put_guardrail(&off, 1_000).unwrap(), Wrote::Changed);
+        let stored = store.guardrails().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(!stored[0].enabled);
+    }
+
+    /// Which guardrail is named in a refusal must not change between two runs that refused the same call.
+    #[test]
+    fn guardrails_come_back_in_the_order_they_were_written() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .put_guardrail(&guardrail("", "", "write_*"), 1_000)
+            .unwrap();
+        store
+            .put_guardrail(&guardrail("", "", "write_file"), 2_000)
+            .unwrap();
+        let stored = store.guardrails().unwrap();
+        assert_eq!(stored[0].tool, "write_*");
+        let chosen = flowlight_rules::refused(
+            &stored,
+            Some("claude"),
+            "mcp.example.com",
+            "tools/call",
+            Some("write_file"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(chosen.tool, "write_*");
+    }
+
+    /// "This one has never fired" and "this one fires forty times an hour" are the two things anybody wants
+    /// to know about a list of guardrails, and neither is answerable by reading the list.
+    #[test]
+    fn a_refusal_is_counted_against_the_guardrail_that_made_it() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .put_guardrail(&guardrail("", "", "write_file"), 1_000)
+            .unwrap();
+        let id = store.guardrails().unwrap()[0].id;
+        assert_eq!(store.guardrail_hits().unwrap(), vec![(id, 0, None)]);
+
+        store.record_guardrail_hit(id, 2_000).unwrap();
+        store.record_guardrail_hit(id, 3_000).unwrap();
+        assert_eq!(store.guardrail_hits().unwrap(), vec![(id, 2, Some(3_000))]);
+    }
+
+    #[test]
+    fn a_guardrail_can_be_forgotten() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .put_guardrail(&guardrail("", "", "write_file"), 1_000)
+            .unwrap();
+        let id = store.guardrails().unwrap()[0].id;
+        assert!(store.forget_guardrail(id).unwrap());
+        assert!(store.guardrails().unwrap().is_empty());
+        assert!(!store.forget_guardrail(id).unwrap());
     }
 
     // Interception

@@ -738,6 +738,113 @@ fn parse_headers(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// One guardrail, and how often it has refused something.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GuardrailView {
+    /// Its identifier, which `forget-guardrail` takes.
+    pub id: i64,
+    /// Whether it refuses anything.
+    pub enabled: bool,
+    /// The agent, or empty for every agent.
+    pub agent: String,
+    /// The host the MCP server is at, or empty for every server.
+    pub server: String,
+    /// The tool or glob.
+    pub tool: String,
+    /// The resource URI or glob.
+    pub resource: String,
+    /// How it reads in a list.
+    pub title: String,
+    /// How many calls it has refused.
+    pub hits: i64,
+    /// When it last refused one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_hit: Option<i64>,
+    /// Why, if whoever wrote it said.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// What one request may write as a guardrail.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct GuardrailWrite {
+    /// The agent, or empty for every agent.
+    #[serde(default)]
+    pub agent: String,
+    /// The host the MCP server is at, or empty for every server.
+    #[serde(default)]
+    pub server: String,
+    /// The tool or glob.
+    #[serde(default)]
+    pub tool: String,
+    /// The resource URI or glob.
+    #[serde(default)]
+    pub resource: String,
+    /// Whether it refuses anything.
+    pub enabled: Option<bool>,
+    /// Why.
+    pub note: Option<String>,
+}
+
+/// Every guardrail, in the order they are tried.
+pub fn guardrails(store: &mut Store) -> Result<Vec<GuardrailView>> {
+    let hits: std::collections::HashMap<i64, (i64, Option<i64>)> = store
+        .guardrail_hits()?
+        .into_iter()
+        .map(|(id, hits, last)| (id, (hits, last)))
+        .collect();
+    Ok(store
+        .guardrails()?
+        .into_iter()
+        .map(|guardrail| {
+            let (hits, last_hit) = hits.get(&guardrail.id).copied().unwrap_or((0, None));
+            GuardrailView {
+                id: guardrail.id,
+                enabled: guardrail.enabled,
+                title: guardrail.title(),
+                agent: guardrail.agent,
+                server: guardrail.server,
+                tool: guardrail.tool,
+                resource: guardrail.resource,
+                hits,
+                last_hit,
+                note: guardrail.note,
+            }
+        })
+        .collect())
+}
+
+/// Writes a guardrail.
+pub fn write_guardrail(
+    store: &mut Store,
+    wanted: &GuardrailWrite,
+    now: i64,
+) -> Result<&'static str> {
+    use anyhow::bail;
+    let guardrail = flowlight_store::Guardrail {
+        id: 0,
+        enabled: wanted.enabled.unwrap_or(true),
+        agent: wanted.agent.trim().to_owned(),
+        server: wanted.server.trim().to_owned(),
+        tool: wanted.tool.trim().to_owned(),
+        resource: wanted.resource.trim().to_owned(),
+        note: wanted.note.clone(),
+    };
+    if !guardrail.is_complete() {
+        // One that names nothing would refuse every tool of every agent, which is never one keystroke away
+        // by accident.
+        bail!(
+            "a guardrail has to name a tool, a server or a resource. One that named none of them would \
+             refuse every tool of every agent, which is not something anybody means to type."
+        );
+    }
+    Ok(match store.put_guardrail(&guardrail, now)? {
+        flowlight_store::Wrote::Added => "added",
+        flowlight_store::Wrote::Changed => "changed",
+        flowlight_store::Wrote::Unchanged => "unchanged",
+    })
+}
+
 /// One thing a candidate rule would change.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ChangeView {

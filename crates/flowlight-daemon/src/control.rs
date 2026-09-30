@@ -131,6 +131,19 @@ pub enum Request {
         /// What it is working for.
         agent: String,
     },
+    /// Every guardrail, with how often each has refused something.
+    Guardrails,
+    /// Write a guardrail.
+    WriteGuardrail {
+        /// What it refuses.
+        #[serde(flatten)]
+        guardrail: crate::views::GuardrailWrite,
+    },
+    /// Remove a guardrail.
+    ForgetGuardrail {
+        /// The identifier.
+        id: i64,
+    },
     /// Every canned answer.
     Mocks,
     /// Write a canned answer.
@@ -439,7 +452,9 @@ fn handle(
         | Request::SetModel { .. }
         | Request::SetIntercept { .. }
         | Request::WriteMock { .. }
-        | Request::ForgetMock { .. } => Store::open(database)?,
+        | Request::ForgetMock { .. }
+        | Request::WriteGuardrail { .. }
+        | Request::ForgetGuardrail { .. } => Store::open(database)?,
         _ => Store::open_read_only(database)?,
     };
 
@@ -485,6 +500,11 @@ fn handle(
             &change,
             crate::history::authority_paths(database, certificates),
         )?)?,
+        Request::Guardrails => serde_json::to_string(&crate::views::guardrails(&mut store)?)?,
+        Request::WriteGuardrail { guardrail } => {
+            serde_json::to_string(&crate::views::write_guardrail(&mut store, &guardrail, now)?)?
+        }
+        Request::ForgetGuardrail { id } => serde_json::to_string(&store.forget_guardrail(id)?)?,
         Request::Mocks => serde_json::to_string(&crate::views::mocks(&mut store)?)?,
         Request::WriteMock { mock } => {
             serde_json::to_string(&crate::views::write_mock(&mut store, &mock, now)?)?

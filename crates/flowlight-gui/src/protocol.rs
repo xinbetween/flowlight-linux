@@ -274,6 +274,33 @@ pub struct Interception {
     pub intercept: Intercept,
     /// The answers.
     pub mocks: Vec<Mock>,
+    /// The tools that are refused.
+    pub guardrails: Vec<Guardrail>,
+}
+
+/// One guardrail, and how often it has refused something.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct Guardrail {
+    /// Its identifier.
+    pub id: i64,
+    /// Whether it refuses anything.
+    pub enabled: bool,
+    /// The agent, or empty for every agent.
+    pub agent: String,
+    /// The host the MCP server is at.
+    pub server: String,
+    /// The tool or glob.
+    pub tool: String,
+    /// The resource URI or glob.
+    pub resource: String,
+    /// How it reads in a list.
+    pub title: String,
+    /// How many calls it has refused.
+    pub hits: i64,
+    /// When it last refused one.
+    pub last_hit: Option<i64>,
+    /// Why.
+    pub note: Option<String>,
 }
 
 /// One thing a candidate rule would change.
@@ -472,7 +499,12 @@ pub fn forget_mock(id: i64) -> String {
     format!(r#"{{"op":"forget-mock","id":{id}}}"#)
 }
 
-/// Builds the request that asks what a rule would change without writing it.
+/// Builds the request that removes a guardrail.
+pub fn forget_guardrail(id: i64) -> String {
+    format!(r#"{{"op":"forget-guardrail","id":{id}}}"#)
+}
+
+/// Builds the request that asks what a rule would change without writing it./// Builds the request that asks what a rule would change without writing it.
 pub fn simulate(
     action: &str,
     subject: &str,

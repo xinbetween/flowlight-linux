@@ -71,7 +71,7 @@ PYTHON
 }
 
 echo "Watching..."
-sudo "$binary" --json --seconds 260 --database "$database" --socket "$socket" --web 127.0.0.1:0 \
+sudo "$binary" --json --seconds 320 --database "$database" --socket "$socket" --web 127.0.0.1:0 \
     --certificates "$certificates" \
     --export-seconds 2 >"$output" 2>"$log" &
 watcher=$!
@@ -591,6 +591,66 @@ if [ "$agent_tested" = yes ]; then
     # that matter.
     ask '{"op":"requests","since":600,"limit":400}' >/dev/null
     sudo "$binary" --database "$database" --certificates "$certificates" --json coverage --since 600 >/dev/null
+
+    # Guardrails: which tools an agent may use, which is a different question from which hosts it may reach.
+    # A guardrail is decided in the proxy, so this needs interception on — which it still is.
+    guard_secret="do-not-repeat-this-argument"
+    sudo "$binary" --database "$database" --certificates "$certificates" \
+        guardrail --tool 'smoke_*' --agent claude --note "smoke test" >/dev/null
+    sudo "$binary" --database "$database" --certificates "$certificates" --json guardrails \
+        | jq -e '.tool == "smoke_*" and .agent == "claude" and .hits == 0' >/dev/null \
+        || fail "the guardrail was not stored."
+    echo "OK: a guardrail is written, and has refused nothing yet"
+
+    # One that names nothing would refuse every tool of every agent.
+    if sudo "$binary" --database "$database" --certificates "$certificates" guardrail 2>/dev/null; then
+        fail "a guardrail naming nothing at all was accepted."
+    fi
+    echo "OK: a guardrail has to name a tool, a server or a resource"
+
+    sleep 4
+    # The agent asks to use the tool. The answer has to be a JSON-RPC error it understands, not a dropped
+    # connection it would retry.
+    refused_body=$("$fake_agent" -c "sleep 1; curl -sS --cacert '$bundle' --max-time 15 -X POST \
+        -H 'Content-Type: application/json' \
+        --data '{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"tools/call\",\"params\":{\"name\":\"smoke_tool\",\"arguments\":{\"secret\":\"$guard_secret\"}}}' \
+        'https://$target_host/mcp' 2>/dev/null; exit \$?" || true)
+    printf 'the agent got: %s\n' "$refused_body"
+    printf '%s' "$refused_body" | jq -e '.error.code == -32000 and .id == 77' >/dev/null \
+        || fail "a guarded tool call did not come back as a JSON-RPC error answering the call."
+    printf '%s' "$refused_body" | jq -e '.error.data.refusedBy == "flowlight"' >/dev/null \
+        || fail "the refusal does not say who refused it."
+    echo "OK: a guarded tool call is refused with an error the agent understands"
+
+    # And the thing the tool was asked to do is in none of it. This is the property the whole design rests on:
+    # reading a call's method and its tool's name must not mean reading its arguments.
+    if printf '%s' "$refused_body" | grep -qF "$guard_secret"; then
+        fail "the refusal repeated the tool's arguments back."
+    fi
+    sleep 2
+    if sudo "$binary" --database "$database" --certificates "$certificates" --json history --since 600 \
+        | grep -qF "$guard_secret"; then
+        fail "a guarded call's arguments were recorded."
+    fi
+    echo "OK: what the tool was asked to do was never read"
+
+    sudo "$binary" --database "$database" --certificates "$certificates" --json guardrails \
+        | jq -e '.hits >= 1' >/dev/null \
+        || fail "the guardrail did not count the call it refused."
+    echo "OK: a refusal is counted against the guardrail that made it"
+
+    # A tool no guardrail names is not refused.
+    allowed=$("$fake_agent" -c "sleep 1; curl -sS --cacert '$bundle' --max-time 15 -o /dev/null -w '%{http_code}' -X POST \
+        -H 'Content-Type: application/json' \
+        --data '{\"jsonrpc\":\"2.0\",\"id\":78,\"method\":\"tools/call\",\"params\":{\"name\":\"other_tool\"}}' \
+        'https://$target_host/mcp' 2>/dev/null; exit \$?" || true)
+    printf 'a tool nothing names got: %s\n' "$allowed"
+    [ "$allowed" != 200 ] || fail "a tool no guardrail names was answered by Flowlight rather than the server."
+    echo "OK: a tool no guardrail names reaches the server"
+
+    for id in $(sudo "$binary" --database "$database" --certificates "$certificates" --json guardrails | jq -r '.id'); do
+        sudo "$binary" --database "$database" --certificates "$certificates" forget-guardrail "$id" >/dev/null
+    done
 
     sudo "$binary" --database "$database" --certificates "$certificates" intercept --off >/dev/null
     sleep 4

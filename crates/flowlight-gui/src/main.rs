@@ -274,15 +274,20 @@ async fn refresh(
             Err(err) => say(status, &err),
         },
         "intercept" => {
-            // Two questions for one page, because the configuration and the answers it uses are read
-            // together and half of them is not worth drawing.
+            // Three questions for one page, because the configuration and the two things it decides with
+            // are read together and any one of them alone is not worth drawing.
             let mocks =
                 fetch::<Vec<protocol::Mock>>(socket.clone(), r#"{"op":"mocks"}"#.to_owned());
+            let guardrails = fetch::<Vec<protocol::Guardrail>>(
+                socket.clone(),
+                r#"{"op":"guardrails"}"#.to_owned(),
+            );
             match fetch::<protocol::Intercept>(socket, r#"{"op":"intercept"}"#.to_owned()).await {
                 Ok(intercept) => {
                     let row = protocol::Interception {
                         intercept,
                         mocks: mocks.await.unwrap_or_default(),
+                        guardrails: guardrails.await.unwrap_or_default(),
                     };
                     draw(state, 7, &row, &pages.intercept, |column| {
                         render_intercept(state, column, &row);
@@ -1464,6 +1469,63 @@ fn render_intercept(state: &Rc<State>, column: &gtk::Box, row: &protocol::Interc
         answers.add(&line);
     }
     column.append(&answers);
+
+    let guarded = adw::PreferencesGroup::builder()
+        .title("Tools that are refused")
+        .description(
+            "Which tools an agent may use is a different question from which hosts it may reach. A \
+             guardrail is refused with an error the agent understands, not a dropped connection it will \
+             retry — and what the tool was asked to do is never read.",
+        )
+        .build();
+    if row.guardrails.is_empty() {
+        guarded.add(
+            &adw::ActionRow::builder()
+                .title("None")
+                .subtitle("`flowlightd guardrail --tool write_file --agent claude` writes one.")
+                .build(),
+        );
+    }
+    for guardrail in &row.guardrails {
+        let line = adw::ActionRow::builder()
+            .title(guardrail.title.clone())
+            .subtitle(format!(
+                "{}{}",
+                match guardrail.hits {
+                    0 => "has never refused anything".to_owned(),
+                    1 => "has refused one call".to_owned(),
+                    many => format!("has refused {many} calls"),
+                },
+                if guardrail.enabled {
+                    ""
+                } else {
+                    " — switched off"
+                }
+            ))
+            .build();
+        let forget = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Forget this guardrail")
+            .valign(gtk::Align::Center)
+            .build();
+        forget.add_css_class("flat");
+        {
+            let state = Rc::clone(state);
+            let id = guardrail.id;
+            forget.connect_clicked(move |_| {
+                let socket = state.socket.clone();
+                let request = protocol::forget_guardrail(id);
+                let state = Rc::clone(&state);
+                glib::spawn_future_local(async move {
+                    let _: Result<serde_json::Value, String> = fetch(socket, request).await;
+                    *state.drawn.borrow_mut() = Default::default();
+                });
+            });
+        }
+        line.add_suffix(&forget);
+        guarded.add(&line);
+    }
+    column.append(&guarded);
 
     let scope = adw::PreferencesGroup::builder()
         .title("Scope")

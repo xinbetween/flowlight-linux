@@ -165,7 +165,8 @@ Useful flags:
 
 Plus subcommands that read the database rather than the kernel — `history --since 6h`, `agents`, `summary`,
 `coverage --since 24h`, `budget`, `export`, `model`, `query`, `intercept`, `trust`, `mock`, `mocks`,
-`forget-mock` — and six for rules: `block`, `allow`, `ask`, `simulate`, `rules`, `forget`. `--json` works on all
+`forget-mock`, `guardrail`, `guardrails`, `forget-guardrail` — and six for rules: `block`, `allow`, `ask`,
+`simulate`, `rules`, `forget`. `--json` works on all
 of them. One subcommand is not like the others: `launch` runs as you rather than as root, because the agent it
 starts has to.
 
@@ -472,6 +473,54 @@ other. It says plainly that a process started this way is **not** marked: only b
 outside the database — so it is the one that is checked against the asker. Marking a process makes every rule
 scoped to that agent apply to it and, when interception is on, redirects its connections. Root may name any
 process; anybody else may name only their own, by real uid, read from `/proc`.
+
+### Guardrails
+
+Which tools an agent may use is a different question from which hosts it may reach, and answering it means
+reading what the agent *says* rather than where it connects.
+
+```console
+$ sudo flowlightd guardrail --tool '*write*' --agent claude --note "read-only this week"
+added
+
+$ flowlightd guardrails
+   1  claude: no *write*  — refused 3 call(s)
+```
+
+The agent asks to use the tool and gets back an answer:
+
+```json
+{"jsonrpc":"2.0","id":77,"error":{"code":-32000,"message":"claude: no *write*",
+ "data":{"refusedBy":"flowlight"}}}
+```
+
+**A refusal is an answer, not a failure.** It carries the call's own `id`, because that is how a JSON-RPC
+client matches an answer to its question — get it wrong and the agent waits for one that never comes, which is
+the same as a dropped connection and worse than an error. And a dropped connection teaches an agent to retry;
+an error teaches it the tool is not available, which is what is true.
+
+Guardrails need interception, because refusing a call means reading it. What is read is the JSON-RPC method,
+the tool's name and a resource URI — by the same scanner that feeds the MCP columns, which structurally cannot
+read an argument. **What the tool was asked to do passes through unread**, exactly as it does when nothing is
+intercepting, and the smoke test asserts that a refused call's arguments appear in neither the answer nor the
+database.
+
+Four decisions, each of which could have gone the other way:
+
+- **There is no allow.** A guardrail is subtractive by nature: it is applied to a list the agent itself
+  declares, and an "allow" would only ever mean "do not subtract this", which is what leaving it out already
+  says. One action also means no precedence — the first guardrail that refuses a call refuses it.
+- **`tools/list` is never refused.** Refusing a *question* tells an agent that a tool exists and is forbidden,
+  which invites working around it. A guardrail is about what an agent does.
+- **One that names nothing is refused as unfinished**, not accepted as very strict. A guardrail naming neither
+  tool, server nor resource would refuse every tool of every agent, and that is never one keystroke away.
+- **A body larger than sixteen megabytes is forwarded unread.** A deliberate hole, and the safe direction: a
+  guardrail that can be evaded by an enormous request is better than a proxy that can be stopped by one.
+
+`--server` names the host the MCP server is at — what the proxy actually knows, rather than the name an agent's
+configuration gives it. A server with no tool refuses the whole server. `--resource` covers `resources/read`,
+matched by URI. Everything is matched without regard to case and with `*` standing for any run of characters,
+because a tool's name is written by hand in one place and generated in another.
 
 ### Interception
 

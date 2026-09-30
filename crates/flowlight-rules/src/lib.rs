@@ -1247,3 +1247,327 @@ mod interception_tests {
         assert_eq!(mock("*.example.com", "", "*").title(), "ANY *.example.com*");
     }
 }
+
+// MARK: Guardrails
+
+/// "This agent may not use that tool."
+///
+/// The other half of the rule model, and its own idea rather than a special case of the network one. *Which
+/// tools may this agent use* is a different question from *which hosts may it reach*, and answering it means
+/// reading what the agent says rather than where it connects.
+///
+/// # Why there is no allow
+///
+/// A guardrail is subtractive by nature. It is applied to a list the agent itself declares — the tools a server
+/// offers — and an "allow" would only ever mean "do not subtract this", which is what leaving it out already
+/// says. A rule model with one action needs no precedence, which is the second reason: the first guardrail that
+/// refuses a call refuses it, and there is nothing for a second one to overturn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Guardrail {
+    /// Its identifier, so `forget` can take it away.
+    pub id: i64,
+    /// Whether it refuses anything.
+    pub enabled: bool,
+    /// The agent, or empty for every agent.
+    pub agent: String,
+    /// The host the MCP server is reached at, or empty for every server.
+    ///
+    /// A host rather than the name the agent's configuration gives the server. The proxy knows where a
+    /// connection went and not what somebody called it, and matching on what is actually known beats matching
+    /// on a name that has to be looked up and may be missing.
+    pub server: String,
+    /// The tool, or a glob. Empty means every tool on the named server, which is how a whole server is refused.
+    pub tool: String,
+    /// A resource URI or glob, for `resources/read`. Empty means this guardrail says nothing about resources.
+    pub resource: String,
+    /// Why, for whoever reads the list later.
+    pub note: Option<String>,
+}
+
+impl Guardrail {
+    /// Whether this names anything at all.
+    ///
+    /// One that names nothing would refuse every tool of every agent. That is never one keystroke away by
+    /// accident, so it counts as unfinished rather than as very strict.
+    pub fn is_complete(&self) -> bool {
+        !self.tool.trim().is_empty()
+            || !self.server.trim().is_empty()
+            || !self.resource.trim().is_empty()
+    }
+
+    /// How this reads in a list.
+    pub fn title(&self) -> String {
+        let who = if self.agent.trim().is_empty() {
+            "any agent"
+        } else {
+            self.agent.trim()
+        };
+        if !self.resource.trim().is_empty() {
+            return alloc::format!("{who}: no {}", self.resource.trim());
+        }
+        match (self.tool.trim(), self.server.trim()) {
+            ("", server) => alloc::format!("{who}: nothing from {server}"),
+            (tool, "") => alloc::format!("{who}: no {tool}"),
+            (tool, server) => alloc::format!("{who}: no {tool} at {server}"),
+        }
+    }
+
+    /// Whether this refuses a named tool.
+    ///
+    /// Matched without regard to case and by glob, because a tool's name is written by hand in one place and
+    /// generated in another.
+    pub fn refuses_tool(&self, agent: Option<&str>, server: &str, tool: &str) -> bool {
+        if !self.enabled || !self.is_complete() || !self.covers_agent(agent) {
+            return false;
+        }
+        if !self.covers_server(server) {
+            return false;
+        }
+        match self.tool.trim() {
+            // A server named and no tool: the whole server. A guardrail that named neither would have been
+            // refused as incomplete above.
+            "" => !self.server.trim().is_empty(),
+            wanted => matches(wanted, tool),
+        }
+    }
+
+    /// Whether this refuses a resource being read.
+    pub fn refuses_resource(&self, agent: Option<&str>, server: &str, uri: &str) -> bool {
+        if !self.enabled || !self.covers_agent(agent) || !self.covers_server(server) {
+            return false;
+        }
+        match self.resource.trim() {
+            "" => false,
+            wanted => matches(wanted, uri),
+        }
+    }
+
+    /// Whether this guardrail could refuse anything at all of this agent's, at this host.
+    ///
+    /// Asked once per connection, before it is terminated, so that a connection nothing could be refused on is
+    /// not decrypted for the sake of it. It answers about the agent and the server only — the tool is not known
+    /// until the call has been read, which is after the decision to look.
+    pub fn refuses_anything_of(&self, agent: Option<&str>, server: &str) -> bool {
+        self.enabled && self.is_complete() && self.covers_agent(agent) && self.covers_server(server)
+    }
+
+    /// Whether this guardrail is about this agent. Empty means every agent, including traffic belonging to none.
+    fn covers_agent(&self, agent: Option<&str>) -> bool {
+        match self.agent.trim() {
+            "" => true,
+            named => agent.is_some_and(|agent| matches(named, agent)),
+        }
+    }
+
+    /// Whether this guardrail is about this server.
+    fn covers_server(&self, server: &str) -> bool {
+        match self.server.trim() {
+            "" => true,
+            named => matches(named, server),
+        }
+    }
+}
+
+/// Whether a pattern covers a name, ignoring case, with `*` standing for any run of characters.
+fn matches(pattern: &str, subject: &str) -> bool {
+    let (pattern, subject) = (pattern.to_ascii_lowercase(), subject.to_ascii_lowercase());
+    pattern == subject || glob(&pattern, &subject)
+}
+
+/// The first guardrail that refuses this call, if any refuses it.
+///
+/// First rather than most specific, because there is only one action: nothing a later guardrail could say
+/// would change the answer, so the search stops as soon as it has one.
+pub fn refused<'a>(
+    guardrails: &'a [Guardrail],
+    agent: Option<&str>,
+    server: &str,
+    method: &str,
+    tool: Option<&str>,
+    resource: Option<&str>,
+) -> Option<&'a Guardrail> {
+    // A guardrail is about what an agent *does*, and the methods that do something are these two. `tools/list`
+    // is a question, and refusing a question tells an agent a tool exists and is forbidden — which is worse
+    // than either answer, because it invites working around it.
+    match method {
+        "tools/call" => {
+            let tool = tool?;
+            guardrails
+                .iter()
+                .find(|guardrail| guardrail.refuses_tool(agent, server, tool))
+        }
+        "resources/read" => {
+            let resource = resource?;
+            guardrails
+                .iter()
+                .find(|guardrail| guardrail.refuses_resource(agent, server, resource))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod guardrail_tests {
+    use super::*;
+    use alloc::vec;
+
+    fn guardrail(agent: &str, server: &str, tool: &str) -> Guardrail {
+        Guardrail {
+            id: 1,
+            enabled: true,
+            agent: agent.to_owned(),
+            server: server.to_owned(),
+            tool: tool.to_owned(),
+            resource: String::new(),
+            note: None,
+        }
+    }
+
+    /// One that names nothing would refuse every tool of every agent, which is never one keystroke away by
+    /// accident.
+    #[test]
+    fn a_guardrail_that_names_nothing_refuses_nothing() {
+        let empty = guardrail("", "", "");
+        assert!(!empty.is_complete());
+        assert!(!empty.refuses_tool(Some("claude"), "mcp.example.com", "write_file"));
+        // Even one that names an agent, because an agent is who it applies to and not what it is about.
+        let whose = guardrail("claude", "", "");
+        assert!(!whose.is_complete());
+        assert!(!whose.refuses_tool(Some("claude"), "mcp.example.com", "write_file"));
+    }
+
+    #[test]
+    fn a_named_tool_is_refused_and_nothing_else_is() {
+        let rail = guardrail("", "", "write_file");
+        assert!(rail.refuses_tool(Some("claude"), "mcp.example.com", "write_file"));
+        assert!(!rail.refuses_tool(Some("claude"), "mcp.example.com", "read_file"));
+    }
+
+    /// A tool's name is written by hand in one place and generated in another.
+    #[test]
+    fn a_tool_is_matched_without_regard_to_case_and_by_glob() {
+        assert!(guardrail("", "", "Write_File").refuses_tool(None, "x", "write_file"));
+        assert!(guardrail("", "", "*write*").refuses_tool(None, "x", "atomic_write_file"));
+        assert!(guardrail("", "", "*write*").refuses_tool(None, "x", "WRITE"));
+        assert!(!guardrail("", "", "*write*").refuses_tool(None, "x", "read_file"));
+    }
+
+    /// A server and no tool is how a whole server is refused.
+    #[test]
+    fn a_server_with_no_tool_refuses_the_whole_server() {
+        let rail = guardrail("", "mcp.example.com", "");
+        assert!(rail.refuses_tool(Some("claude"), "mcp.example.com", "anything_at_all"));
+        assert!(!rail.refuses_tool(Some("claude"), "other.example.com", "anything_at_all"));
+    }
+
+    #[test]
+    fn an_agent_named_narrows_it_to_that_agent() {
+        let rail = guardrail("claude", "", "write_file");
+        assert!(rail.refuses_tool(Some("claude"), "x", "write_file"));
+        assert!(!rail.refuses_tool(Some("cursor"), "x", "write_file"));
+        // And traffic belonging to no agent is not that agent.
+        assert!(!rail.refuses_tool(None, "x", "write_file"));
+    }
+
+    /// Empty means every agent, which includes traffic that belongs to none.
+    #[test]
+    fn no_agent_named_means_every_agent() {
+        let rail = guardrail("", "", "write_file");
+        assert!(rail.refuses_tool(Some("claude"), "x", "write_file"));
+        assert!(rail.refuses_tool(None, "x", "write_file"));
+    }
+
+    #[test]
+    fn a_guardrail_that_is_off_refuses_nothing() {
+        let mut rail = guardrail("", "", "write_file");
+        rail.enabled = false;
+        assert!(!rail.refuses_tool(Some("claude"), "x", "write_file"));
+        assert!(
+            refused(
+                &[rail],
+                Some("claude"),
+                "x",
+                "tools/call",
+                Some("write_file"),
+                None
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_resource_is_refused_by_uri() {
+        let mut rail = guardrail("claude", "", "");
+        rail.resource = "file:///etc/*".to_owned();
+        assert!(rail.is_complete());
+        assert!(rail.refuses_resource(Some("claude"), "x", "file:///etc/shadow"));
+        assert!(!rail.refuses_resource(Some("claude"), "x", "file:///home/me/notes"));
+        // And it says nothing about tools, because it names none.
+        assert!(!rail.refuses_tool(Some("claude"), "x", "write_file"));
+    }
+
+    /// Refusing a question tells an agent that a tool exists and is forbidden, which invites working around
+    /// it. A guardrail is about what an agent does.
+    #[test]
+    fn listing_is_not_refused() {
+        let rails = vec![guardrail("", "", "*")];
+        assert!(refused(&rails, Some("claude"), "x", "tools/list", None, None).is_none());
+        assert!(refused(&rails, Some("claude"), "x", "initialize", None, None).is_none());
+        assert!(
+            refused(
+                &rails,
+                Some("claude"),
+                "x",
+                "tools/call",
+                Some("anything"),
+                None
+            )
+            .is_some()
+        );
+    }
+
+    /// One action, so the first that refuses decides and there is nothing to overturn.
+    #[test]
+    fn the_first_that_refuses_decides() {
+        let mut first = guardrail("", "", "write_*");
+        first.id = 7;
+        let mut second = guardrail("", "", "write_file");
+        second.id = 8;
+        let rails = vec![first, second];
+        let chosen = refused(
+            &rails,
+            Some("claude"),
+            "x",
+            "tools/call",
+            Some("write_file"),
+            None,
+        )
+        .expect("one refuses");
+        assert_eq!(chosen.id, 7);
+    }
+
+    #[test]
+    fn a_call_with_no_tool_named_is_not_refused() {
+        let rails = vec![guardrail("", "", "*")];
+        assert!(refused(&rails, Some("claude"), "x", "tools/call", None, None).is_none());
+    }
+
+    #[test]
+    fn a_title_says_who_and_what() {
+        assert_eq!(
+            guardrail("claude", "", "write_file").title(),
+            "claude: no write_file"
+        );
+        assert_eq!(
+            guardrail("", "mcp.example.com", "").title(),
+            "any agent: nothing from mcp.example.com"
+        );
+        assert_eq!(
+            guardrail("claude", "mcp.example.com", "write_*").title(),
+            "claude: no write_* at mcp.example.com"
+        );
+        let mut resource = guardrail("claude", "", "");
+        resource.resource = "file:///etc/*".to_owned();
+        assert_eq!(resource.title(), "claude: no file:///etc/*");
+    }
+}

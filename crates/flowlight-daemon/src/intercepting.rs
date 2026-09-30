@@ -48,8 +48,16 @@ impl Happened {
     pub fn is_worth_keeping(&self) -> bool {
         matches!(
             self.decided,
-            Decided::Answered { .. } | Decided::Failed { .. }
+            Decided::Answered { .. } | Decided::Guarded { .. } | Decided::Failed { .. }
         )
+    }
+
+    /// The guardrails that refused something, so the count against each can be kept.
+    pub fn guardrails(&self) -> &[i64] {
+        match &self.decided {
+            Decided::Guarded { guardrails, .. } => guardrails,
+            _ => &[],
+        }
     }
 
     /// How this reads in a note and on a line.
@@ -74,6 +82,18 @@ impl Happened {
                         "a request was answered by Flowlight rather than by the server"
                     },
                     rules
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ),
+            Decided::Guarded { host, guardrails } => (
+                "guardrail".to_owned(),
+                host.clone(),
+                format!(
+                    "a tool call was refused by guardrail {}",
+                    guardrails
                         .iter()
                         .map(|id| id.to_string())
                         .collect::<Vec<_>>()
@@ -107,6 +127,11 @@ pub struct Interception {
     proxy: Arc<Proxy>,
     /// What is in force, so a pass that changes nothing writes nothing.
     running: Option<Intercept>,
+    /// What each agent identifier is called, so the proxy can be told who a connection belongs to.
+    ///
+    /// The kernel carries a number, because a number is what fits in a map. A guardrail names an agent, and
+    /// the two have to be joined somewhere — here, where the numbering is already known.
+    names: Arc<std::sync::RwLock<std::collections::HashMap<u32, String>>>,
     /// Which agent identifiers are in the kernel's scope map.
     scoped: std::collections::HashSet<u32>,
     /// The port the listeners are on, once they are up.
@@ -166,6 +191,7 @@ impl Interception {
             )?,
             proxy: Arc::new(proxy),
             running: None,
+            names: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             scoped: std::collections::HashSet::new(),
             port: None,
         })
@@ -180,10 +206,12 @@ impl Interception {
         &mut self,
         intercept: &Intercept,
         mocks: Vec<Mock>,
+        guardrails: Vec<flowlight_store::Guardrail>,
         mut identity: impl FnMut(&str) -> u32,
     ) -> Result<bool> {
         self.proxy.set_spared(intercept.never.clone());
         self.proxy.set_mocks(mocks);
+        self.proxy.set_guardrails(guardrails);
 
         if self.running.as_ref() == Some(intercept) {
             return Ok(false);
@@ -193,7 +221,13 @@ impl Interception {
             intercept
                 .agents
                 .iter()
-                .map(|agent| identity(agent))
+                .map(|agent| {
+                    let id = identity(agent);
+                    if let Ok(mut names) = self.names.write() {
+                        names.insert(id, agent.clone());
+                    }
+                    id
+                })
                 .collect()
         } else {
             std::collections::HashSet::new()
@@ -253,10 +287,11 @@ impl Interception {
         for listener in [Some(four), six].into_iter().flatten() {
             let proxy = Arc::clone(&self.proxy);
             let originals = Arc::clone(&originals);
+            let names = Arc::clone(&self.names);
             let sender = sender.clone();
             std::thread::Builder::new()
                 .name("flowlight-proxy".to_owned())
-                .spawn(move || accept(&listener, &proxy, &originals, &sender))
+                .spawn(move || accept(&listener, &proxy, &originals, &names, &sender))
                 .context("starting the proxy's listener")?;
         }
         self.port = Some(port);
@@ -269,6 +304,7 @@ fn accept(
     listener: &TcpListener,
     proxy: &Arc<Proxy>,
     originals: &Arc<std::sync::Mutex<BpfHashMap<MapData, u16, Original>>>,
+    names: &Arc<std::sync::RwLock<std::collections::HashMap<u32, String>>>,
     sender: &Sender<crate::Message>,
 ) {
     for stream in listener.incoming() {
@@ -308,10 +344,14 @@ fn accept(
 
         let proxy = Arc::clone(proxy);
         let sender = sender.clone();
+        let agent = names
+            .read()
+            .ok()
+            .and_then(|names| names.get(&original.agent).cloned());
         let _ = std::thread::Builder::new()
             .name("flowlight-intercept".to_owned())
             .spawn(move || {
-                let decided = proxy.handle(stream, reached_of(&original));
+                let decided = proxy.handle(stream, reached_of(&original), agent.as_deref());
                 let _ = sender.send(crate::Message::Intercepted(Box::new(Happened {
                     tgid: original.tgid,
                     decided,

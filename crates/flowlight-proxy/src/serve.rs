@@ -21,7 +21,7 @@
 use crate::authority::{Authority, Signed};
 use crate::http::{self, Framing};
 use anyhow::{Context as _, Result};
-use flowlight_rules::Mock;
+use flowlight_rules::{Guardrail, Mock};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::{
@@ -59,6 +59,13 @@ pub enum Decided {
         /// How many requests went through.
         requests: usize,
     },
+    /// Terminated, and a guardrail refused what the agent was asking to do.
+    Guarded {
+        /// The host.
+        host: String,
+        /// The guardrails that refused, by identifier.
+        guardrails: Vec<i64>,
+    },
     /// Terminated, and at least one request was answered by a rule.
     Answered {
         /// The host.
@@ -86,6 +93,8 @@ pub struct Proxy {
     mocks: std::sync::RwLock<Vec<Mock>>,
     /// Hosts never terminated, whatever else says so.
     spared: std::sync::RwLock<Vec<String>>,
+    /// Which tools an agent may not use. Read on every call, so one written a moment ago is in force.
+    guardrails: std::sync::RwLock<Vec<Guardrail>>,
 }
 
 impl Proxy {
@@ -104,6 +113,7 @@ impl Proxy {
             upstream: Arc::new(upstream),
             mocks: std::sync::RwLock::new(Vec::new()),
             spared: std::sync::RwLock::new(Vec::new()),
+            guardrails: std::sync::RwLock::new(Vec::new()),
         })
     }
 
@@ -119,6 +129,28 @@ impl Proxy {
         if let Ok(mut held) = self.spared.write() {
             *held = spared;
         }
+    }
+
+    /// Replaces the guardrails.
+    pub fn set_guardrails(&self, guardrails: Vec<Guardrail>) {
+        if let Ok(mut held) = self.guardrails.write() {
+            *held = guardrails;
+        }
+    }
+
+    /// Whether any guardrail could refuse something this agent does.
+    ///
+    /// Asked once per connection, before anything is terminated. A host is terminated when a canned answer
+    /// could match it *or* when a guardrail could refuse a call to it — the second is why a connection to an
+    /// MCP server is terminated at all.
+    fn guards(&self, agent: Option<&str>, host: &str) -> bool {
+        self.guardrails.read().is_ok_and(|guardrails| {
+            guardrails.iter().any(|guardrail| {
+                guardrail.enabled
+                    && guardrail.is_complete()
+                    && guardrail.refuses_anything_of(agent, host)
+            })
+        })
     }
 
     /// The authority, for whatever has to write its certificate somewhere.
@@ -146,10 +178,10 @@ impl Proxy {
     ///
     /// Takes the original destination rather than working it out, because the only trustworthy source for it is
     /// the kernel and the only place that can ask is the caller.
-    pub fn handle(&self, client: TcpStream, reached: Reached) -> Decided {
+    pub fn handle(&self, client: TcpStream, reached: Reached, agent: Option<&str>) -> Decided {
         let _ = client.set_read_timeout(Some(PATIENCE));
         let _ = client.set_write_timeout(Some(PATIENCE));
-        match self.decide(client, reached) {
+        match self.decide(client, reached, agent) {
             Ok(decided) => decided,
             Err(err) => Decided::Failed {
                 host: None,
@@ -159,16 +191,24 @@ impl Proxy {
     }
 
     /// The whole of it, with the failures in one place.
-    fn decide(&self, mut client: TcpStream, reached: Reached) -> Result<Decided> {
+    fn decide(
+        &self,
+        mut client: TcpStream,
+        reached: Reached,
+        agent: Option<&str>,
+    ) -> Result<Decided> {
         // The name is taken from the handshake, not from a header: a header is written by whoever is
         // connecting, and the certificate presented has to be for the name they asked for.
         let (named, first) = peek_server_name(&mut client)?;
 
         // A host nobody mocks is never terminated. No certificate is presented, nothing is decrypted, and the
         // connection is what it would have been if interception were off.
-        let terminate = named
-            .as_deref()
-            .is_some_and(|host| !self.is_spared(host) && self.mocks_anything(host));
+        // Terminated when something could decide about it: a canned answer that could match the host, or a
+        // guardrail that could refuse a call made over it. The second is why a connection to an MCP server is
+        // decrypted at all.
+        let terminate = named.as_deref().is_some_and(|host| {
+            !self.is_spared(host) && (self.mocks_anything(host) || self.guards(agent, host))
+        });
         if !terminate {
             let upstream = TcpStream::connect(SocketAddr::new(reached.address, reached.port))
                 .with_context(|| {
@@ -192,7 +232,7 @@ impl Proxy {
             ServerConnection::new(Arc::new(server)).context("starting TLS with the client")?;
         let inside = StreamOwned::new(connection, Prefixed::new(client, first));
 
-        self.exchange(inside, &host, reached)
+        self.exchange(inside, &host, reached, agent)
     }
 
     /// Reads requests off a terminated connection, and decides about each.
@@ -201,11 +241,13 @@ impl Proxy {
         inside: StreamOwned<ServerConnection, Prefixed>,
         host: &str,
         reached: Reached,
+        agent: Option<&str>,
     ) -> Result<Decided> {
         let mut client = BufReader::new(inside);
         let mut upstream: Option<StreamOwned<ClientConnection, TcpStream>> = None;
         let mut forwarded = 0;
         let mut answered = Vec::new();
+        let mut guarded = Vec::new();
         let mut refusal = false;
 
         loop {
@@ -233,6 +275,27 @@ impl Proxy {
                 break;
             }
 
+            // What the agent is asking to do, read out of the beginning of the body. Held first, because it
+            // has to be forwarded byte for byte if it is not refused.
+            let mut held = None;
+            if !self.guardrails.read().is_ok_and(|rails| rails.is_empty())
+                && http::could_be_mcp(&head)
+            {
+                held = http::hold_body(&mut client, framing)?;
+                if let Some(body) = &held
+                    && let Some((refused, said)) = self.refusal(agent, host, body)
+                {
+                    client
+                        .get_mut()
+                        .write_all(&http::refusal_bytes(&http::envelope_id(body), &said))?;
+                    let _ = client.get_mut().flush();
+                    guarded.push(refused);
+                    // Answered, so nothing goes upstream and the server never sees the call. The answer says
+                    // `Connection: close` for the same reason a mock's does.
+                    break;
+                }
+            }
+
             let onwards = match upstream.take() {
                 Some(ready) => ready,
                 None => match self.connect(host, reached) {
@@ -251,8 +314,21 @@ impl Proxy {
                 },
             };
             let mut onwards = BufReader::new(onwards);
-            onwards.get_mut().write_all(&head.bytes())?;
-            http::relay_body(&mut client, onwards.get_mut(), framing)?;
+            match &held {
+                // Held to be looked at, and now sent on exactly as it arrived — except for a chunked body,
+                // which was read as chunks and goes out as one piece with a length, because the framing it
+                // arrived in was consumed to read it.
+                Some(body) => {
+                    onwards
+                        .get_mut()
+                        .write_all(&reframed(&head, body).bytes())?;
+                    onwards.get_mut().write_all(body)?;
+                }
+                None => {
+                    onwards.get_mut().write_all(&head.bytes())?;
+                    http::relay_body(&mut client, onwards.get_mut(), framing)?;
+                }
+            }
             onwards.get_mut().flush()?;
             forwarded += 1;
 
@@ -281,7 +357,12 @@ impl Proxy {
         // says so outright and curl prints it. Sent here, once, on every way out of the loop.
         finish(client.get_mut());
 
-        Ok(if answered.is_empty() {
+        Ok(if !guarded.is_empty() {
+            Decided::Guarded {
+                host: host.to_owned(),
+                guardrails: guarded,
+            }
+        } else if answered.is_empty() {
             Decided::Forwarded {
                 host: host.to_owned(),
                 requests: forwarded,
@@ -293,6 +374,12 @@ impl Proxy {
                 refusal,
             }
         })
+    }
+
+    /// Which guardrail refuses what this body asks for.
+    fn refusal(&self, agent: Option<&str>, host: &str, body: &[u8]) -> Option<(i64, String)> {
+        let guardrails = self.guardrails.read().ok()?;
+        refusal_of(&guardrails, agent, host, body)
     }
 
     /// The rule that answers a request, if one does.
@@ -322,6 +409,51 @@ impl Proxy {
             .with_context(|| format!("starting TLS with {host}"))?;
         Ok(StreamOwned::new(connection, socket))
     }
+}
+
+/// Which guardrail refuses what this body asks for, and what to say about it.
+///
+/// The body is scanned by the same reader that feeds the MCP columns, which structurally cannot read an
+/// argument: it looks for a JSON-RPC envelope and takes the method, the tool's name and a resource URI. What
+/// the tool was *asked to do* passes through here unread, exactly as it does when nothing is intercepting.
+fn refusal_of(
+    guardrails: &[Guardrail],
+    agent: Option<&str>,
+    host: &str,
+    body: &[u8],
+) -> Option<(i64, String)> {
+    for call in flowlight_agents::wire::calls(body) {
+        if let Some(guardrail) = flowlight_rules::refused(
+            guardrails,
+            agent,
+            host,
+            &call.method,
+            call.tool.as_deref(),
+            call.resource.as_deref(),
+        ) {
+            return Some((guardrail.id, guardrail.title()));
+        }
+    }
+    None
+}
+
+/// A head for a body that was held, with the framing corrected.
+///
+/// A chunked body was read as chunks in order to look at it, so it can no longer be forwarded as chunks: it
+/// goes on as one piece with a length. Everything else keeps the head it arrived with.
+fn reframed(head: &http::Head, body: &[u8]) -> http::Head {
+    if !matches!(http::framing_of_request(head), http::Framing::Chunked) {
+        return head.clone();
+    }
+    let mut rewritten = head.clone();
+    rewritten.headers.retain(|(name, _)| {
+        !name.eq_ignore_ascii_case("transfer-encoding")
+            && !name.eq_ignore_ascii_case("content-length")
+    });
+    rewritten
+        .headers
+        .push(("Content-Length".to_owned(), body.len().to_string()));
+    rewritten
 }
 
 /// Ends a terminated connection properly.
@@ -769,6 +901,7 @@ mod end_to_end {
                 address: "127.0.0.1".parse().unwrap(),
                 port: 1,
             },
+            Some("claude"),
         );
         let answer = client.join().unwrap();
 
@@ -842,6 +975,7 @@ mod end_to_end {
                 address: reached.ip(),
                 port: reached.port(),
             },
+            Some("claude"),
         );
         let back = client.join().unwrap();
         let seen = echo.join().unwrap();
@@ -855,6 +989,154 @@ mod end_to_end {
         // The handshake Flowlight read in order to decide reached the far end unchanged.
         assert_eq!(seen, hello);
         assert_eq!(back, hello);
+    }
+
+    fn guardrail(agent: &str, tool: &str) -> Guardrail {
+        Guardrail {
+            id: 9,
+            enabled: true,
+            agent: agent.to_owned(),
+            server: String::new(),
+            tool: tool.to_owned(),
+            resource: String::new(),
+            note: None,
+        }
+    }
+
+    /// The whole guarded path, over real TLS and with no network: an agent asks to use a tool, and gets back
+    /// an answer the server never saw.
+    #[test]
+    fn a_guarded_tool_call_is_refused_and_nothing_goes_upstream() {
+        let scratch = Scratch::new("guarded");
+        let authority = Authority::open(&scratch.keys(), &scratch.published(), "a-test").unwrap();
+        let client_side = trusting(&authority);
+
+        let proxy = Proxy::new(authority).unwrap();
+        proxy.set_guardrails(vec![guardrail("claude", "write_*")]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        // The argument is in the body and must never come back in anything.
+        let body = concat!(
+            r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"write_file","#,
+            r#""arguments":{"path":"/etc/shadow","contents":"DO-NOT-REPEAT-THIS"}}}"#
+        );
+        let sent = body.to_owned();
+        let client = std::thread::spawn(move || {
+            let socket = TcpStream::connect(address).unwrap();
+            let name = ServerName::try_from("mcp.example.com").unwrap();
+            let connection = ClientConnection::new(client_side, name).unwrap();
+            let mut inside = StreamOwned::new(connection, socket);
+            inside
+                .write_all(
+                    format!(
+                        "POST /mcp HTTP/1.1\r\nHost: mcp.example.com\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\n\r\n{sent}",
+                        sent.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            let mut answer = String::new();
+            let mut reader = BufReader::new(inside);
+            let _ = reader.read_to_string(&mut answer);
+            answer
+        });
+
+        let (accepted, _) = listener.accept().unwrap();
+        // Port 1, which nothing is listening on: if this went upstream it would fail rather than refuse.
+        let decided = proxy.handle(
+            accepted,
+            Reached {
+                address: "127.0.0.1".parse().unwrap(),
+                port: 1,
+            },
+            Some("claude"),
+        );
+        let answer = client.join().unwrap();
+
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+        assert!(
+            answer.contains("X-Flowlight-Guardrail: refused"),
+            "{answer}"
+        );
+        let payload = answer.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let parsed: serde_json::Value = serde_json::from_str(payload).unwrap();
+        // Answered to the call it refuses, or the agent waits for an answer that never comes.
+        assert_eq!(parsed["id"], 11);
+        assert_eq!(parsed["error"]["code"], -32000);
+        assert_eq!(parsed["error"]["message"], "claude: no write_*");
+        assert_eq!(
+            decided,
+            Decided::Guarded {
+                host: "mcp.example.com".to_owned(),
+                guardrails: vec![9],
+            }
+        );
+        // The thing the tool was asked to do is in none of it.
+        assert!(!answer.contains("DO-NOT-REPEAT-THIS"), "{answer}");
+        assert!(!answer.contains("/etc/shadow"), "{answer}");
+    }
+
+    /// A guardrail about another agent does not refuse this one, and with nothing else to decide the
+    /// connection is not terminated at all.
+    #[test]
+    fn a_guardrail_about_somebody_else_terminates_nothing() {
+        let scratch = Scratch::new("not-guarded");
+        let authority = Authority::open(&scratch.keys(), &scratch.published(), "a-test").unwrap();
+        let proxy = Proxy::new(authority).unwrap();
+        proxy.set_guardrails(vec![guardrail("cursor", "write_*")]);
+
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let reached = upstream.local_addr().unwrap();
+        let echo = std::thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let mut seen = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while let Ok(read) = socket.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&buffer[..read]);
+                if seen.len() >= 5 {
+                    break;
+                }
+            }
+            seen
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let hello = super::tests::client_hello(Some("mcp.example.com"));
+        let sent = hello.clone();
+        let client = std::thread::spawn(move || {
+            let mut socket = TcpStream::connect(address).unwrap();
+            socket.write_all(&sent).unwrap();
+        });
+
+        let (accepted, _) = listener.accept().unwrap();
+        let decided = proxy.handle(
+            accepted,
+            Reached {
+                address: reached.ip(),
+                port: reached.port(),
+            },
+            Some("claude"),
+        );
+        let _ = client.join();
+        let seen = echo.join().unwrap();
+
+        assert_eq!(
+            decided,
+            Decided::Passed {
+                host: Some("mcp.example.com".to_owned())
+            }
+        );
+        assert_eq!(
+            seen, hello,
+            "the handshake should reach the server unchanged"
+        );
     }
 
     /// Opening an authority that exists does not make a new one. A second certificate would mean everything
