@@ -7,6 +7,7 @@
 
 use crate::query::{self, Call, Query, TOOL, TOOL_SUMMARY};
 use anyhow::{Context as _, Result, bail};
+use flowlight_store::Language;
 use flowlight_store::ask::{Ask, Kind, Safety};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -79,14 +80,18 @@ pub fn ask(
         .context("no model is configured; every provider has to be told which model to use")?;
     // Checked here as well as when the endpoint was written, because a check that only exists at the place
     // something is configured is a check the next caller does not get.
+    //
+    // In English, unlike the sentences a person is actually shown. Every caller asks `Ask::why_not` first and
+    // refuses in the reader's language; reaching these two means the configuration changed between that check
+    // and this one, or that a caller skipped it — a message for whoever is reading a log, not a disclosure.
     match Safety::of(endpoint, configuration.kind) {
         Safety::Fine => {}
-        refused => bail!("{}", refused.describe(endpoint)),
+        refused => bail!("{}", refused.describe(endpoint, Language::English)),
     }
     if configuration.kind.needs_key() && key.trim().is_empty() {
         bail!(
             "{} needs a key and there is not one on file.",
-            configuration.kind.described()
+            configuration.kind.described(Language::English)
         );
     }
 
