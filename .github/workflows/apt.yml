@@ -1,0 +1,169 @@
+# Builds the apt repository, proves it works, and publishes it if there is a key to sign with.
+#
+# Separate from Release for the same reason Release is separate from CI: this one changes what a machine that
+# already trusts the archive will install on its next `apt-get update`, which is a larger act than attaching a
+# file to a page somebody chose to visit.
+#
+# The order matters. The archive is verified with a key generated and thrown away inside the job — installed
+# from over `file://`, then tampered with to prove the check is real — before the private key is ever imported.
+# A malformed `Release` is a red check here rather than a broken `apt-get update` on somebody's machine.
+name: apt
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release whose packages to serve. The newest one if left blank.
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # One at a time, and never cancelled halfway: a half-published archive is one where `Release` names hashes for
+  # files that are not there yet.
+  group: apt
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-24.04
+    outputs:
+      signed: ${{ steps.sign.outputs.signed }}
+      version: ${{ steps.collect.outputs.version }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      # The packages come from the release rather than from a build here. The archive must serve the same bytes
+      # people downloaded from the release page; building them again would serve something nobody has tested.
+      - name: Collect the packages
+        id: collect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASKED: ${{ inputs.tag || github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          tag=$ASKED
+          if [ -z "$tag" ]; then
+            tag=$(gh release view --json tagName -q .tagName --repo "$GITHUB_REPOSITORY")
+          fi
+          mkdir -p debs
+          gh release download "$tag" --pattern '*.deb' --dir debs --repo "$GITHUB_REPOSITORY"
+          ls -l debs
+          # A release with no packages attached is a release the Release workflow has not finished for, and
+          # publishing an archive that drops a version is worse than publishing nothing.
+          test -n "$(ls debs/*.deb 2>/dev/null)" || { echo "$tag has no .deb assets"; exit 1; }
+          version=$(basename "$(ls debs/flowlight_*.deb | head -1)" | cut -d_ -f2)
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "serving $version from $tag"
+
+      - name: Build the archive
+        run: ./packaging/apt/build.sh debs archive "${{ steps.collect.outputs.version }}"
+
+      # The part that makes the rest worth trusting: a key made here, used here, and gone when the job ends,
+      # signing a copy of the archive that apt is then made to install from.
+      - name: Prove apt will take it
+        run: |
+          set -euo pipefail
+          GNUPGHOME=$(mktemp -d); chmod 700 "$GNUPGHOME"; export GNUPGHOME
+          gpg --batch --pinentry-mode loopback --passphrase '' \
+            --quick-generate-key "Flowlight CI (throwaway) <ci@invalid>" ed25519 sign never
+          cp -r archive proof
+          ./packaging/apt/sign.sh proof
+
+          sudo install -d -m 0755 /etc/apt/keyrings
+          sudo install -m 644 proof/flowlight-archive-keyring.asc /etc/apt/keyrings/flowlight-proof.asc
+          echo "deb [signed-by=/etc/apt/keyrings/flowlight-proof.asc] file://$PWD/proof stable main" \
+            | sudo tee /etc/apt/sources.list.d/flowlight-proof.list
+
+          sudo apt-get update
+          apt-cache policy flowlight flowlight-gui
+          # From the archive, not from a file path: this is the command the repository exists to make work.
+          sudo apt-get install -y -qq flowlight
+          test -x /usr/sbin/flowlightd
+          /usr/sbin/flowlightd --version
+          if systemctl is-enabled flowlightd >/dev/null 2>&1; then
+            echo "the unit is enabled; it must not be"; exit 1
+          fi
+          sudo apt-get remove -y -qq flowlight
+
+          # And the check is real. One byte appended to the package the index promised a hash for, and apt
+          # must refuse it — otherwise everything above proves only that apt fetched a file.
+          printf '\0' >>"$(ls proof/pool/main/f/flowlight/flowlight_*_amd64.deb | head -1)"
+          # Emptied, or apt would install the copy it already has and the test would pass for the wrong reason.
+          sudo apt-get clean
+          if sudo apt-get install -y -qq flowlight 2>/tmp/tampered; then
+            echo "apt installed a package whose hash does not match; the archive is not verifying anything"
+            exit 1
+          fi
+          grep -qi 'hash sum mismatch\|mismatch\|size mismatch' /tmp/tampered \
+            || { echo "apt refused it for some other reason:"; cat /tmp/tampered; exit 1; }
+          echo "the hash in Release is enforced, not decoration"
+
+          sudo rm -f /etc/apt/sources.list.d/flowlight-proof.list /etc/apt/keyrings/flowlight-proof.asc
+          rm -rf proof "$GNUPGHOME"
+
+      # Only now, and only if there is one. Nothing is published unsigned: apt refuses an unsigned archive by
+      # default, and the way around that — `[trusted=yes]` — teaches somebody to turn off the check that makes
+      # the repository worth having.
+      - name: Sign it
+        id: sign
+        env:
+          KEY: ${{ secrets.GPG_SIGNING_KEY }}
+          PASSPHRASE: ${{ secrets.GPG_SIGNING_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEY:-}" ]; then
+            echo "signed=false" >>"$GITHUB_OUTPUT"
+            {
+              echo "### The archive was built and verified, and not published"
+              echo
+              echo "There is no \`GPG_SIGNING_KEY\` secret, so there is nothing to sign with, and an unsigned"
+              echo "archive is one apt refuses. Creating that key is a decision for whoever people would be"
+              echo "trusting — see \`packaging/apt/README.md\`."
+            } >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          GNUPGHOME=$(mktemp -d); chmod 700 "$GNUPGHOME"; export GNUPGHOME
+          echo "$KEY" | gpg --batch --import
+          if [ -n "${PASSPHRASE:-}" ]; then
+            echo "pinentry-mode loopback" >>"$GNUPGHOME/gpg.conf"
+            echo "passphrase-file $GNUPGHOME/passphrase" >>"$GNUPGHOME/gpg.conf"
+            printf '%s' "$PASSPHRASE" >"$GNUPGHOME/passphrase"
+            chmod 600 "$GNUPGHOME/passphrase"
+          fi
+          ./packaging/apt/sign.sh archive
+          # Verified before it goes out, because a signature nobody checked is a file with armour on it.
+          gpg --batch --verify archive/dists/stable/InRelease
+          gpg --batch --verify archive/dists/stable/Release.gpg archive/dists/stable/Release
+          echo "signed=true" >>"$GITHUB_OUTPUT"
+          rm -rf "$GNUPGHOME"
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        if: steps.sign.outputs.signed == 'true'
+        with:
+          path: archive
+
+  publish:
+    needs: archive
+    if: needs.archive.outputs.signed == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      # The one job that publishes, and the only one holding these.
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+      - name: Say what is now installable
+        run: |
+          echo "### Flowlight ${{ needs.archive.outputs.version }} is in the archive" >>"$GITHUB_STEP_SUMMARY"
+          echo "" >>"$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.deploy.outputs.page_url }}" >>"$GITHUB_STEP_SUMMARY"

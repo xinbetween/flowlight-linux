@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flowlight for Linux — apt repository</title>
+<style>
+  :root { color-scheme: light dark; --ink: #16181d; --paper: #fbfbfa; --quiet: #5c6169; --line: #e3e3e0; --code: #f2f2ef; }
+  @media (prefers-color-scheme: dark) {
+    :root { --ink: #e8e8e6; --paper: #14161a; --quiet: #9aa0a8; --line: #2a2d33; --code: #1d2025; }
+  }
+  body { margin: 0 auto; padding: 3rem 1rem 6rem; max-width: 46rem; background: var(--paper); color: var(--ink);
+         font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.05rem; margin: 2.5rem 0 .5rem; }
+  p.lede { color: var(--quiet); margin: 0 0 2rem; }
+  pre { background: var(--code); border: 1px solid var(--line); border-radius: 6px; padding: .9rem 1rem;
+        overflow-x: auto; font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  code { font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  aside { border-left: 3px solid var(--line); padding: .1rem 0 .1rem 1rem; color: var(--quiet); margin: 1.5rem 0; }
+  footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--line); color: var(--quiet); font-size: .9rem; }
+  a { color: inherit; }
+</style>
+</head>
+<body>
+<h1>Flowlight for Linux</h1>
+<p class="lede">An apt repository, currently carrying <strong>@VERSION@</strong> for amd64 and arm64.</p>
+
+<h2>Adding it</h2>
+<pre>sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://xinbetween.github.io/flowlight-linux/flowlight-archive-keyring.asc \
+  | sudo tee /etc/apt/keyrings/flowlight.asc >/dev/null
+
+echo "deb [signed-by=/etc/apt/keyrings/flowlight.asc] \
+https://xinbetween.github.io/flowlight-linux stable main" \
+  | sudo tee /etc/apt/sources.list.d/flowlight.list >/dev/null
+
+sudo apt-get update
+sudo apt-get install flowlight        # the daemon
+sudo apt-get install flowlight-gui    # and the window, if this machine has a desktop</pre>
+
+<aside>
+  <p><strong>It installs and does not start.</strong> A tool that reads every HTTPS request on a machine should
+  not begin doing that because somebody installed a package, so the systemd unit ships disabled. When you want
+  it: <code>sudo systemctl enable --now flowlightd</code>.</p>
+</aside>
+
+<h2>What you are agreeing to</h2>
+<p>Adding a third-party repository trusts whoever holds this key, for as long as that line is in your sources,
+on every <code>apt-get update</code>, for every package it offers. That is a larger thing to agree to than
+downloading one file and checking it once — so the <code>.deb</code> files on each
+<a href="https://github.com/xinbetween/flowlight-linux/releases">release page</a> stay a first-class way to
+install, and this page exists for the people who would rather their machine told them about an update than not.</p>
+
+<p><code>signed-by</code> is not optional in the line above. It binds the key to this archive; a key dropped into
+<code>/etc/apt/trusted.gpg.d</code> would be trusted for every repository on the machine, which is not what
+anybody means by adding one.</p>
+
+<h2>The key</h2>
+<pre>@FINGERPRINT@</pre>
+<p>Served as <a href="flowlight-archive-keyring.asc">flowlight-archive-keyring.asc</a>. The archive holds the
+current version; older ones stay on their release pages.</p>
+
+<footer>
+  GPL-3.0 · <a href="https://github.com/xinbetween/flowlight-linux">source</a> ·
+  <a href="https://github.com/xinbetween/flowlight">the macOS build</a>
+</footer>
+</body>
+</html>

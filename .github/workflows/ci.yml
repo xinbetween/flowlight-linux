@@ -113,6 +113,24 @@ jobs:
           test ! -x /usr/sbin/flowlightd
           echo "the package installs, does not start itself, and comes off again"
 
+      # The archive that apt reads, built from the packages just built. Signing needs a key that exists in one
+      # place and installing from it is the `apt` workflow's job; what is checked here is the part that needs
+      # nothing — that the index names every package with the hash it actually has.
+      - name: Build the apt archive
+        run: |
+          set -euo pipefail
+          ./packaging/apt/build.sh target/deb /tmp/archive 0.0.0-ci
+          test -f /tmp/archive/dists/stable/Release
+          test -f /tmp/archive/index.html
+          grep -q '^Package: flowlight$' /tmp/archive/dists/stable/main/binary-amd64/Packages
+          # Every Filename resolves and every SHA256 is the file's own, checked rather than assumed: an index
+          # that names a hash nothing has is an archive that fails on somebody else's machine.
+          ( cd /tmp/archive && awk '/^Filename: /{f=$2} /^SHA256: /{print $2"  "f}' \
+              dists/stable/main/binary-amd64/Packages | sha256sum --check --strict )
+          ( cd /tmp/archive/dists/stable && awk '/^SHA256:/{on=1;next} /^[A-Za-z]/{on=0} on{print $1"  "$3}' \
+              Release | sha256sum --check --strict )
+          echo "the archive's index and Release agree with what is in the pool"
+
       - name: Attribute and read a real request
         env:
           # `gh` is written in Go, so its TLS is linked into its own binary and Flowlight cannot read it.
