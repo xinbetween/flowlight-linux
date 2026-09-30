@@ -20,8 +20,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  BPF_LINKER_VERSION: v0.11.1
-  BPF_LINKER_SHA256: 5cfcd0ba5f1cd9d44fc6bbeb5e1a19c22b0e97ff0f6b1e0d4ad0bd5e9f2ae56f
+  BPF_LINKER_VERSION: 0.11.1
 
 jobs:
   packages:
@@ -33,8 +32,14 @@ jobs:
           # somebody else's schedule is what this project cannot absorb quietly.
           - runner: ubuntu-24.04
             architecture: amd64
+            target: x86_64-unknown-linux-musl
+            # The linker's own published binary, with its hash. It turns our code into the bytecode the
+            # kernel's verifier judges, so a substitution here is a substitution in what the kernel runs.
+            linker_sha256: e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8
           - runner: ubuntu-24.04-arm
             architecture: arm64
+            target: aarch64-unknown-linux-musl
+            linker_sha256: 341ec1c595496877cae2b073544c2226d78a922739632b5732dbaa48507f1380
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -54,12 +59,20 @@ jobs:
           rustup default stable
           rustup toolchain install nightly --profile minimal --component rust-src
 
+      # The published binary for this architecture, with its hash — the same way CI does it. `cargo install`
+      # was tried first and does not work: it builds against a matching LLVM, which is not on the runner, and
+      # the failure is `could not find llvm-config`. Installing an LLVM to build a linker that is already
+      # published is work for nothing.
       - name: Install bpf-linker
         run: |
           set -euo pipefail
-          # From source on this one: the prebuilt binary is published for x86_64 only, and this also runs on
-          # arm64. It costs minutes rather than seconds, which a release can afford and CI cannot.
-          cargo install bpf-linker --version 0.11.1 --locked
+          url="https://github.com/aya-rs/bpf-linker/releases/download/v${BPF_LINKER_VERSION}/bpf-linker-${{ matrix.target }}.tar.zst"
+          curl -fsSL -o /tmp/bpf-linker.tar.zst "$url"
+          echo "${{ matrix.linker_sha256 }}  /tmp/bpf-linker.tar.zst" | sha256sum --check --strict
+          mkdir -p "$HOME/.local/bin"
+          tar -xpf /tmp/bpf-linker.tar.zst -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/bpf-linker" --version
 
       - name: Build
         run: cargo build --release --package flowlight-daemon --package flowlight-gui
