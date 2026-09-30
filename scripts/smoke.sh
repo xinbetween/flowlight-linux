@@ -81,6 +81,21 @@ await() {
 await "reading openssl"
 await "interface socket at"
 
+# The same idea for the database rather than the log: a question derived from stored traffic has to wait for
+# that traffic to be stored. The daemon writes a partial batch once a second, which is fast and is not
+# instant, and asking a moment too early is how a correct answer looks like an empty one.
+await_stored() {
+    local filter=$1 seconds=${2:-20}
+    for _ in $(seq "$((seconds * 4))"); do
+        if ask '{"op":"requests","since":900,"limit":400}' | jq -e "[.ok[] | select($filter)] | length > 0" \
+            >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.25
+    done
+    fail "the database never held a request matching $filter."
+}
+
 # The interface. An ephemeral port, because a fixed one is a fixed way for this to fail on a machine that
 # happens to be using it.
 url=$(grep -o 'http://127\.0\.0\.1:[0-9]*/?token=[0-9a-f]*' "$log" | head -1)
@@ -183,6 +198,8 @@ if curl -sS --max-time 8 "https://$blocked_address/" -o /dev/null 2>/dev/null; t
     # everything it starts, before the child can run.
     # Asked before it is written, which is the path the window's button takes: it shows what the rule would
     # have changed and only writes it if somebody says yes.
+    # Derived from stored traffic, so wait for the traffic to be stored first.
+    await_stored ".host == \"$target_host\" and .method == \"GET\""
     simulated=$(ask "{\"op\":\"simulate\",\"action\":\"block\",\"subject\":\"$target_host\",\"since\":600}")
     echo "$simulated"
     printf '%s' "$simulated" \
