@@ -6,6 +6,7 @@ members = [
     "crates/flowlight-ask",
     "crates/flowlight-common",
     "crates/flowlight-daemon",
+    "crates/flowlight-devices",
     "crates/flowlight-ebpf",
     "crates/flowlight-owners",
     "crates/flowlight-proxy",
@@ -23,6 +24,7 @@ default-members = [
     "crates/flowlight-alerts",
     "crates/flowlight-ask",
     "crates/flowlight-common",
+    "crates/flowlight-devices",
     "crates/flowlight-owners",
     "crates/flowlight-proxy",
     "crates/flowlight-rules",
@@ -30,7 +32,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.4.6"
+version = "0.4.7"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/xinbetween/flowlight-linux"
@@ -40,6 +42,7 @@ rust-version = "1.87"
 [workspace.dependencies]
 flowlight-alerts = { path = "crates/flowlight-alerts" }
 flowlight-ask = { path = "crates/flowlight-ask" }
+flowlight-devices = { path = "crates/flowlight-devices" }
 flowlight-owners = { path = "crates/flowlight-owners" }
 flowlight-proxy = { path = "crates/flowlight-proxy" }
 flowlight-common = { path = "crates/flowlight-common", default-features = false }

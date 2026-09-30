@@ -133,6 +133,17 @@ pub enum Request {
     },
     /// Every guardrail, with how often each has refused something.
     Guardrails,
+    /// What is attached by something other than the network.
+    Devices {
+        /// Everything ever seen, rather than only what is attached now.
+        #[serde(default)]
+        all: bool,
+    },
+    /// Start or stop watching the channels that are not the network.
+    SetDevices {
+        /// Whether to watch.
+        watching: bool,
+    },
     /// Traffic sliced one way, and the processes that do not look like the rest.
     Report {
         /// `process`, `host`, `address` or `protocol`.
@@ -497,7 +508,8 @@ fn handle(
         | Request::ForgetMock { .. }
         | Request::WriteGuardrail { .. }
         | Request::ForgetGuardrail { .. }
-        | Request::SetOwners { .. } => Store::open(database)?,
+        | Request::SetOwners { .. }
+        | Request::SetDevices { .. } => Store::open(database)?,
         _ => Store::open_read_only(database)?,
     };
 
@@ -544,6 +556,13 @@ fn handle(
             crate::history::authority_paths(database, certificates),
         )?)?,
         Request::Guardrails => serde_json::to_string(&crate::views::guardrails(&mut store)?)?,
+        Request::Devices { all } => {
+            serde_json::to_string(&crate::views::devices(&mut store, all)?)?
+        }
+        Request::SetDevices { watching } => {
+            store.set_watching_devices(watching)?;
+            serde_json::to_string(&crate::views::devices(&mut store, false)?)?
+        }
         Request::Report { by, since, limit } => serde_json::to_string(&crate::views::report(
             &mut store,
             &by,

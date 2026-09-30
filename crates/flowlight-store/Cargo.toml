@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 flowlight-alerts.workspace = true
+flowlight-devices.workspace = true
 flowlight-rules.workspace = true
 anyhow.workspace = true
 rusqlite = { version = "0.40", features = ["bundled"] }

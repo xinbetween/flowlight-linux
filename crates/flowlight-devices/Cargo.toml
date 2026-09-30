@@ -1,0 +1,15 @@
+[package]
+name = "flowlight-devices"
+description = "The channels that are not the network: what is attached over USB, what is paired over Bluetooth, and what has been mounted."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+
+[lints]
+workspace = true
