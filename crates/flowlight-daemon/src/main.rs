@@ -21,6 +21,7 @@ mod http2;
 mod intercepting;
 mod launching;
 mod libraries;
+mod owning;
 mod payload;
 mod record;
 mod spending;
@@ -89,6 +90,12 @@ const RULES: Duration = Duration::from_secs(2);
 
 /// Where cgroup v2 is mounted on anything current.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// How often Flowlight asks who operates an address it has connected to.
+///
+/// A minute, and four addresses at a time. Slower than anything else here on purpose: this is the one pass
+/// that tells a third party something.
+const OWNERS: Duration = Duration::from_secs(60);
 
 /// How often the machine is scanned for agents that have started.
 ///
@@ -404,6 +411,21 @@ enum Command {
     },
     /// Every guardrail, with how often each has refused something.
     Guardrails,
+    /// Who operates the addresses this machine has reached.
+    ///
+    /// Off until it is asked for: it is the one thing Flowlight does that tells a third party anything. With
+    /// no options, says what asking would mean and what is already known.
+    Owners {
+        /// Start asking.
+        #[arg(long)]
+        on: bool,
+        /// Stop asking. What has already been learnt is kept.
+        #[arg(long)]
+        off: bool,
+        /// How far back to look: `30m`, `6h`, `2d`, or a number of seconds.
+        #[arg(long, value_name = "WINDOW", default_value = "24h")]
+        since: String,
+    },
     /// Remove a guardrail.
     ForgetGuardrail {
         /// The identifier, as `guardrails` prints it.
@@ -1001,6 +1023,8 @@ fn run(
     let mut next_rules = Instant::now();
     let export_every = Duration::from_secs(args.export_seconds.max(1));
     let mut next_export = Instant::now() + export_every;
+    let mut next_owners = Instant::now() + OWNERS;
+    let owners = flowlight_owners::Lookup::new();
     let mut next_agent_scan = Instant::now();
     let mut last_propagation = blocking::Propagation::default();
     let mut seen = 0_u64;
@@ -1165,6 +1189,26 @@ fn run(
         }
 
         if let Some(store) = store.as_deref_mut()
+            && Instant::now() >= next_owners
+        {
+            next_owners = Instant::now() + OWNERS;
+            if store.owner_lookup().unwrap_or(false) {
+                let learnt = owning::pass(store, &owners, now());
+                if !learnt.is_quiet() {
+                    if learnt.named > 0 {
+                        eprintln!(
+                            "looked up who operates {} of {} address(es)",
+                            learnt.named, learnt.asked
+                        );
+                    }
+                    if let Some(failure) = &learnt.failure {
+                        eprintln!("could not look up who operates an address: {failure}");
+                    }
+                }
+            }
+        }
+
+        if let Some(store) = store.as_deref_mut()
             && Instant::now() >= next_export
         {
             // After the flush interval has had a chance to run, because what is in the batch is not yet in
@@ -1208,13 +1252,15 @@ fn run(
                 .min(next_flush)
                 .min(next_rules)
                 .min(next_agent_scan)
-                .min(next_export),
+                .min(next_export)
+                .min(next_owners),
             None => next_scan
                 .min(next_sweep)
                 .min(next_flush)
                 .min(next_rules)
                 .min(next_agent_scan)
-                .min(next_export),
+                .min(next_export)
+                .min(next_owners),
         };
         let timeout = until.saturating_duration_since(Instant::now());
 

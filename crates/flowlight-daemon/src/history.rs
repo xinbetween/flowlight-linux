@@ -55,6 +55,7 @@ pub fn run(
             | Command::Trust { .. }
             | Command::Guardrail { .. }
             | Command::ForgetGuardrail { .. }
+            | Command::Owners { .. }
     );
     if !writes && !database.exists() {
         bail!(
@@ -546,6 +547,53 @@ pub fn run(
                          `flowlightd intercept --agent {}` adds it.",
                         agent.trim(),
                         agent.trim()
+                    )?;
+                }
+            }
+        }
+        Command::Owners { on, off, since } => {
+            if *on {
+                store.set_owner_lookup(true)?;
+            }
+            if *off {
+                store.set_owner_lookup(false)?;
+            }
+            let window = parse_window(since)
+                .with_context(|| format!("reading `{since}` as a length of time"))?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs() as i64);
+            let view = crate::views::owners(&mut store, now - window)?;
+            if json {
+                writeln!(out, "{}", line(&view))?;
+            } else {
+                for sentence in &view.disclosure {
+                    writeln!(out, "{sentence}")?;
+                }
+                writeln!(
+                    out,
+                    "\n{}",
+                    if view.asking {
+                        "Asking."
+                    } else {
+                        "Not asking. `flowlightd owners --on` starts."
+                    }
+                )?;
+                if view.owners.is_empty() {
+                    writeln!(out, "Nothing is known yet about who operates what.")?;
+                }
+                for owner in &view.owners {
+                    writeln!(
+                        out,
+                        "  AS{:<8} {:<40} {} address(es), {} connection(s)",
+                        owner.asn, owner.name, owner.addresses, owner.connections
+                    )?;
+                }
+                if view.unknown > 0 {
+                    writeln!(
+                        out,
+                        "\n{} address(es) nobody has looked up yet.",
+                        view.unknown
                     )?;
                 }
             }

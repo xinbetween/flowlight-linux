@@ -845,6 +845,58 @@ pub fn write_guardrail(
     })
 }
 
+/// Who operates the addresses this machine has reached.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OwnersView {
+    /// Whether Flowlight is asking.
+    pub asking: bool,
+    /// Where it would ask.
+    pub resolver: String,
+    /// What asking means, in sentences.
+    pub disclosure: Vec<String>,
+    /// Who was found, busiest first.
+    pub owners: Vec<OwnerView>,
+    /// How many addresses nobody has looked up yet.
+    pub unknown: usize,
+}
+
+/// One operator.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OwnerView {
+    /// The autonomous system number.
+    pub asn: u32,
+    /// Who it belongs to.
+    pub name: String,
+    /// How many of their addresses were reached.
+    pub addresses: i64,
+    /// How many connections went to them.
+    pub connections: i64,
+}
+
+/// Who operates what, described.
+pub fn owners(store: &mut Store, since: i64) -> Result<OwnersView> {
+    let resolver = flowlight_owners::lookup::resolver().map_or_else(
+        || "a public resolver".to_owned(),
+        |address| address.to_string(),
+    );
+    Ok(OwnersView {
+        asking: store.owner_lookup()?,
+        disclosure: crate::owning::disclose(&resolver),
+        resolver,
+        owners: store
+            .owners(since)?
+            .into_iter()
+            .map(|row| OwnerView {
+                asn: row.asn,
+                name: row.name,
+                addresses: row.addresses,
+                connections: row.connections,
+            })
+            .collect(),
+        unknown: store.addresses_without_owners(since, 1_000)?.len(),
+    })
+}
+
 /// One thing a candidate rule would change.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ChangeView {

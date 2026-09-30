@@ -281,6 +281,19 @@ pub struct Coverage {
     pub unprobed: Vec<Note>,
 }
 
+/// One operator, and how much of this machine's traffic went to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerRow {
+    /// The autonomous system number.
+    pub asn: u32,
+    /// Who it belongs to.
+    pub name: String,
+    /// How many distinct addresses of theirs were reached.
+    pub addresses: i64,
+    /// How many connections went to them.
+    pub connections: i64,
+}
+
 /// One bucket of a series over time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeriesRow {
@@ -421,7 +434,7 @@ impl Store {
     }
 
     /// The schema this version of the code expects.
-    pub const SCHEMA: i64 = 10;
+    pub const SCHEMA: i64 = 11;
 
     /// Creates the schema, or brings an older one up to it.
     ///
@@ -480,6 +493,12 @@ impl Store {
             CREATE TABLE IF NOT EXISTS intercept (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS owners (
+                address TEXT PRIMARY KEY,
+                asn     INTEGER NOT NULL,
+                name    TEXT    NOT NULL,
+                at      INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS guardrails (
                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1287,6 +1306,87 @@ impl Store {
     /// Writes the interception configuration.
     pub fn set_intercept(&mut self, intercept: &Intercept) -> Result<()> {
         intercept::write(&self.connection, intercept)
+    }
+
+    /// Whether Flowlight may ask who operates an address.
+    ///
+    /// Off until somebody says otherwise. It is the one thing here that tells a third party anything.
+    pub fn owner_lookup(&self) -> Result<bool> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'owner-lookup'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .is_some_and(|value| value == "1"))
+    }
+
+    /// Turns it on or off.
+    pub fn set_owner_lookup(&mut self, wanted: bool) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('owner-lookup', ?1)",
+            params![if wanted { "1" } else { "0" }],
+        )?;
+        Ok(())
+    }
+
+    /// Who operates an address, if anybody has said.
+    pub fn owner(&self, address: &str) -> Result<Option<(u32, String)>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT asn, name FROM owners WHERE address = ?1",
+                params![address],
+                |row| Ok((row.get::<_, i64>(0)? as u32, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Writes who operates an address.
+    pub fn set_owner(&mut self, address: &str, asn: u32, name: &str, now: i64) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO owners (address, asn, name, at) VALUES (?1, ?2, ?3, ?4)",
+            params![address, i64::from(asn), name, now],
+        )?;
+        Ok(())
+    }
+
+    /// Addresses that have been connected to and whose operator nobody has looked up.
+    ///
+    /// Busiest first, so that a ceiling on how many are asked about spends the questions on the addresses
+    /// somebody is most likely to be asking about.
+    pub fn addresses_without_owners(&mut self, since: i64, limit: usize) -> Result<Vec<String>> {
+        self.flush()?;
+        let mut statement = self.connection.prepare(
+            "SELECT c.destination, count(*) AS seen FROM connections c
+             LEFT JOIN owners o ON o.address = c.destination
+             WHERE c.at >= ?1 AND c.destination IS NOT NULL AND c.destination != '' AND o.address IS NULL
+             GROUP BY c.destination ORDER BY seen DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![since, limit as i64], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every operator known, with how many addresses each was seen at.
+    pub fn owners(&mut self, since: i64) -> Result<Vec<OwnerRow>> {
+        self.flush()?;
+        let mut statement = self.connection.prepare(
+            "SELECT o.asn, o.name, count(DISTINCT c.destination), count(*)
+             FROM connections c JOIN owners o ON o.address = c.destination
+             WHERE c.at >= ?1 AND o.asn != 0
+             GROUP BY o.asn, o.name ORDER BY count(*) DESC",
+        )?;
+        let rows = statement.query_map(params![since], |row| {
+            Ok(OwnerRow {
+                asn: row.get::<_, i64>(0)? as u32,
+                name: row.get(1)?,
+                addresses: row.get(2)?,
+                connections: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Every guardrail, in the order they are tried.
@@ -2153,7 +2253,114 @@ mod tests {
         assert!(!store.intercept().unwrap().enabled);
         assert!(store.mocks().unwrap().is_empty());
         assert!(store.guardrails().unwrap().is_empty());
+        assert_eq!(store.owner("1.1.1.1").unwrap(), None);
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    // Owners
+
+    fn connection(at: i64, process: &str, destination: &str) -> ConnectionRow {
+        ConnectionRow {
+            at,
+            process: process.to_owned(),
+            confidence: "path".to_owned(),
+            pid: 1,
+            agent: None,
+            destination: Some(destination.to_owned()),
+            port: 443,
+            blocked: false,
+        }
+    }
+
+    /// Off until somebody says otherwise, because it is the one thing here that tells a third party
+    /// anything.
+    #[test]
+    fn looking_up_an_owner_is_off_until_it_is_asked_for() {
+        let mut store = Store::in_memory().unwrap();
+        assert!(!store.owner_lookup().unwrap());
+        store.set_owner_lookup(true).unwrap();
+        assert!(store.owner_lookup().unwrap());
+        store.set_owner_lookup(false).unwrap();
+        assert!(!store.owner_lookup().unwrap());
+    }
+
+    #[test]
+    fn an_owner_written_is_an_owner_read_back() {
+        let mut store = Store::in_memory().unwrap();
+        assert_eq!(store.owner("1.1.1.1").unwrap(), None);
+        store
+            .set_owner("1.1.1.1", 13335, "Cloudflare, Inc.", 1_000)
+            .unwrap();
+        assert_eq!(
+            store.owner("1.1.1.1").unwrap(),
+            Some((13335, "Cloudflare, Inc.".to_owned()))
+        );
+    }
+
+    /// A ceiling on how many addresses are asked about should spend its questions on the ones somebody is
+    /// most likely to be asking about.
+    #[test]
+    fn the_addresses_nobody_has_looked_up_come_back_busiest_first() {
+        let mut store = Store::in_memory().unwrap();
+        for _ in 0..3 {
+            store
+                .record_connection(connection(1_000, "curl", "1.1.1.1"))
+                .unwrap();
+        }
+        store
+            .record_connection(connection(1_000, "curl", "8.8.8.8"))
+            .unwrap();
+        store.flush().unwrap();
+
+        assert_eq!(
+            store.addresses_without_owners(0, 10).unwrap(),
+            vec!["1.1.1.1".to_owned(), "8.8.8.8".to_owned()]
+        );
+        // One that is known is not asked about again.
+        store
+            .set_owner("1.1.1.1", 13335, "Cloudflare, Inc.", 1_000)
+            .unwrap();
+        assert_eq!(
+            store.addresses_without_owners(0, 10).unwrap(),
+            vec!["8.8.8.8".to_owned()]
+        );
+    }
+
+    #[test]
+    fn owners_are_counted_by_how_much_went_to_them() {
+        let mut store = Store::in_memory().unwrap();
+        for _ in 0..2 {
+            store
+                .record_connection(connection(1_000, "curl", "1.1.1.1"))
+                .unwrap();
+        }
+        store
+            .record_connection(connection(1_000, "curl", "1.0.0.1"))
+            .unwrap();
+        store
+            .record_connection(connection(1_000, "curl", "8.8.8.8"))
+            .unwrap();
+        store.flush().unwrap();
+        store
+            .set_owner("1.1.1.1", 13335, "Cloudflare, Inc.", 1_000)
+            .unwrap();
+        store
+            .set_owner("1.0.0.1", 13335, "Cloudflare, Inc.", 1_000)
+            .unwrap();
+        store
+            .set_owner("8.8.8.8", 15169, "Google LLC", 1_000)
+            .unwrap();
+        // This network is not an operator, and counting it would put it at the top of every list.
+        store
+            .set_owner("10.0.0.1", 0, "this network", 1_000)
+            .unwrap();
+
+        let owners = store.owners(0).unwrap();
+        assert_eq!(owners.len(), 2);
+        assert_eq!(owners[0].name, "Cloudflare, Inc.");
+        assert_eq!(owners[0].addresses, 2);
+        assert_eq!(owners[0].connections, 3);
+        assert_eq!(owners[1].name, "Google LLC");
     }
 
     // Guardrails
