@@ -11,6 +11,7 @@
 //! Needs root, or `CAP_BPF` and `CAP_PERFMON`. There is no version of loading a probe that does not.
 
 mod agent;
+mod alerting;
 mod asking;
 mod blocking;
 mod client;
@@ -90,6 +91,12 @@ const RULES: Duration = Duration::from_secs(2);
 
 /// Where cgroup v2 is mounted on anything current.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// How often the closed hours and days are judged against what is usual.
+///
+/// A minute. The judging itself only happens when a window has closed, so this is how long after an hour ends
+/// that anything is said about it.
+const ALERTS: Duration = Duration::from_secs(60);
 
 /// How often Flowlight asks who operates an address it has connected to.
 ///
@@ -411,6 +418,21 @@ enum Command {
     },
     /// Every guardrail, with how often each has refused something.
     Guardrails,
+    /// What was noticed, and the numbers behind each of it.
+    ///
+    /// A spike against what a process usually moves, a host nothing had reached before, a port nothing usually
+    /// reaches, an agent that reached an address rather than a name, a connection a rule refused.
+    Alerts {
+        /// How far back to look: `30m`, `6h`, `2d`, or a number of seconds.
+        #[arg(long, value_name = "WINDOW", default_value = "24h")]
+        since: String,
+        /// At most this many.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Only the ones about agents.
+        #[arg(long)]
+        agents: bool,
+    },
     /// Who operates the addresses this machine has reached.
     ///
     /// Off until it is asked for: it is the one thing Flowlight does that tells a third party anything. With
@@ -1025,6 +1047,16 @@ fn run(
     let mut next_export = Instant::now() + export_every;
     let mut next_owners = Instant::now() + OWNERS;
     let owners = flowlight_owners::Lookup::new();
+    let mut next_alerts = Instant::now() + ALERTS;
+    // What has been seen before, read once. A host recorded before a restart is not new after one.
+    let mut noticing = store.as_deref_mut().map(|store| {
+        let seen = alerting::Seen::new(store, now());
+        let (hosts, processes) = seen.counts();
+        eprintln!(
+            "watching for anything unusual against {hosts} host(s) and {processes} process(es) already seen"
+        );
+        seen
+    });
     let mut next_agent_scan = Instant::now();
     let mut last_propagation = blocking::Propagation::default();
     let mut seen = 0_u64;
@@ -1188,6 +1220,17 @@ fn run(
             }
         }
 
+        if let (Some(store), Some(seen)) = (store.as_deref_mut(), noticing.as_mut())
+            && Instant::now() >= next_alerts
+        {
+            next_alerts = Instant::now() + ALERTS;
+            let said = seen.about_windows(store, now());
+            let kept = alerting::keep(store, &said, now());
+            for alert in said.iter().take(kept) {
+                eprintln!("{}", alerting::line(alert));
+            }
+        }
+
         if let Some(store) = store.as_deref_mut()
             && Instant::now() >= next_owners
         {
@@ -1253,14 +1296,16 @@ fn run(
                 .min(next_rules)
                 .min(next_agent_scan)
                 .min(next_export)
-                .min(next_owners),
+                .min(next_owners)
+                .min(next_alerts),
             None => next_scan
                 .min(next_sweep)
                 .min(next_flush)
                 .min(next_rules)
                 .min(next_agent_scan)
                 .min(next_export)
-                .min(next_owners),
+                .min(next_owners)
+                .min(next_alerts),
         };
         let timeout = until.saturating_duration_since(Instant::now());
 
@@ -1280,6 +1325,15 @@ fn run(
                 record.agent = agents.of(event.tgid);
                 if let Some(store) = store.as_deref_mut() {
                     keep(store.record_connection(record.stored(now())));
+                    if let Some(seen) = noticing.as_mut() {
+                        let alert = seen.about_refusal(
+                            &record.process,
+                            record.destination.as_deref().unwrap_or("an address"),
+                            record.port,
+                            record.agent.as_deref(),
+                        );
+                        let _ = store.record_alert(&alert, now());
+                    }
                 }
                 render(&mut stdout, args.json, &record, &record.human())?;
             }
@@ -1335,6 +1389,18 @@ fn run(
                 record.agent = agents.of(event.tgid);
                 if let Some(store) = store.as_deref_mut() {
                     keep(store.record_connection(record.stored(now())));
+                    if let Some(seen) = noticing.as_mut() {
+                        let said = seen.about_connection(
+                            &record.process,
+                            record.destination.as_deref().unwrap_or_default(),
+                            record.port,
+                            record.agent.as_deref(),
+                        );
+                        let kept = alerting::keep(store, &said, now());
+                        for alert in said.iter().take(kept) {
+                            eprintln!("{}", alerting::line(alert));
+                        }
+                    }
                 }
                 render(&mut stdout, args.json, &record, &record.human())?;
             }
@@ -1377,6 +1443,14 @@ fn run(
                     for record in &records {
                         if let Some(store) = store.as_deref_mut() {
                             keep(store.record_request(record.stored(now())));
+                            if let Some(seen) = noticing.as_mut() {
+                                let said =
+                                    seen.about_request(&record.process, record.host.as_deref());
+                                let kept = alerting::keep(store, &said, now());
+                                for alert in said.iter().take(kept) {
+                                    eprintln!("{}", alerting::line(alert));
+                                }
+                            }
                         }
                         render(&mut stdout, args.json, record, &record.human())?;
                     }

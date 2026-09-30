@@ -918,6 +918,42 @@ pub fn owners(store: &mut Store, since: i64) -> Result<OwnersView> {
     })
 }
 
+/// One thing that was noticed.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AlertView {
+    /// Its identifier.
+    pub id: i64,
+    /// When, in seconds since the epoch.
+    pub at: i64,
+    /// What sort of thing.
+    pub kind: String,
+    /// What it was about.
+    pub subject: String,
+    /// The sentence, with the arithmetic in it.
+    pub detail: String,
+    /// One to three.
+    pub severity: u8,
+    /// Whether this is about an agent rather than about any process.
+    pub about_an_agent: bool,
+}
+
+/// What was noticed recently, most recent first.
+pub fn alerts(store: &mut Store, since: i64, limit: usize) -> Result<Vec<AlertView>> {
+    Ok(store
+        .alerts_since(since, rows(limit))?
+        .into_iter()
+        .map(|row| AlertView {
+            about_an_agent: crate::alerting::about_an_agent(&row.kind),
+            id: row.id,
+            at: row.at,
+            kind: row.kind,
+            subject: row.subject,
+            detail: row.detail,
+            severity: row.severity,
+        })
+        .collect())
+}
+
 /// One thing a candidate rule would change.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ChangeView {

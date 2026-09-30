@@ -133,6 +133,15 @@ pub enum Request {
     },
     /// Every guardrail, with how often each has refused something.
     Guardrails,
+    /// What was noticed recently.
+    Alerts {
+        /// How far back, in seconds.
+        #[serde(default = "a_day")]
+        since: i64,
+        /// At most this many.
+        #[serde(default = "three_hundred")]
+        limit: usize,
+    },
     /// Who operates the addresses this machine has reached.
     Owners {
         /// How far back, in seconds.
@@ -513,6 +522,11 @@ fn handle(
             crate::history::authority_paths(database, certificates),
         )?)?,
         Request::Guardrails => serde_json::to_string(&crate::views::guardrails(&mut store)?)?,
+        Request::Alerts { since, limit } => serde_json::to_string(&crate::views::alerts(
+            &mut store,
+            crate::views::window(now, since),
+            limit,
+        )?)?,
         Request::Owners { since } => serde_json::to_string(&crate::views::owners(
             &mut store,
             crate::views::window(now, since),

@@ -281,6 +281,23 @@ pub struct Coverage {
     pub unprobed: Vec<Note>,
 }
 
+/// One thing that was noticed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertRow {
+    /// Its identifier.
+    pub id: i64,
+    /// When.
+    pub at: i64,
+    /// What sort of thing, as this or an older version wrote it.
+    pub kind: String,
+    /// What it was about.
+    pub subject: String,
+    /// The sentence, with the arithmetic in it.
+    pub detail: String,
+    /// One to three.
+    pub severity: u8,
+}
+
 /// One operator, and how much of this machine's traffic went to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerRow {
@@ -434,7 +451,7 @@ impl Store {
     }
 
     /// The schema this version of the code expects.
-    pub const SCHEMA: i64 = 11;
+    pub const SCHEMA: i64 = 12;
 
     /// Creates the schema, or brings an older one up to it.
     ///
@@ -493,6 +510,23 @@ impl Store {
             CREATE TABLE IF NOT EXISTS intercept (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS alerts (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                at       INTEGER NOT NULL,
+                kind     TEXT    NOT NULL,
+                subject  TEXT    NOT NULL,
+                detail   TEXT    NOT NULL,
+                severity INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS alerts_at ON alerts(at);
+            CREATE TABLE IF NOT EXISTS baselines (
+                metric   TEXT    NOT NULL,
+                subject  TEXT    NOT NULL,
+                mean     REAL    NOT NULL,
+                variance REAL    NOT NULL,
+                samples  INTEGER NOT NULL,
+                PRIMARY KEY (metric, subject)
             );
             CREATE TABLE IF NOT EXISTS owners (
                 address TEXT PRIMARY KEY,
@@ -1306,6 +1340,159 @@ impl Store {
     /// Writes the interception configuration.
     pub fn set_intercept(&mut self, intercept: &Intercept) -> Result<()> {
         intercept::write(&self.connection, intercept)
+    }
+
+    /// Writes down something worth saying.
+    ///
+    /// The same thing is not said twice in a row: an alert already recorded for this kind and subject within
+    /// the last hour is a repeat, and a list that repeats itself is one nobody reads to the bottom of.
+    pub fn record_alert(&mut self, alert: &flowlight_alerts::Alert, now: i64) -> Result<bool> {
+        let recent: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT at FROM alerts WHERE kind = ?1 AND subject = ?2 ORDER BY at DESC LIMIT 1",
+                params![alert.kind.as_str(), alert.subject],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if recent.is_some_and(|at| now - at < 3_600) {
+            return Ok(false);
+        }
+        self.connection.execute(
+            "INSERT INTO alerts (at, kind, subject, detail, severity) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                now,
+                alert.kind.as_str(),
+                alert.subject,
+                alert.detail,
+                i64::from(alert.severity)
+            ],
+        )?;
+        Ok(true)
+    }
+
+    /// What was noticed recently, most recent first.
+    pub fn alerts_since(&mut self, since: i64, limit: usize) -> Result<Vec<AlertRow>> {
+        self.flush()?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, at, kind, subject, detail, severity FROM alerts
+             WHERE at >= ?1 ORDER BY at DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![since, limit as i64], |row| {
+            Ok(AlertRow {
+                id: row.get(0)?,
+                at: row.get(1)?,
+                kind: row.get(2)?,
+                subject: row.get(3)?,
+                detail: row.get(4)?,
+                severity: row.get::<_, i64>(5)?.clamp(1, 3) as u8,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// What normal was for one thing, if anything has been recorded.
+    pub fn baseline(
+        &self,
+        metric: &str,
+        subject: &str,
+    ) -> Result<Option<flowlight_alerts::Baseline>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT mean, variance, samples FROM baselines WHERE metric = ?1 AND subject = ?2",
+                params![metric, subject],
+                |row| {
+                    Ok(flowlight_alerts::Baseline {
+                        mean: row.get(0)?,
+                        variance: row.get(1)?,
+                        samples: row.get::<_, i64>(2)?.max(0) as u32,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Writes what normal is now.
+    pub fn set_baseline(
+        &mut self,
+        metric: &str,
+        subject: &str,
+        baseline: flowlight_alerts::Baseline,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO baselines (metric, subject, mean, variance, samples)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                metric,
+                subject,
+                baseline.mean,
+                baseline.variance,
+                i64::from(baseline.samples)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Bytes each process moved in one window, for comparing against what it usually moves.
+    pub fn bytes_by_process(&mut self, since: i64, until: i64) -> Result<Vec<(String, i64)>> {
+        self.flush()?;
+        let mut statement = self.connection.prepare(
+            "SELECT process, coalesce(sum(bytes), 0) FROM requests
+             WHERE at >= ?1 AND at < ?2 GROUP BY process",
+        )?;
+        let rows =
+            statement.query_map(params![since, until], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// How many distinct hosts each process reached in one window.
+    pub fn hosts_by_process(&mut self, since: i64, until: i64) -> Result<Vec<(String, i64)>> {
+        self.flush()?;
+        let mut statement = self.connection.prepare(
+            "SELECT process, count(DISTINCT host) FROM requests
+             WHERE at >= ?1 AND at < ?2 AND host IS NOT NULL AND host != '' GROUP BY process",
+        )?;
+        let rows =
+            statement.query_map(params![since, until], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every host ever recorded, for deciding whether one is new.
+    ///
+    /// From the summary as well as the detail, or every host becomes new again the day its detail expires.
+    pub fn every_host(&mut self) -> Result<std::collections::BTreeSet<String>> {
+        self.flush()?;
+        let mut found = std::collections::BTreeSet::new();
+        for query in [
+            "SELECT DISTINCT host FROM requests WHERE host IS NOT NULL AND host != ''",
+            "SELECT DISTINCT host FROM daily_requests WHERE host != ''",
+        ] {
+            let mut statement = self.connection.prepare(query)?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for host in rows {
+                found.insert(host?.to_lowercase());
+            }
+        }
+        Ok(found)
+    }
+
+    /// Every process ever recorded, for deciding whether one is new.
+    pub fn every_process(&mut self) -> Result<std::collections::BTreeSet<String>> {
+        self.flush()?;
+        let mut found = std::collections::BTreeSet::new();
+        for query in [
+            "SELECT DISTINCT process FROM connections",
+            "SELECT DISTINCT process FROM requests",
+            "SELECT DISTINCT process FROM daily_requests",
+        ] {
+            let mut statement = self.connection.prepare(query)?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for process in rows {
+                found.insert(process?);
+            }
+        }
+        Ok(found)
     }
 
     /// Whether Flowlight may ask who operates an address.
@@ -2254,7 +2441,138 @@ mod tests {
         assert!(store.mocks().unwrap().is_empty());
         assert!(store.guardrails().unwrap().is_empty());
         assert_eq!(store.owner("1.1.1.1").unwrap(), None);
+        assert!(store.alerts_since(0, 10).unwrap().is_empty());
+        assert_eq!(store.baseline("bytes_hour", "x").unwrap(), None);
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    // Alerts
+
+    fn alert(kind: flowlight_alerts::Kind, subject: &str) -> flowlight_alerts::Alert {
+        flowlight_alerts::Alert {
+            kind,
+            subject: subject.to_owned(),
+            detail: "because of some numbers".to_owned(),
+            severity: 2,
+        }
+    }
+
+    #[test]
+    fn an_alert_written_is_an_alert_read_back() {
+        let mut store = Store::in_memory().unwrap();
+        assert!(
+            store
+                .record_alert(&alert(flowlight_alerts::Kind::VolumeSpike, "node"), 10_000)
+                .unwrap()
+        );
+        let rows = store.alerts_since(0, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "traffic spike");
+        assert_eq!(rows[0].subject, "node");
+        assert_eq!(rows[0].severity, 2);
+    }
+
+    /// A list that repeats itself is one nobody reads to the bottom of.
+    #[test]
+    fn the_same_thing_is_not_said_twice_within_an_hour() {
+        let mut store = Store::in_memory().unwrap();
+        let spike = alert(flowlight_alerts::Kind::VolumeSpike, "node");
+        assert!(store.record_alert(&spike, 10_000).unwrap());
+        assert!(!store.record_alert(&spike, 10_001).unwrap());
+        assert!(!store.record_alert(&spike, 13_000).unwrap());
+        // An hour later it is news again.
+        assert!(store.record_alert(&spike, 14_000).unwrap());
+        // And something else about the same subject is not a repeat.
+        assert!(
+            store
+                .record_alert(&alert(flowlight_alerts::Kind::NewProcess, "node"), 10_002)
+                .unwrap()
+        );
+        assert_eq!(store.alerts_since(0, 10).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn the_most_recent_alerts_come_back_first() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .record_alert(&alert(flowlight_alerts::Kind::NewProcess, "first"), 1_000)
+            .unwrap();
+        store
+            .record_alert(&alert(flowlight_alerts::Kind::NewProcess, "second"), 2_000)
+            .unwrap();
+        let rows = store.alerts_since(0, 10).unwrap();
+        assert_eq!(rows[0].subject, "second");
+        // And a window excludes what is older than it.
+        assert_eq!(store.alerts_since(1_500, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_baseline_written_is_a_baseline_read_back() {
+        let mut store = Store::in_memory().unwrap();
+        assert_eq!(store.baseline("bytes_hour", "node").unwrap(), None);
+        let baseline = flowlight_alerts::Baseline {
+            mean: 1_234.5,
+            variance: 99.0,
+            samples: 48,
+        };
+        store.set_baseline("bytes_hour", "node", baseline).unwrap();
+        assert_eq!(
+            store.baseline("bytes_hour", "node").unwrap(),
+            Some(baseline)
+        );
+        // A different metric about the same subject is a different baseline.
+        assert_eq!(store.baseline("hosts_day", "node").unwrap(), None);
+    }
+
+    #[test]
+    fn what_each_process_moved_and_reached_is_counted_for_a_window() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .record_request(request(1_000, "node", "a.example", 500))
+            .unwrap();
+        store
+            .record_request(request(1_100, "node", "b.example", 700))
+            .unwrap();
+        store
+            .record_request(request(9_000, "node", "c.example", 100))
+            .unwrap();
+        store
+            .record_request(request(1_200, "curl", "a.example", 50))
+            .unwrap();
+        store.flush().unwrap();
+
+        let bytes = store.bytes_by_process(0, 5_000).unwrap();
+        assert!(bytes.contains(&("node".to_owned(), 1_200)));
+        assert!(bytes.contains(&("curl".to_owned(), 50)));
+        let hosts = store.hosts_by_process(0, 5_000).unwrap();
+        assert!(hosts.contains(&("node".to_owned(), 2)));
+        // The window excludes what is outside it.
+        assert!(!bytes.iter().any(|(_, moved)| *moved == 100));
+    }
+
+    /// Or every host becomes new again the day its detail expires.
+    #[test]
+    fn a_host_remembered_only_in_the_summary_counts_as_known() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .record_request(request(1_000, "curl", "Old.Example", 10))
+            .unwrap();
+        store
+            .record_request(request(500_000, "curl", "new.example", 10))
+            .unwrap();
+        store
+            .sweep(
+                500_000,
+                Retention {
+                    detail_days: 1,
+                    summary_days: 30,
+                },
+            )
+            .unwrap();
+        let known = store.every_host().unwrap();
+        // Lowercased, so the same host by another spelling is not new again.
+        assert!(known.contains("old.example"), "{known:?}");
+        assert!(store.every_process().unwrap().contains("curl"));
     }
 
     // Owners
