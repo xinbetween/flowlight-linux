@@ -10,8 +10,14 @@
 name: apt
 
 on:
-  release:
-    types: [published]
+  # After the Release workflow finishes, rather than when the release is published. The packages are attached
+  # by that workflow, so a release exists for several minutes before it has any — and triggering on the
+  # release itself meant this ran immediately, found no assets, and stopped. That is exactly what happened to
+  # v0.4.8, and the failure was silent in the sense that mattered: the release page was fine and the archive
+  # nobody had looked at yet was a version behind.
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
@@ -29,6 +35,8 @@ concurrency:
 
 jobs:
   archive:
+    # A Release that failed has nothing worth serving and a cancelled one has half of it.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04
     outputs:
       signed: ${{ steps.sign.outputs.signed }}
@@ -42,10 +50,13 @@ jobs:
         id: collect
         env:
           GH_TOKEN: ${{ github.token }}
-          ASKED: ${{ inputs.tag || github.event.release.tag_name }}
+          ASKED: ${{ inputs.tag || github.event.workflow_run.head_branch }}
         run: |
           set -euo pipefail
           tag=$ASKED
+          # `Release` can be dispatched against a branch, and a branch is not a tag. Anything that does not
+          # look like a version is treated as "the newest release", which is what dispatching it means.
+          case "$tag" in v*) ;; *) tag="" ;; esac
           if [ -z "$tag" ]; then
             tag=$(gh release view --json tagName -q .tagName --repo "$GITHUB_REPOSITORY")
           fi
