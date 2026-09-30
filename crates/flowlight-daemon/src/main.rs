@@ -13,11 +13,13 @@
 mod agent;
 mod asking;
 mod blocking;
+mod client;
 mod control;
 mod exporting;
 mod history;
 mod http2;
 mod intercepting;
+mod launching;
 mod libraries;
 mod payload;
 mod record;
@@ -297,6 +299,24 @@ enum Command {
         #[arg(long)]
         off: bool,
     },
+    /// Start an agent so that Flowlight is already governing it before it runs.
+    ///
+    /// The one command here that must **not** be run as root: an agent started by root would run as root. It
+    /// talks to a running daemon over the interface socket, which it owns, and needs nothing else.
+    Launch {
+        /// What to call the agent. Worked out from the command when it is not given.
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
+        /// Print the variables an agent would be started with, and start nothing.
+        ///
+        /// For a launcher or a supervisor that starts the agent itself — a desktop entry, a systemd unit, a
+        /// session manager. The mark cannot be arranged that way, but the environment can.
+        #[arg(long)]
+        print_environment: bool,
+        /// The command, after `--`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
     /// Whether Flowlight terminates connections, and whose.
     ///
     /// The one thing here that changes what an application sees. Off, and off by default. With no options,
@@ -476,6 +496,10 @@ enum Message {
     Payload(Box<TlsChunk>),
     /// The proxy decided about a redirected connection.
     Intercepted(Box<intercepting::Happened>),
+    /// Something asked for a process to be marked as an agent's, and is waiting to hear whether it was.
+    Mark(Box<Marking>),
+    /// One reader thread stopped. When the last one does, nothing is watching the kernel.
+    ReaderStopped,
     /// The kernel had something to report and nowhere to put it.
     ///
     /// Carried rather than swallowed. A tool whose entire claim is "this is what your machine did" has to be
@@ -483,8 +507,32 @@ enum Message {
     Lost(u64),
 }
 
+/// A process to mark, and somewhere to say whether it was.
+///
+/// Answered rather than acknowledged: whoever asked is holding that process still until this comes back, and a
+/// mark that might have landed is no use to something whose promise is that it landed first.
+struct Marking {
+    /// The process.
+    pid: u32,
+    /// What it is working for.
+    agent: String,
+    /// Where the answer goes.
+    answer: std::sync::mpsc::Sender<Result<bool, String>>,
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    // Before everything else, and before the database is opened: this one runs as a person, asks a running
+    // daemon what it needs to know, and must not touch anything root owns.
+    if let Some(Command::Launch {
+        agent,
+        print_environment,
+        command,
+    }) = &args.command
+    {
+        return launch(&args, agent.as_deref(), *print_environment, command);
+    }
 
     if let Some(command) = &args.command {
         return history::run(command, &args.database, &args.certificates, args.json);
@@ -558,13 +606,15 @@ fn main() -> anyhow::Result<()> {
     }
 
     let (sender, receiver) = channel();
-    spawn_readers(&mut ebpf, "EVENTS", Kind::Connection, &sender)?;
+    let mut readers = spawn_readers(&mut ebpf, "EVENTS", Kind::Connection, &sender)?;
     if enforcing.is_some() {
-        spawn_readers(&mut ebpf, "BLOCK_EVENTS", Kind::Blocked, &sender)?;
+        readers += spawn_readers(&mut ebpf, "BLOCK_EVENTS", Kind::Blocked, &sender)?;
     }
     if !args.no_payloads {
-        spawn_readers(&mut ebpf, "TLS_EVENTS", Kind::Payload, &sender)?;
+        readers += spawn_readers(&mut ebpf, "TLS_EVENTS", Kind::Payload, &sender)?;
     }
+    // Kept for the control socket, which asks the loop to mark a process and waits for the answer.
+    let marking = sender.clone();
     // Interception, which is the one thing here that changes what an application sees. Attached after the
     // blocking programs on purpose: the kernel runs them in the order they were attached, blocking decides
     // about the address in the context and redirect changes it, so the other order would quietly disable
@@ -682,6 +732,7 @@ fn main() -> anyhow::Result<()> {
                 args.certificates.clone(),
                 owner,
                 hello,
+                marking,
             ) {
                 Ok(()) => eprintln!(
                     "interface socket at {}, owned by uid {}",
@@ -744,11 +795,69 @@ fn main() -> anyhow::Result<()> {
         &mut ebpf,
         &receiver,
         &args,
-        store.as_mut(),
-        enforcing.as_mut(),
-        spending.as_mut(),
-        intercepting.as_mut(),
+        Watching {
+            store: store.as_mut(),
+            enforcing: enforcing.as_mut(),
+            spending: spending.as_mut(),
+            intercepting: intercepting.as_mut(),
+            readers,
+        },
     )
+}
+
+/// Starts an agent, or says what starting one would set.
+fn launch(
+    args: &Args,
+    agent: Option<&str>,
+    print_environment: bool,
+    command: &[String],
+) -> anyhow::Result<()> {
+    let named = match (
+        agent,
+        flowlight_agents::launch::name_of(command, flowlight_agents::ancestry::KNOWN),
+    ) {
+        (Some(given), _) => given.trim().to_owned(),
+        (None, Some(worked_out)) => worked_out,
+        (None, None) => bail!(
+            "nothing to start and no agent named. `flowlightd launch -- claude`, or `--agent NAME \
+             --print-environment` to see what starting one would set."
+        ),
+    };
+    if named.is_empty() {
+        bail!("an agent needs a name");
+    }
+
+    let governing = launching::governing(&args.socket, &named)?;
+    let environment = flowlight_agents::launch::Environment::for_agent(
+        &named,
+        governing.bundle.as_deref(),
+        governing.terminated,
+    );
+
+    if print_environment {
+        // Only the variables, on standard output, because something else is reading them. Everything said to
+        // a person goes to standard error.
+        print!("{}", environment.as_lines());
+        for line in &environment.because {
+            eprintln!("{line}");
+        }
+        eprintln!(
+            "\nA process started with these is not marked as {named}'s: only starting it through \
+             `flowlightd launch` can do that, because the mark has to be in the kernel before it runs."
+        );
+        return Ok(());
+    }
+    if command.is_empty() {
+        bail!("nothing to start. `flowlightd launch -- claude`");
+    }
+
+    eprintln!("starting {named}, marked before it runs");
+    for line in &environment.because {
+        eprintln!("  {line}");
+    }
+    let status = launching::run(&args.socket, &named, command, &environment)?;
+    // Transparent: whatever started this sees what the agent exited with, not what Flowlight thinks of it.
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 /// What this machine is called, for the certificate authority's name.
@@ -791,11 +900,12 @@ fn spawn_readers(
     map: &str,
     kind: Kind,
     sender: &Sender<Message>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     let events = ebpf
         .take_map(map)
         .ok_or_else(|| anyhow!("the compiled program has no {map} map"))?;
     let mut perf: PerfEventArray<MapData> = PerfEventArray::try_from(events)?;
+    let mut started = 0;
     for cpu in online_cpus().map_err(|(path, err)| anyhow!("reading {path}: {err}"))? {
         let buffer = perf
             .open(cpu, Some(PERF_PAGES))
@@ -803,22 +913,50 @@ fn spawn_readers(
         let sender = sender.clone();
         std::thread::Builder::new()
             .name(format!("flowlight-{map}-{cpu}"))
-            .spawn(move || read_events(buffer, kind, &sender))
+            .spawn(move || {
+                read_events(buffer, kind, &sender);
+                // Announced rather than inferred from the channel closing. The control socket holds a sender
+                // of its own — it is a producer too — so the channel no longer closes when every reader has
+                // stopped, and "nothing is watching the kernel any more" has to be counted instead.
+                let _ = sender.send(Message::ReaderStopped);
+            })
             .with_context(|| format!("starting the {map} reader for CPU {cpu}"))?;
+        started += 1;
     }
-    Ok(())
+    Ok(started)
 }
 
 /// Prints what the readers send, and keeps looking for TLS libraries, until the caller's limits are reached.
+/// Everything the loop holds for as long as it runs.
+///
+/// A struct rather than five more parameters. `run` had eight and each release added one; a parameter list that
+/// long is one where two of them get swapped and nothing says so.
+struct Watching<'a> {
+    /// Where what is seen goes, unless nothing is being kept.
+    store: Option<&'a mut Store>,
+    /// The kernel's table of what to refuse, when rules are being enforced.
+    enforcing: Option<&'a mut Blocking>,
+    /// What Flowlight is allowed to read, held against the kernel.
+    spending: Option<&'a mut Spending>,
+    /// The redirect and the proxy, when interception is available.
+    intercepting: Option<&'a mut intercepting::Interception>,
+    /// How many threads are draining the kernel's buffers. When the last one stops, nothing is watching.
+    readers: usize,
+}
+
 fn run(
     ebpf: &mut Ebpf,
     receiver: &Receiver<Message>,
     args: &Args,
-    mut store: Option<&mut Store>,
-    mut enforcing: Option<&mut Blocking>,
-    mut spending: Option<&mut Spending>,
-    mut intercepting: Option<&mut intercepting::Interception>,
+    watching: Watching<'_>,
 ) -> anyhow::Result<()> {
+    let Watching {
+        mut store,
+        mut enforcing,
+        mut spending,
+        mut intercepting,
+        mut readers,
+    } = watching;
     let deadline = args
         .seconds
         .map(|seconds| Instant::now() + Duration::from_secs(seconds));
@@ -1066,6 +1204,28 @@ fn run(
                 }
                 render(&mut stdout, args.json, &record, &record.human())?;
             }
+            Ok(Message::Mark(asked)) => {
+                let answer = match enforcing.as_deref_mut() {
+                    Some(enforcing) => {
+                        // Written whether or not this process is already marked: `mark` returns whether it
+                        // changed anything, and what the caller needs to know is that the kernel now says so.
+                        enforcing.mark(asked.pid, &asked.agent);
+                        eprintln!(
+                            "{} (pid {}) was marked before it ran; rules scoped to it reach it and \
+                             everything it starts",
+                            asked.agent, asked.pid
+                        );
+                        Ok(true)
+                    }
+                    None => Err(
+                        "this daemon is not enforcing rules, so there is nowhere to write a mark. \
+                         Interception and agent-scoped rules both need it."
+                            .to_owned(),
+                    ),
+                };
+                let _ = asked.answer.send(answer);
+                continue;
+            }
             Ok(Message::Intercepted(happened)) => {
                 let (kind, subject, detail) = happened.describe();
                 let agent = agents.of(happened.tgid);
@@ -1139,6 +1299,13 @@ fn run(
                     // One buffer can complete more than one request, and each is a record.
                     seen += records.len() as u64 - 1;
                 }
+            }
+            Ok(Message::ReaderStopped) => {
+                readers = readers.saturating_sub(1);
+                if readers == 0 {
+                    bail!("every reader thread stopped; nothing is watching the kernel any more")
+                }
+                continue;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {

@@ -23,13 +23,14 @@
 //! second from one program — but because it can be read by a person, spoken by a shell script, and tested
 //! without linking anything.
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use flowlight_store::Store;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Sender, channel};
 
 /// Where the socket lives unless told otherwise.
 pub const DEFAULT_SOCKET: &str = "/run/flowlight/flowlight.sock";
@@ -120,6 +121,16 @@ pub enum Request {
         #[serde(flatten)]
         change: crate::views::InterceptChange,
     },
+    /// Tell the kernel that a process belongs to an agent, before it has run.
+    ///
+    /// The one request that changes something outside the database, so it is the one request that is checked
+    /// against who is asking: a process somebody else owns is not theirs to name.
+    Mark {
+        /// The process.
+        pid: u32,
+        /// What it is working for.
+        agent: String,
+    },
     /// Every canned answer.
     Mocks,
     /// Write a canned answer.
@@ -203,6 +214,7 @@ pub fn serve(
     certificates: PathBuf,
     owner: (u32, u32),
     hello: Hello,
+    marking: Sender<crate::Message>,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -224,7 +236,16 @@ pub fn serve(
 
     std::thread::Builder::new()
         .name("flowlight-control".to_owned())
-        .spawn(move || accept(&listener, &database, &certificates, owner.0, &hello))
+        .spawn(move || {
+            accept(
+                &listener,
+                &database,
+                &certificates,
+                owner.0,
+                &hello,
+                &marking,
+            )
+        })
         .context("starting the control thread")?;
     Ok(())
 }
@@ -236,17 +257,19 @@ fn accept(
     certificates: &Path,
     owner: u32,
     hello: &Hello,
+    marking: &Sender<crate::Message>,
 ) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        match peer(&stream) {
+        let asking = match peer(&stream) {
             // Root may always ask; so may the user the socket belongs to. Anyone else has got here past a
             // mode of 0600, which should not be possible, and is told nothing about why.
-            Some(uid) if uid == owner || uid == 0 => {}
+            Some(uid) if uid == owner || uid == 0 => uid,
             _ => continue,
-        }
+        };
         let database = database.to_path_buf();
         let certificates = certificates.to_path_buf();
+        let marking = marking.clone();
         let hello = Hello {
             version: hello.version.clone(),
             enforcing: hello.enforcing,
@@ -255,7 +278,7 @@ fn accept(
         // A thread per connection. There is one interface, and a handful of requests a second from it.
         let _ = std::thread::Builder::new()
             .name("flowlight-client".to_owned())
-            .spawn(move || converse(stream, &database, &certificates, &hello));
+            .spawn(move || converse(stream, &database, &certificates, &hello, asking, &marking));
     }
 }
 
@@ -282,7 +305,14 @@ fn peer(stream: &UnixStream) -> Option<u32> {
 }
 
 /// Handles one connection.
-fn converse(stream: UnixStream, database: &Path, certificates: &Path, hello: &Hello) {
+fn converse(
+    stream: UnixStream,
+    database: &Path,
+    certificates: &Path,
+    hello: &Hello,
+    asking: u32,
+    marking: &Sender<crate::Message>,
+) {
     let Ok(writer) = stream.try_clone() else {
         return;
     };
@@ -293,7 +323,7 @@ fn converse(stream: UnixStream, database: &Path, certificates: &Path, hello: &He
         if line.trim().is_empty() {
             continue;
         }
-        let reply = answer(&line, database, certificates, hello);
+        let reply = answer(&line, database, certificates, hello, asking, marking);
         if writeln!(writer, "{reply}").is_err() || writer.flush().is_err() {
             return;
         }
@@ -301,8 +331,15 @@ fn converse(stream: UnixStream, database: &Path, certificates: &Path, hello: &He
 }
 
 /// One request, one line of reply.
-fn answer(line: &str, database: &Path, certificates: &Path, hello: &Hello) -> String {
-    match handle(line, database, certificates, hello) {
+fn answer(
+    line: &str,
+    database: &Path,
+    certificates: &Path,
+    hello: &Hello,
+    asking: u32,
+    marking: &Sender<crate::Message>,
+) -> String {
+    match handle(line, database, certificates, hello, asking, marking) {
         Ok(payload) => format!(r#"{{"ok":{payload}}}"#),
         // The message goes to the interface, because the interface is the only thing looking, and it is
         // this machine's own error about this machine's own database shown to somebody who has already
@@ -314,6 +351,57 @@ fn answer(line: &str, database: &Path, certificates: &Path, hello: &Hello) -> St
     }
 }
 
+/// Tells the kernel that a process belongs to an agent, and waits to find out whether it did.
+///
+/// Synchronous on purpose. The caller is holding the process still until this answers, and a mark that might
+/// have landed is no use to something whose whole promise is that it landed before the process ran.
+fn mark(pid: u32, agent: &str, asking: u32, marking: &Sender<crate::Message>) -> Result<bool> {
+    let agent = agent.trim();
+    if agent.is_empty() {
+        bail!("a mark needs an agent to name");
+    }
+    // Whose process it is. Root may name anything; anybody else may name only their own, because marking a
+    // process makes every rule scoped to that agent apply to it — and, if interception is on, redirects it.
+    if asking != 0 {
+        match owner_of(pid) {
+            Some(uid) if uid == asking => {}
+            Some(uid) => bail!("process {pid} belongs to uid {uid}, not to uid {asking}"),
+            None => bail!("there is no process {pid}"),
+        }
+    }
+
+    let (answer, answered) = channel();
+    marking
+        .send(crate::Message::Mark(Box::new(crate::Marking {
+            pid,
+            agent: agent.to_owned(),
+            answer,
+        })))
+        .map_err(|_| {
+            anyhow::anyhow!("the daemon is no longer watching, so nothing can be marked")
+        })?;
+    // Bounded, because the alternative is a client held open for ever by a daemon that has stopped reading.
+    answered
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .map_err(|_| anyhow::anyhow!("the daemon did not answer within five seconds"))?
+        .map_err(|why| anyhow::anyhow!("{why}"))
+}
+
+/// Which user a process belongs to, from `/proc`.
+///
+/// The real uid, which is the first of the four on that line. A process that has dropped privileges is still
+/// the user's, and one that has gained them is not somebody else's to name.
+fn owner_of(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
 /// A failure, in the shape the interface reads.
 #[derive(Serialize)]
 struct Failure {
@@ -321,13 +409,24 @@ struct Failure {
 }
 
 /// Does what was asked and returns the payload as JSON.
-fn handle(line: &str, database: &Path, certificates: &Path, hello: &Hello) -> Result<String> {
+fn handle(
+    line: &str,
+    database: &Path,
+    certificates: &Path,
+    hello: &Hello,
+    asking: u32,
+    marking: &Sender<crate::Message>,
+) -> Result<String> {
     let request: Request = serde_json::from_str(line)
         .context("reading the request; it is one JSON object per line")?;
     let now = crate::views::now();
 
     if let Request::Hello = request {
         return Ok(serde_json::to_string(hello)?);
+    }
+
+    if let Request::Mark { pid, agent } = &request {
+        return mark(*pid, agent, asking, marking).map(|marked| marked.to_string());
     }
 
     let mut store = match &request {
@@ -346,6 +445,8 @@ fn handle(line: &str, database: &Path, certificates: &Path, hello: &Hello) -> Re
 
     let payload = match request {
         Request::Hello => unreachable!("answered above"),
+        // Both answered before the database was opened, because neither needs it.
+        Request::Mark { .. } => unreachable!("answered above"),
         Request::Requests { since, limit } => serde_json::to_string(&crate::views::requests(
             &mut store,
             crate::views::window(now, since),
@@ -500,7 +601,15 @@ mod tests {
     /// One helper rather than eleven call sites: the last time this signature grew it grew in eleven places,
     /// and two of them were wrong.
     fn answered(line: &str, database: &Path) -> String {
-        answer(line, database, Path::new("/nonexistent"), &hello())
+        let (marking, _held) = channel();
+        answer(
+            line,
+            database,
+            Path::new("/nonexistent"),
+            &hello(),
+            0,
+            &marking,
+        )
     }
 
     fn hello() -> Hello {

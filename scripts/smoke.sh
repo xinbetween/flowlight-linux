@@ -71,7 +71,7 @@ PYTHON
 }
 
 echo "Watching..."
-sudo "$binary" --json --seconds 220 --database "$database" --socket "$socket" --web 127.0.0.1:0 \
+sudo "$binary" --json --seconds 260 --database "$database" --socket "$socket" --web 127.0.0.1:0 \
     --certificates "$certificates" \
     --export-seconds 2 >"$output" 2>"$log" &
 watcher=$!
@@ -414,6 +414,70 @@ echo "OK: changing where it goes takes the agreement with it"
 
 ask '{"op":"set-export","off":true}' | jq -e '.ok.enabled == false' >/dev/null \
     || fail "export would not turn off."
+
+# Launching an agent through Flowlight. The claim is not that it works — the scan already marks agents — but
+# that the mark is in the kernel *before* the agent runs. So this asks the sharpest question there is: a rule
+# scoped to the agent, and a connection made with no pause at all.
+#
+# Every other agent test in this file sleeps three seconds first, because that is how long the scan can take.
+# This one must not, and must still be refused.
+#
+# A different address from the blocking section, and deliberately: 1.1.1.1 is blocked for everyone by this
+# point, so a refusal there would prove nothing about the mark. This one has no rule but the scoped one.
+launch_address=1.0.0.1
+if [ "$agent_tested" = yes ] && curl -sS --max-time 8 "https://$launch_address/" -o /dev/null 2>/dev/null; then
+    # Never as root: an agent started by root would run as root.
+    as_root=$(sudo "$binary" --socket "$socket" launch -- /bin/true 2>&1 || true)
+    printf '%s' "$as_root" | grep -q "must not be run as root" \
+        || fail "launching as root was not refused. It said: $as_root"
+    echo "OK: launching refuses to run as root, because the agent would be root too"
+
+    # What a launcher or a supervisor would be told to set, for the case where Flowlight is not the parent.
+    "$binary" --socket "$socket" launch --agent claude --print-environment >"$reported" 2>/dev/null \
+        || fail "launch could not say what it would set."
+    grep -q "^FLOWLIGHT_AGENT=claude$" "$reported" \
+        || fail "the environment does not say which agent it is for."
+    if grep -qv "=" "$reported"; then
+        fail "the printed environment has a line in it that is not a variable."
+    fi
+    echo "OK: the variables a launcher would set can be read by one"
+
+    # And now the real thing. A rule that refuses the address for this agent alone, then a connection made
+    # immediately, with no pause for any scan to have noticed anything.
+    sudo "$binary" --database "$database" --certificates "$certificates" \
+        block "$launch_address" --port 443 --agent claude --note "launch test" >/dev/null
+    sleep 3
+    # First: without launching, and with no pause, the same connection goes through. Without this the check
+    # below could pass because of a rule rather than because of the mark — which is the way a test lies.
+    curl -sS --max-time 8 "https://$launch_address/" -o /dev/null 2>/dev/null \
+        || fail "the address used for the launch test is refused for everyone, so the test would prove nothing."
+    echo "OK: the scoped rule leaves everything that is not the agent alone"
+
+    if "$binary" --socket "$socket" launch --agent claude -- \
+        curl -sS --max-time 8 "https://$launch_address/" -o /dev/null 2>/dev/null; then
+        fail "a connection made immediately by a launched agent was not refused, so the mark did not land before it ran."
+    fi
+    echo "OK: the mark is in the kernel before the agent runs, with no pause at all"
+
+    # A process somebody else owns is not theirs to name.
+    other=$(ask '{"op":"mark","pid":1,"agent":"claude"}')
+    printf '%s' "$other" | grep -q "belongs to uid" \
+        || fail "marking init as an agent was not refused. It said: $other"
+    echo "OK: a process somebody else owns cannot be marked as your agent"
+
+    # And the agent's exit status is the agent's, because something is watching it.
+    launched=0
+    "$binary" --socket "$socket" launch --agent claude -- /bin/sh -c "exit 42" 2>/dev/null || launched=$?
+    [ "$launched" = 42 ] || fail "a launched agent's exit status came back as $launched, not 42."
+    echo "OK: what the agent exited with is what launching exits with"
+
+    for id in $(ask '{"op":"rules"}' | jq -r '.ok[] | select(.scope == "agent:claude") | .id'); do
+        ask "{\"op\":\"forget\",\"id\":$id}" >/dev/null
+    done
+    sleep 3
+else
+    echo "SKIP: no fake agent, or $launch_address is not reachable, so launching could not be exercised"
+fi
 
 # Interception: the one thing Flowlight does that changes what an application sees. Off, and off by default,
 # so the first thing asserted is that it is off and says so.
