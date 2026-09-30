@@ -185,6 +185,8 @@ impl Payload {
             bytes: self.bytes,
             truncated: self.truncated,
             unreadable: self.unreadable.map(str::to_owned),
+            rpc_method: self.rpc_method.clone(),
+            rpc_tool: self.rpc_tool.clone(),
         }
     }
 
