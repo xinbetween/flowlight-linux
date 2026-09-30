@@ -384,13 +384,19 @@ if sudo cat "$export_file" | jq -s -e 'map(select(.process == "flowlightd")) | l
 fi
 echo "OK: the daemon's own traffic is not in what it exports"
 
-# Nothing is sent twice: the mark moved, so a second pass over the same records adds no lines.
+# Nothing is sent twice. Asserted against the high-water mark rather than by looking for duplicate lines:
+# two identical records are a real thing -- the same host answering the same way in the same second with the
+# same byte count -- and a test that called that a duplicate would fail on a correct daemon. What must hold is
+# that every record the mark moved past produced exactly one line.
+mark_before=$(ask '{"op":"export"}' | jq '.ok.sent_through')
 lines_before=$(sudo cat "$export_file" | wc -l)
 sleep 5
+mark_after=$(ask '{"op":"export"}' | jq '.ok.sent_through')
 lines_after=$(sudo cat "$export_file" | wc -l)
-[ "$lines_before" -le "$lines_after" ] || fail "the export file shrank."
-duplicates=$(sudo cat "$export_file" | jq -s 'length - (unique | length)')
-[ "$duplicates" = 0 ] || fail "$duplicates record(s) were exported more than once."
+[ "$mark_after" -ge "$mark_before" ] || fail "the export mark went backwards."
+if [ "$((lines_after - lines_before))" -ne "$((mark_after - mark_before))" ]; then
+    fail "the mark moved by $((mark_after - mark_before)) and the file grew by $((lines_after - lines_before)); a record was sent twice or not at all."
+fi
 echo "OK: a record is sent once"
 
 # And the failure the design exists to prevent: somebody agrees to one destination, and a change points it
