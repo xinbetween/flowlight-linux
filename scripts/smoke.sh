@@ -65,9 +65,21 @@ echo "Watching..."
 sudo "$binary" --json --seconds 70 --database "$database" --socket "$socket" --web 127.0.0.1:0 >"$output" 2>"$log" &
 watcher=$!
 
-# The probes are attached by the time the daemon prints its banner, but the banner goes to stderr and the
-# library scan happens after it. Three seconds is generous and the total cost is three seconds.
-sleep 3
+# Wait for the daemon to say it is reading a TLS library, rather than guessing at how long that takes. A
+# fixed sleep here was a race: on a loaded runner the library scan can finish after the first request has
+# already been made, and then nothing is captured and the failure looks like a broken probe.
+await() {
+    local what=$1 seconds=${2:-30}
+    for _ in $(seq "$((seconds * 4))"); do
+        if grep -q "$what" "$log" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.25
+    done
+    fail "the daemon never said \"$what\"."
+}
+await "reading openssl"
+await "interface socket at"
 
 # The interface. An ephemeral port, because a fixed one is a fixed way for this to fail on a machine that
 # happens to be using it.
