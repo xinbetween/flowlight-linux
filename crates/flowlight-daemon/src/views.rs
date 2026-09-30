@@ -9,7 +9,7 @@
 
 use anyhow::Result;
 use flowlight_agents::mcp;
-use flowlight_store::{Mock, Store};
+use flowlight_store::{Language, Mock, Store};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -266,11 +266,16 @@ pub struct ExportChange {
 
 /// Where what was seen is sent, described.
 pub fn export(store: &mut Store) -> Result<ExportView> {
-    Ok(describe_export(&store.export()?, false))
+    let language = store.speaking()?;
+    Ok(describe_export(&store.export()?, false, language))
 }
 
 /// Turns an export configuration into what an interface shows.
-fn describe_export(export: &flowlight_store::Export, revoked: bool) -> ExportView {
+fn describe_export(
+    export: &flowlight_store::Export,
+    revoked: bool,
+    language: Language,
+) -> ExportView {
     ExportView {
         enabled: export.enabled,
         sending: export.may_send(),
@@ -290,9 +295,9 @@ fn describe_export(export: &flowlight_store::Export, revoked: bool) -> ExportVie
         // Names only, here as everywhere. A view is the thing that ends up in a screenshot.
         headers: export.headers.keys().cloned().collect(),
         consented: export.consented.as_ref() == Some(&export.fingerprint()),
-        why_not: export.why_not(),
+        why_not: export.why_not(language),
         sent_through: export.sent_through,
-        disclosure: export.disclose(),
+        disclosure: export.disclose(language),
         revoked,
     }
 }
@@ -362,7 +367,8 @@ pub fn set_export(store: &mut Store, change: &ExportChange) -> Result<ExportView
         export.enabled = true;
     }
     store.set_export(&export)?;
-    Ok(describe_export(&export, revoked))
+    let language = store.speaking()?;
+    Ok(describe_export(&export, revoked, language))
 }
 
 /// Which model answers questions, and what asking one would mean.
@@ -411,11 +417,16 @@ pub struct AskChange {
 
 /// Which model answers, described.
 pub fn ask(store: &mut Store, key_on_file: bool) -> Result<AskView> {
-    Ok(describe_ask(&store.ask()?, key_on_file))
+    let language = store.speaking()?;
+    Ok(describe_ask(&store.ask()?, key_on_file, language))
 }
 
 /// Turns an Ask configuration into what an interface shows.
-fn describe_ask(configuration: &flowlight_store::Ask, key_on_file: bool) -> AskView {
+fn describe_ask(
+    configuration: &flowlight_store::Ask,
+    key_on_file: bool,
+    language: Language,
+) -> AskView {
     AskView {
         enabled: configuration.enabled,
         ready: configuration.ready(key_on_file),
@@ -429,8 +440,8 @@ fn describe_ask(configuration: &flowlight_store::Ask, key_on_file: bool) -> AskV
         needs_key: configuration.kind.needs_key(),
         key_on_file,
         sends_off_the_machine: configuration.kind.sends_off_the_machine(),
-        why_not: configuration.why_not(key_on_file),
-        disclosure: configuration.disclose(),
+        why_not: configuration.why_not(key_on_file, language),
+        disclosure: configuration.disclose(language),
     }
 }
 
@@ -473,7 +484,8 @@ pub fn set_ask(store: &mut Store, change: &AskChange, key_on_file: bool) -> Resu
     // Configuring a model is asking for the feature. Turning it off is a separate thing somebody says.
     configuration.enabled = !change.off;
     store.set_ask(&configuration)?;
-    Ok(describe_ask(&configuration, key_on_file))
+    let language = store.speaking()?;
+    Ok(describe_ask(&configuration, key_on_file, language))
 }
 
 /// A question, its answer, and the work behind it.
@@ -596,13 +608,15 @@ pub struct MockView {
 
 /// Whether connections are terminated, described.
 pub fn intercept(store: &mut Store, paths: Option<(String, String)>) -> Result<InterceptView> {
-    Ok(describe_intercept(&store.intercept()?, paths))
+    let language = store.speaking()?;
+    Ok(describe_intercept(&store.intercept()?, paths, language))
 }
 
 /// Turns an interception configuration into what an interface shows.
 fn describe_intercept(
     intercept: &flowlight_store::Intercept,
     paths: Option<(String, String)>,
+    language: Language,
 ) -> InterceptView {
     InterceptView {
         enabled: intercept.enabled,
@@ -610,8 +624,8 @@ fn describe_intercept(
         port: intercept.port,
         agents: intercept.agents.clone(),
         never: intercept.never.clone(),
-        why_not: intercept.why_not(),
-        disclosure: intercept.disclose(),
+        why_not: intercept.why_not(language),
+        disclosure: intercept.disclose(language),
         certificate: paths.as_ref().map(|(certificate, _)| certificate.clone()),
         bundle: paths.map(|(_, bundle)| bundle),
     }
@@ -646,7 +660,8 @@ pub fn set_intercept(
         intercept.enabled = false;
     }
     store.set_intercept(&intercept)?;
-    Ok(describe_intercept(&intercept, paths))
+    let language = store.speaking()?;
+    Ok(describe_intercept(&intercept, paths, language))
 }
 
 /// Every canned answer, in the order they are tried.
@@ -896,13 +911,14 @@ pub struct OwnerView {
 
 /// Who operates what, described.
 pub fn owners(store: &mut Store, since: i64) -> Result<OwnersView> {
+    let language = store.speaking()?;
     let resolver = flowlight_owners::lookup::resolver().map_or_else(
-        || "a public resolver".to_owned(),
+        || language.say("owners.resolver.public").to_owned(),
         |address| address.to_string(),
     );
     Ok(OwnersView {
         asking: store.owner_lookup()?,
-        disclosure: crate::owning::disclose(&resolver),
+        disclosure: crate::owning::disclose(&resolver, language),
         resolver,
         owners: store
             .owners(since)?
@@ -1072,6 +1088,79 @@ pub fn report(store: &mut Store, by: &str, since: i64, limit: usize) -> Result<R
     })
 }
 
+/// Which language Flowlight says things in, and which it could.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LanguageView {
+    /// The tag of the language in force.
+    pub language: String,
+    /// What that language calls itself.
+    pub endonym: String,
+    /// The stored setting, or nothing when it follows the environment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setting: Option<String>,
+    /// Whether what is being said is a translation rather than the original.
+    pub translated: bool,
+    /// The sentence a translated disclosure ends with, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caveat: Option<String>,
+    /// Every language there is.
+    pub every: Vec<LanguageOption>,
+}
+
+/// One language somebody could choose.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LanguageOption {
+    /// What to write in the setting.
+    pub tag: String,
+    /// What the language calls itself.
+    pub endonym: String,
+}
+
+/// Which language is being spoken, described.
+pub fn language(store: &mut Store) -> Result<LanguageView> {
+    let language = store.speaking()?;
+    Ok(LanguageView {
+        language: language.tag().to_owned(),
+        endonym: language.endonym().to_owned(),
+        setting: store.language()?.map(|stored| stored.tag().to_owned()),
+        translated: language.is_translated(),
+        caveat: language.caveat().map(str::to_owned),
+        every: flowlight_store::EVERY_LANGUAGE
+            .iter()
+            .map(|candidate| LanguageOption {
+                tag: candidate.tag().to_owned(),
+                endonym: candidate.endonym().to_owned(),
+            })
+            .collect(),
+    })
+}
+
+/// Chooses one, or goes back to following the environment.
+///
+/// A tag nobody has a catalogue for is refused rather than quietly answered in English: somebody asking for
+/// a language this does not have should be told, not left wondering why nothing changed.
+pub fn set_language(store: &mut Store, wanted: Option<&str>) -> Result<LanguageView> {
+    match wanted {
+        None => store.set_language(None)?,
+        Some(tag) => {
+            let chosen = Language::parse(tag).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "`{tag}` is not one of: {}. Traditional Chinese is not among them on purpose: the \
+                     catalogue is simplified, and serving one as the other would be claiming a language \
+                     this does not have.",
+                    flowlight_store::EVERY_LANGUAGE
+                        .iter()
+                        .map(|candidate| candidate.tag())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+            store.set_language(Some(chosen))?;
+        }
+    }
+    language(store)
+}
+
 /// What is attached by something other than the network.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct DevicesView {
@@ -1104,29 +1193,23 @@ pub struct DeviceView {
 }
 
 /// What Flowlight says about these channels before it watches them.
-pub fn device_disclosure() -> Vec<String> {
-    vec![
-        "These are the channels that are not the network: what is plugged in over USB, what is paired over \
-         Bluetooth, and which removable volumes are mounted."
-            .to_owned(),
-        "What is reported is what is connected and when that changed. Never how much went through any of \
-         it: Linux does not account for bytes per device in any way a process can be attributed, and a \
-         number nobody can stand behind is worse than no number."
-            .to_owned(),
-        "Everything is read from the files the kernel already publishes in /sys and /proc. Nothing is asked \
-         of a system service, and nothing leaves this machine."
-            .to_owned(),
-        "Off until it is asked for — not because it needs a permission Flowlight does not have, but because \
-         it widens what is watched."
-            .to_owned(),
-    ]
+pub fn device_disclosure(language: Language) -> Vec<String> {
+    let mut said = vec![
+        language.say("devices.channels").to_owned(),
+        language.say("devices.no_bytes").to_owned(),
+        language.say("devices.sources").to_owned(),
+        language.say("devices.off").to_owned(),
+    ];
+    said.extend(language.caveat().map(str::to_owned));
+    said
 }
 
 /// What is attached, described.
 pub fn devices(store: &mut Store, all: bool) -> Result<DevicesView> {
+    let language = store.speaking()?;
     Ok(DevicesView {
         watching: store.watching_devices()?,
-        disclosure: device_disclosure(),
+        disclosure: device_disclosure(language),
         devices: store
             .device_history()?
             .into_iter()
@@ -1370,11 +1453,12 @@ pub fn rules(store: &mut Store) -> Result<Vec<RuleView>> {
 
 /// What Flowlight is allowed to read, described.
 pub fn budget(store: &mut Store, now: i64) -> Result<BudgetView> {
-    Ok(describe(&store.budget()?, now))
+    let language = store.speaking()?;
+    Ok(describe(&store.budget()?, now, language))
 }
 
 /// Turns a budget into what an interface shows.
-fn describe(budget: &flowlight_store::Budget, now: i64) -> BudgetView {
+fn describe(budget: &flowlight_store::Budget, now: i64, language: Language) -> BudgetView {
     BudgetView {
         payloads: budget.payloads,
         reading: budget.reading_payloads(now),
@@ -1384,7 +1468,7 @@ fn describe(budget: &flowlight_store::Budget, now: i64) -> BudgetView {
         paths: budget.paths.as_str().to_owned(),
         detail_days: budget.detail_days,
         summary_days: budget.summary_days,
-        described: budget.describe(now),
+        described: budget.describe(now, language),
     }
 }
 
@@ -1444,7 +1528,8 @@ pub fn set_budget(store: &mut Store, change: &BudgetChange, now: i64) -> Result<
         budget.summary_days = days;
     }
     store.set_budget(&budget)?;
-    Ok(describe(&budget, now))
+    let language = store.speaking()?;
+    Ok(describe(&budget, now, language))
 }
 
 /// What adding a rule would change, judged against traffic that actually happened.

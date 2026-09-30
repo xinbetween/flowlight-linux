@@ -27,6 +27,7 @@
 //! "which agent talked to what, how often, and did it succeed".
 
 use anyhow::Result;
+use flowlight_text::Language;
 use rusqlite::{Connection, OptionalExtension as _, params};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -118,24 +119,28 @@ impl Field {
         }
     }
 
-    /// How this reads in a sentence.
-    fn described(self) -> &'static str {
-        match self {
-            Self::At => "when",
-            Self::Process => "the process",
-            Self::Confidence => "how the process was named",
-            Self::Pid => "the process identifier",
-            Self::Agent => "the agent",
-            Self::Direction => "the direction",
-            Self::Host => "the host",
-            Self::Method => "the method",
-            Self::Target => "the path",
-            Self::Status => "the status",
-            Self::Bytes => "the size",
-            Self::Protocol => "the protocol",
-            Self::RpcMethod => "the MCP method",
-            Self::RpcTool => "the tool's name",
-        }
+    /// How this reads in a sentence, in the language somebody is reading.
+    ///
+    /// The English is in the catalogue with the other eight rather than here, because a field named in a
+    /// disclosure and a field named in a column heading are the same words in two places, and one of them
+    /// would have been forgotten.
+    fn described(self, language: Language) -> &'static str {
+        language.say(match self {
+            Self::At => "field.at",
+            Self::Process => "field.process",
+            Self::Confidence => "field.confidence",
+            Self::Pid => "field.pid",
+            Self::Agent => "field.agent",
+            Self::Direction => "field.direction",
+            Self::Host => "field.host",
+            Self::Method => "field.method",
+            Self::Target => "field.target",
+            Self::Status => "field.status",
+            Self::Bytes => "field.bytes",
+            Self::Protocol => "field.protocol",
+            Self::RpcMethod => "field.rpc_method",
+            Self::RpcTool => "field.rpc_tool",
+        })
     }
 
     /// Reads one back, or nothing if it is not one.
@@ -266,124 +271,100 @@ impl Export {
     }
 
     /// Why nothing is being sent, when nothing is.
-    pub fn why_not(&self) -> Option<String> {
+    pub fn why_not(&self, language: Language) -> Option<String> {
         if self.may_send() {
             return None;
         }
-        Some(if !self.enabled {
-            "Export is off.".to_owned()
-        } else if self.destination.is_none() {
-            "No destination has been set, so there is nowhere to send anything.".to_owned()
-        } else if self.transport().is_none() {
-            "The destination is neither an http:// or https:// collector nor an absolute file path, so it \
-             is not clear what sending to it would mean."
-                .to_owned()
-        } else if self.consented.is_none() {
-            "Nobody has agreed to this yet. Nothing is sent until somebody does.".to_owned()
-        } else {
-            "What is being sent, or where, has changed since somebody agreed to it. Nothing is sent until \
-             somebody agrees to what it is now."
-                .to_owned()
-        })
+        Some(
+            language
+                .say(if !self.enabled {
+                    "export.why.off"
+                } else if self.destination.is_none() {
+                    "export.why.nowhere"
+                } else if self.transport().is_none() {
+                    "export.why.unusable"
+                } else if self.consented.is_none() {
+                    "export.why.unagreed"
+                } else {
+                    "export.why.changed"
+                })
+                .to_owned(),
+        )
     }
 
     /// What somebody is being asked to agree to, in sentences.
     ///
     /// Every sentence is a complete one and says a thing that is true. The list of what does *not* travel is
     /// there on purpose: a disclosure that only says what it takes invites the reader to assume the rest.
-    pub fn disclose(&self) -> Vec<String> {
+    ///
+    /// In a language other than English the last sentence says that this is a translation and which wording
+    /// the program is tested against. An agreement is only worth as much as the reader's confidence in what
+    /// it says, and a translated one has to be honest about being a translation.
+    pub fn disclose(&self, language: Language) -> Vec<String> {
         let mut said = Vec::new();
         let Some(destination) = self.destination.as_deref() else {
-            said.push("No destination has been set, so nothing can be sent anywhere.".to_owned());
+            said.push(language.say("export.destination.none").to_owned());
             return said;
         };
 
-        said.push(match self.transport() {
-            Some(Transport::Otlp) => format!(
-                "Every request Flowlight reads will be sent over the network to {destination}, as OTLP."
-            ),
-            Some(Transport::File) => format!(
-                "Every request Flowlight reads will be written to {destination}, one line each. Nothing \
-                 crosses the network."
-            ),
-            None => format!(
-                "{destination} is neither a collector nor an absolute file path, so nothing can be sent to \
-                 it."
-            ),
-        });
+        let values = [("destination", destination)];
+        said.push(language.fill(
+            match self.transport() {
+                Some(Transport::Otlp) => "export.destination.otlp",
+                Some(Transport::File) => "export.destination.file",
+                None => "export.destination.unusable",
+            },
+            &values,
+        ));
 
         let travelling: Vec<&str> = EVERY_FIELD
             .iter()
             .filter(|field| self.fields.contains(field))
-            .map(|field| field.described())
+            .map(|field| field.described(language))
             .collect();
         said.push(if travelling.is_empty() {
-            "No fields travel, which means each record would say nothing at all.".to_owned()
+            language.say("export.fields.none").to_owned()
         } else {
-            format!(
-                "{} {} travel: {}.",
-                count(travelling.len()),
+            language.fill(
                 if travelling.len() == 1 {
-                    "field"
+                    "export.fields.one"
                 } else {
-                    "fields"
+                    "export.fields.many"
                 },
-                travelling.join(", ")
+                &[
+                    ("count", &language.counted(travelling.len())),
+                    ("fields", &travelling.join(", ")),
+                ],
             )
         });
 
         let withheld: Vec<&str> = EVERY_FIELD
             .iter()
             .filter(|field| !self.fields.contains(field))
-            .map(|field| field.described())
+            .map(|field| field.described(language))
             .collect();
         if !withheld.is_empty() {
-            said.push(format!("These do not: {}.", withheld.join(", ")));
+            said.push(language.fill("export.withheld", &[("fields", &withheld.join(", "))]));
         }
 
         if !self.headers.is_empty() {
             let names: Vec<&str> = self.headers.keys().map(String::as_str).collect();
-            said.push(format!(
-                "{} {} sent with each batch: {}. The values are not shown here and are not part of what \
-                 you are agreeing to.",
-                count(names.len()),
+            said.push(language.fill(
                 if names.len() == 1 {
-                    "header is"
+                    "export.headers.one"
                 } else {
-                    "headers are"
+                    "export.headers.many"
                 },
-                names.join(", ")
+                &[
+                    ("count", &language.counted(names.len())),
+                    ("names", &names.join(", ")),
+                ],
             ));
         }
 
-        said.push(
-            "This agreement is bound to exactly that. Changing the destination, the fields or the headers \
-             stops the export until somebody agrees again."
-                .to_owned(),
-        );
+        said.push(language.say("export.bound").to_owned());
+        said.extend(language.caveat().map(str::to_owned));
         said
-    }
-}
-
-/// A small number, in words, because a sentence that starts with a digit reads like a log line.
-fn count(many: usize) -> &'static str {
-    match many {
-        0 => "No",
-        1 => "One",
-        2 => "Two",
-        3 => "Three",
-        4 => "Four",
-        5 => "Five",
-        6 => "Six",
-        7 => "Seven",
-        8 => "Eight",
-        9 => "Nine",
-        10 => "Ten",
-        11 => "Eleven",
-        12 => "Twelve",
-        13 => "Thirteen",
-        14 => "Fourteen",
-        _ => "Several",
     }
 }
 
@@ -482,7 +463,7 @@ mod tests {
         assert!(!export.may_send());
         assert!(
             export
-                .why_not()
+                .why_not(Language::English)
                 .is_some_and(|why| why.contains("Nobody has agreed"))
         );
     }
@@ -492,7 +473,7 @@ mod tests {
         let mut export = configured();
         export.consented = Some(export.fingerprint());
         assert!(export.may_send());
-        assert_eq!(export.why_not(), None);
+        assert_eq!(export.why_not(Language::English), None);
     }
 
     /// The failure the whole design exists to prevent: somebody agrees to four fields going to their own
@@ -507,7 +488,7 @@ mod tests {
         assert!(!export.may_send());
         assert!(
             export
-                .why_not()
+                .why_not(Language::English)
                 .is_some_and(|why| why.contains("has changed since somebody agreed"))
         );
     }
@@ -596,7 +577,7 @@ mod tests {
         assert!(!export.may_send());
         assert!(
             export
-                .why_not()
+                .why_not(Language::English)
                 .is_some_and(|why| why.contains("not clear"))
         );
     }
@@ -604,7 +585,7 @@ mod tests {
     /// A disclosure that only says what it takes invites the reader to assume the rest.
     #[test]
     fn the_disclosure_says_what_does_not_travel_as_well() {
-        let said = configured().disclose();
+        let said = configured().disclose(Language::English);
         let whole = said.join(" ");
         assert!(
             whole.contains("over the network to https://otel.example.com/v1/logs"),
@@ -626,7 +607,7 @@ mod tests {
     fn a_file_destination_says_nothing_crosses_the_network() {
         let mut export = configured();
         export.destination = Some("/var/log/flowlight.jsonl".to_owned());
-        let whole = export.disclose().join(" ");
+        let whole = export.disclose(Language::English).join(" ");
         assert!(
             whole.contains("Nothing \ncrosses the network.")
                 || whole.contains("Nothing crosses the network."),
@@ -642,7 +623,7 @@ mod tests {
         export
             .headers
             .insert("authorization".to_owned(), "Bearer hunter2".to_owned());
-        let whole = export.disclose().join(" ");
+        let whole = export.disclose(Language::English).join(" ");
         assert!(whole.contains("authorization"), "{whole}");
         assert!(!whole.contains("hunter2"), "{whole}");
         assert!(whole.contains("values are not shown here"), "{whole}");
@@ -650,7 +631,7 @@ mod tests {
 
     #[test]
     fn an_export_with_no_destination_says_so_rather_than_describing_one() {
-        let said = Export::fresh().disclose();
+        let said = Export::fresh().disclose(Language::English);
         assert_eq!(said.len(), 1);
         assert!(said[0].contains("No destination has been set"));
     }

@@ -11,7 +11,7 @@
 //! Flowlight exists to notice other programs doing.
 
 use flowlight_owners::Lookup;
-use flowlight_store::Store;
+use flowlight_store::{Language, Store};
 
 /// How many addresses are asked about in one pass.
 const PER_PASS: usize = 4;
@@ -90,21 +90,16 @@ pub fn pass(store: &mut Store, lookup: &Lookup, now: i64) -> Learnt {
 ///
 /// Said before the first question rather than in a manual, like every other thing here that leaves the
 /// machine.
-pub fn disclose(resolver: &str) -> Vec<String> {
-    vec![
-        "Flowlight will ask who operates the addresses this machine has connected to.".to_owned(),
-        format!(
-            "The question is a DNS lookup of Team Cymru's public routing data, sent to {resolver} — this \
-             machine's own resolver, or a public one if it has none configured."
-        ),
-        "What is sent is an address. Not which process reached it, not when, not how often, and nothing \
-         else Flowlight knows about it."
-            .to_owned(),
-        "An address on this machine or this network is never asked about: the answer is already known, and \
-         the question would be about your network."
-            .to_owned(),
-        "Four addresses a minute at most, busiest first, and never the same one twice.".to_owned(),
-    ]
+pub fn disclose(resolver: &str, language: Language) -> Vec<String> {
+    let mut said = vec![
+        language.say("owners.what").to_owned(),
+        language.fill("owners.question", &[("resolver", resolver)]),
+        language.say("owners.sent").to_owned(),
+        language.say("owners.local").to_owned(),
+        language.say("owners.rate").to_owned(),
+    ];
+    said.extend(language.caveat().map(str::to_owned));
+    said
 }
 
 #[cfg(test)]
@@ -123,7 +118,7 @@ mod tests {
     /// theirs is sent to a third party, and which one.
     #[test]
     fn the_disclosure_says_what_leaves_and_where_it_goes() {
-        let said = disclose("192.168.1.1:53").join(" ");
+        let said = disclose("192.168.1.1:53", Language::English).join(" ");
         assert!(said.contains("192.168.1.1:53"));
         assert!(said.contains("What is sent is an address"));
         assert!(said.contains("never asked about"));

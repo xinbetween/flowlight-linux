@@ -21,11 +21,13 @@
 //!
 //! [`Budget::describe`] is built from complete sentences rather than a template with numbers dropped into
 //! it. That is a habit from the macOS build, where the same summary is translated into nine languages and a
-//! sentence assembled from fragments is a sentence that reads like one in at least three of them. Nothing
-//! here is translated yet, and the habit is still right: a summary is prose, and prose survives being read
-//! aloud.
+//! sentence assembled from fragments is a sentence that reads like one in at least three of them. It is now
+//! translated here too, which is what the habit was for: each sentence is one entry in the catalogue, with
+//! the numbers and the units passed in, so a translator is given prose to translate rather than fragments to
+//! reassemble.
 
 use anyhow::Result;
+use flowlight_text::Language;
 use rusqlite::{Connection, OptionalExtension as _, params};
 
 /// How long payload capture lasts before it has to be renewed.
@@ -164,101 +166,85 @@ impl Budget {
     ///
     /// Printed at startup and shown in the interface. Assembled from whole sentences rather than one
     /// template with numbers dropped into it, so that it reads like something a person wrote.
-    pub fn describe(&self, now: i64) -> Vec<String> {
+    pub fn describe(&self, now: i64, language: Language) -> Vec<String> {
         let mut said = Vec::new();
 
         if !self.payloads {
-            said.push("Payloads are not read at all. Connections are still attributed.".to_owned());
+            said.push(language.say("budget.payloads.off").to_owned());
         } else if self.session_expired(now) {
-            said.push(
-                "Payload capture has run out and is no longer reading anything. Renew it to start again."
-                    .to_owned(),
-            );
+            said.push(language.say("budget.session.expired").to_owned());
         } else {
             match self.session_remaining(now) {
-                Some(remaining) => said.push(format!(
-                    "Payloads are being read for another {}.",
-                    duration(remaining)
+                Some(remaining) => said.push(language.fill(
+                    "budget.session.remaining",
+                    &[("remaining", &duration(remaining, language))],
                 )),
-                None => said.push(
-                    "Payloads are being read, with no session limit — which was asked for, not assumed."
-                        .to_owned(),
-                ),
+                None => said.push(language.say("budget.session.unlimited").to_owned()),
             }
         }
 
         if self.daily_bytes == 0 {
-            said.push(
-                "There is no daily ceiling on how much one process may contribute.".to_owned(),
-            );
+            said.push(language.say("budget.daily.none").to_owned());
         } else {
-            said.push(format!(
-                "After {} in a day, a process stops having its payloads captured until tomorrow.",
-                bytes(self.daily_bytes)
+            said.push(language.fill(
+                "budget.daily",
+                &[("size", &bytes(self.daily_bytes, language))],
             ));
         }
 
-        said.push(match self.paths {
-            Paths::Full => {
-                "Request paths are kept in full, with credentials removed from them.".to_owned()
-            }
-            Paths::HostOnly => {
-                "Only the host of a request is kept, never the path it asked for.".to_owned()
-            }
-            Paths::None => {
-                "Neither paths nor query strings are kept. Hosts are, because nothing can be grouped \
-                 without them."
-                    .to_owned()
-            }
-        });
+        said.push(
+            language
+                .say(match self.paths {
+                    Paths::Full => "budget.paths.full",
+                    Paths::HostOnly => "budget.paths.host",
+                    Paths::None => "budget.paths.none",
+                })
+                .to_owned(),
+        );
 
-        said.push(format!(
-            "Individual requests are kept for {}, and a daily summary for {}.",
-            days(self.detail_days),
-            days(self.summary_days)
+        said.push(language.fill(
+            "budget.retention",
+            &[
+                ("detail", &language.days(self.detail_days)),
+                ("summary", &language.days(self.summary_days)),
+            ],
         ));
         said
     }
 }
 
-/// `3 days`, or `1 day`.
-fn days(count: u32) -> String {
-    if count == 1 {
-        "1 day".to_owned()
-    } else {
-        format!("{count} days")
-    }
-}
-
 /// A length of time, in the largest unit that does not lie about the precision.
-fn duration(seconds: i64) -> String {
+fn duration(seconds: i64, language: Language) -> String {
+    let counted = |key: &'static str, plural: &'static str, count: i64| {
+        language.fill(
+            if count == 1 { key } else { plural },
+            &[("count", &count.to_string())],
+        )
+    };
     if seconds < 60 {
-        format!("{seconds} seconds")
+        counted("time.seconds.one", "time.seconds.many", seconds)
     } else if seconds < 3_600 {
-        let minutes = seconds / 60;
-        if minutes == 1 {
-            "1 minute".to_owned()
-        } else {
-            format!("{minutes} minutes")
-        }
+        counted("time.minutes.one", "time.minutes.many", seconds / 60)
     } else {
-        let hours = seconds / 3_600;
-        let minutes = (seconds % 3_600) / 60;
-        let hour = if hours == 1 {
-            "1 hour".to_owned()
-        } else {
-            format!("{hours} hours")
-        };
-        match minutes {
+        let hour = counted("time.hours.one", "time.hours.many", seconds / 3_600);
+        match (seconds % 3_600) / 60 {
             0 => hour,
-            1 => format!("{hour} and 1 minute"),
-            minutes => format!("{hour} and {minutes} minutes"),
+            minutes => language.fill(
+                "time.joined",
+                &[
+                    ("hours", &hour),
+                    (
+                        "minutes",
+                        &counted("time.minutes.one", "time.minutes.many", minutes),
+                    ),
+                ],
+            ),
         }
     }
 }
 
 /// A size, in the unit somebody would say out loud.
-fn bytes(count: i64) -> String {
+fn bytes(count: i64, language: Language) -> String {
     if count >= 1024 * 1024 * 1024 {
         format!("{:.1} GB", count as f64 / (1024.0 * 1024.0 * 1024.0))
     } else if count >= 1024 * 1024 {
@@ -266,7 +252,8 @@ fn bytes(count: i64) -> String {
     } else if count >= 1024 {
         format!("{} kB", count / 1024)
     } else {
-        format!("{count} bytes")
+        // The one unit that is a word rather than a symbol, and therefore the one that translates.
+        language.fill("size.bytes", &[("count", &count.to_string())])
     }
 }
 
@@ -357,7 +344,7 @@ mod tests {
         assert_eq!(budget.session_remaining(0), None);
         assert!(
             budget
-                .describe(0)
+                .describe(0, Language::English)
                 .iter()
                 .any(|line| line.contains("which was asked for, not assumed"))
         );
@@ -372,7 +359,7 @@ mod tests {
         assert!(!budget.reading_payloads(0));
         assert!(
             budget
-                .describe(0)
+                .describe(0, Language::English)
                 .iter()
                 .any(|line| line.contains("Connections are still attributed"))
         );
@@ -431,7 +418,7 @@ mod tests {
             session_began: 0,
             ..Budget::default()
         };
-        let said = budget.describe(0);
+        let said = budget.describe(0, Language::English);
         assert_eq!(said.len(), 4);
         for line in &said {
             assert!(line.ends_with('.'), "not a sentence: {line}");
@@ -456,7 +443,7 @@ mod tests {
             session_began: 0,
             ..Budget::default()
         };
-        let said = budget.describe(0);
+        let said = budget.describe(0, Language::English);
         assert!(
             said[3].contains("1 day, and a daily summary for 1 day."),
             "{}",
@@ -467,21 +454,21 @@ mod tests {
 
     #[test]
     fn a_length_of_time_reads_the_way_somebody_would_say_it() {
-        assert_eq!(duration(30), "30 seconds");
-        assert_eq!(duration(60), "1 minute");
-        assert_eq!(duration(120), "2 minutes");
-        assert_eq!(duration(3_600), "1 hour");
-        assert_eq!(duration(7_200), "2 hours");
-        assert_eq!(duration(3_660), "1 hour and 1 minute");
-        assert_eq!(duration(7_380), "2 hours and 3 minutes");
-        assert_eq!(duration(28_800), "8 hours");
+        assert_eq!(duration(30, Language::English), "30 seconds");
+        assert_eq!(duration(60, Language::English), "1 minute");
+        assert_eq!(duration(120, Language::English), "2 minutes");
+        assert_eq!(duration(3_600, Language::English), "1 hour");
+        assert_eq!(duration(7_200, Language::English), "2 hours");
+        assert_eq!(duration(3_660, Language::English), "1 hour and 1 minute");
+        assert_eq!(duration(7_380, Language::English), "2 hours and 3 minutes");
+        assert_eq!(duration(28_800, Language::English), "8 hours");
     }
 
     #[test]
     fn a_size_reads_the_way_somebody_would_say_it() {
-        assert_eq!(bytes(512), "512 bytes");
-        assert_eq!(bytes(2_048), "2 kB");
-        assert_eq!(bytes(64 * 1024 * 1024), "64 MB");
-        assert_eq!(bytes(2 * 1024 * 1024 * 1024), "2.0 GB");
+        assert_eq!(bytes(512, Language::English), "512 bytes");
+        assert_eq!(bytes(2_048, Language::English), "2 kB");
+        assert_eq!(bytes(64 * 1024 * 1024, Language::English), "64 MB");
+        assert_eq!(bytes(2 * 1024 * 1024 * 1024, Language::English), "2.0 GB");
     }
 }

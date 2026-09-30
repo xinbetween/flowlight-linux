@@ -15,6 +15,7 @@
 //! the package manager, the browser and the update service all broke at once.
 
 use crate::Result;
+use flowlight_text::Language;
 use rusqlite::{Connection, OptionalExtension as _, params};
 
 /// Where the proxy listens unless told otherwise.
@@ -64,19 +65,19 @@ impl Intercept {
     }
 
     /// Why nothing is being terminated, when nothing is.
-    pub fn why_not(&self) -> Option<String> {
+    pub fn why_not(&self, language: Language) -> Option<String> {
         if self.running() {
             return None;
         }
-        Some(if !self.enabled {
-            "Interception is off. Nothing is terminated, and no certificate of Flowlight's is presented to \
-             anything."
-                .to_owned()
-        } else {
-            "Interception is on and names no agents, so nothing is redirected. Naming one is how the scope \
-             is chosen: `flowlightd intercept --agent claude`."
-                .to_owned()
-        })
+        Some(
+            language
+                .say(if !self.enabled {
+                    "intercept.why.off"
+                } else {
+                    "intercept.why.no_agents"
+                })
+                .to_owned(),
+        )
     }
 
     /// Whether this host is one that must never be terminated.
@@ -92,46 +93,20 @@ impl Intercept {
     ///
     /// Longer than the other disclosures in this program, because it is the only feature that changes what an
     /// application sees rather than only watching it.
-    pub fn disclose(&self) -> Vec<String> {
-        let mut said = Vec::new();
-        said.push(
-            "Interception is not watching. Everything else Flowlight does reads what an application hands \
-             its TLS library and changes nothing that crosses the network."
-                .to_owned(),
-        );
+    pub fn disclose(&self, language: Language) -> Vec<String> {
+        let mut said = vec![language.say("intercept.watching").to_owned()];
         said.push(if self.agents.is_empty() {
-            "No agents are named, so nothing is redirected. Interception applies to the agents it names and \
-             to nothing else on this machine."
-                .to_owned()
+            language.say("intercept.agents.none").to_owned()
         } else {
-            format!(
-                "Connections from {} — and from anything they start — are redirected to a proxy on this \
-                 machine, which terminates TLS and opens its own connection onwards.",
-                self.agents.join(", ")
-            )
+            language.fill("intercept.agents", &[("agents", &self.agents.join(", "))])
         });
-        said.push(
-            "That proxy presents a certificate signed by a certificate authority created on this machine. \
-             Anything that does not trust it will refuse the connection, which is what a pinned certificate \
-             is supposed to do."
-                .to_owned(),
-        );
-        said.push(
-            "A host nobody has written a mock for is passed through without being terminated at all, so the \
-             certificate is only ever presented where there is a reason to."
-                .to_owned(),
-        );
+        said.push(language.say("intercept.authority").to_owned());
+        said.push(language.say("intercept.passthrough").to_owned());
         if !self.never.is_empty() {
-            said.push(format!(
-                "These are never terminated, whatever else says so: {}.",
-                self.never.join(", ")
-            ));
+            said.push(language.fill("intercept.never", &[("hosts", &self.never.join(", "))]));
         }
-        said.push(
-            "Turning it off stops the redirect immediately. Removing the certificate authority is a separate \
-             step, because trusting one and untrusting it are both things somebody should do on purpose."
-                .to_owned(),
-        );
+        said.push(language.say("intercept.off").to_owned());
+        said.extend(language.caveat().map(str::to_owned));
         said
     }
 }
@@ -196,7 +171,11 @@ mod tests {
         let intercept = Intercept::fresh();
         assert!(!intercept.enabled);
         assert!(!intercept.running());
-        assert!(intercept.why_not().is_some_and(|why| why.contains("off")));
+        assert!(
+            intercept
+                .why_not(Language::English)
+                .is_some_and(|why| why.contains("off"))
+        );
     }
 
     /// An empty scope means nobody, not everybody. The other reading would break the package manager first.
@@ -209,7 +188,7 @@ mod tests {
         assert!(!intercept.running());
         assert!(
             intercept
-                .why_not()
+                .why_not(Language::English)
                 .is_some_and(|why| why.contains("names no agents"))
         );
 
@@ -218,7 +197,7 @@ mod tests {
             ..intercept
         };
         assert!(scoped.running());
-        assert_eq!(scoped.why_not(), None);
+        assert_eq!(scoped.why_not(Language::English), None);
     }
 
     #[test]
@@ -243,7 +222,7 @@ mod tests {
             agents: vec!["claude".to_owned()],
             ..Intercept::fresh()
         }
-        .disclose()
+        .disclose(Language::English)
         .join(" ");
         assert!(said.contains("is not watching"));
         assert!(said.contains("pinned certificate"));

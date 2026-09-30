@@ -18,6 +18,7 @@
 //! is read at the moment it is needed.
 
 use crate::Result;
+use flowlight_text::Language;
 use rusqlite::{Connection, OptionalExtension as _, params};
 use std::fmt;
 
@@ -60,14 +61,14 @@ impl Kind {
         }
     }
 
-    /// How this reads in a sentence.
-    pub fn described(self) -> &'static str {
-        match self {
-            Self::Local => "a model server on this machine or this network",
-            Self::Compatible => "an OpenAI-compatible endpoint",
-            Self::Anthropic => "Anthropic",
-            Self::Gemini => "Google Gemini",
-        }
+    /// How this reads in a sentence, in the language somebody is reading.
+    pub fn described(self, language: Language) -> &'static str {
+        language.say(match self {
+            Self::Local => "ask.kind.local",
+            Self::Compatible => "ask.kind.compatible",
+            Self::Anthropic => "ask.kind.anthropic",
+            Self::Gemini => "ask.kind.gemini",
+        })
     }
 
     /// Reads one back, or nothing if it is not one.
@@ -155,31 +156,25 @@ impl Ask {
     }
 
     /// Why a question cannot be asked, when it cannot.
-    pub fn why_not(&self, key_on_file: bool) -> Option<String> {
+    pub fn why_not(&self, key_on_file: bool, language: Language) -> Option<String> {
         if self.ready(key_on_file) {
             return None;
         }
         Some(if !self.enabled {
-            "Ask is off. There is no model in Flowlight for Linux, so one has to be configured: \
-             `flowlightd model --kind local --model <name>` for a server on this machine, or a provider and \
-             a key."
-                .to_owned()
+            language.say("ask.why.off").to_owned()
         } else if self.endpoint.is_none() {
-            "No endpoint is set, so there is nothing to ask.".to_owned()
+            language.say("ask.why.no_endpoint").to_owned()
         } else if self.model.is_none() {
-            "No model name is set. Every provider needs to be told which model to use, and there is no \
-             sensible default to guess at."
-                .to_owned()
+            language.say("ask.why.no_model").to_owned()
         } else if let Some(endpoint) = self.endpoint.as_deref() {
             match Safety::of(endpoint, self.kind) {
-                Safety::Fine => format!(
-                    "{} needs a key, and there is not one on file.",
-                    self.kind.described()
-                ),
-                other => other.describe(endpoint),
+                Safety::Fine => {
+                    language.fill("ask.why.no_key", &[("kind", self.kind.described(language))])
+                }
+                other => other.describe(endpoint, language),
             }
         } else {
-            "Ask is not configured.".to_owned()
+            language.say("ask.why.unconfigured").to_owned()
         })
     }
 
@@ -187,45 +182,27 @@ impl Ask {
     ///
     /// Said before the first question rather than in a manual. For a local server it is short, because the
     /// answer is that nothing leaves; for anything else it names the host, because that is the fact.
-    pub fn disclose(&self) -> Vec<String> {
+    pub fn disclose(&self, language: Language) -> Vec<String> {
         let mut said = Vec::new();
         let Some(endpoint) = self.endpoint.as_deref() else {
-            said.push(
-                "No model is configured, so questions cannot be answered. Flowlight for Linux has no model \
-                 of its own: there are no bundled weights, and no default pointing at somebody's API."
-                    .to_owned(),
-            );
+            said.push(language.say("ask.none").to_owned());
             return said;
         };
-        said.push(if self.kind.sends_off_the_machine() {
-            format!(
-                "Your question and the results of the queries Flowlight runs for it will be sent to \
-                 {endpoint}."
-            )
-        } else {
-            format!(
-                "Your question goes to {endpoint}, which is on this machine or this network. Nothing \
-                 crosses the internet."
-            )
-        });
-        said.push(
-            "What is sent is the question, the instructions, and the totals and names that Flowlight's own \
-             queries return. Never a row of history, never a request target, and never anything the model \
-             did not ask for."
-                .to_owned(),
-        );
-        said.push(
-            "The model cannot see the database. It may name one of a fixed list of queries, which Flowlight \
-             runs; there is no query language and no way to write one."
-                .to_owned(),
-        );
+        let values = [("endpoint", endpoint)];
+        said.push(language.fill(
+            if self.kind.sends_off_the_machine() {
+                "ask.remote"
+            } else {
+                "ask.local"
+            },
+            &values,
+        ));
+        said.push(language.say("ask.sent").to_owned());
+        said.push(language.say("ask.queries").to_owned());
         if self.kind.sends_off_the_machine() {
-            said.push(
-                "The connection to the provider is recorded and attributed to flowlightd, like any other \
-                 process's. A tool that hid its own traffic would have no business showing anybody else's."
-                    .to_owned(),
-            );
+            said.push(language.say("ask.recorded").to_owned());
         }
+        said.extend(language.caveat().map(str::to_owned));
         said
     }
 }
@@ -245,19 +222,16 @@ pub enum Safety {
 
 impl Safety {
     /// Why an endpoint was refused, as a sentence.
-    pub fn describe(self, endpoint: &str) -> String {
-        match self {
-            Self::Fine => format!("{endpoint} is fine."),
-            Self::NotAUrl => format!("{endpoint} is not a URL."),
-            Self::WrongScheme => {
-                format!("{endpoint} is neither an http:// nor an https:// address.")
-            }
-            Self::ClearOverTheInternet => format!(
-                "{endpoint} is plain http:// to an address that is not this machine or a private network. A \
-                 key and a question about this machine's own traffic would cross the network in the clear, \
-                 so Flowlight will not send them. Use https://."
-            ),
-        }
+    pub fn describe(self, endpoint: &str, language: Language) -> String {
+        language.fill(
+            match self {
+                Self::Fine => "ask.safety.fine",
+                Self::NotAUrl => "ask.safety.not_a_url",
+                Self::WrongScheme => "ask.safety.wrong_scheme",
+                Self::ClearOverTheInternet => "ask.safety.clear",
+            },
+            &[("endpoint", endpoint)],
+        )
     }
 
     /// Whether this endpoint may be sent to.
@@ -383,7 +357,7 @@ mod tests {
         assert_eq!(ask.model, None);
         assert!(!ask.ready(true));
         assert!(
-            ask.why_not(true)
+            ask.why_not(true, Language::English)
                 .is_some_and(|why| why.contains("no model"))
         );
     }
@@ -398,9 +372,12 @@ mod tests {
             model: Some("claude-sonnet-5".to_owned()),
         };
         assert!(!ask.ready(false));
-        assert!(ask.why_not(false).is_some_and(|why| why.contains("key")));
+        assert!(
+            ask.why_not(false, Language::English)
+                .is_some_and(|why| why.contains("key"))
+        );
         assert!(ask.ready(true));
-        assert_eq!(ask.why_not(true), None);
+        assert_eq!(ask.why_not(true, Language::English), None);
     }
 
     /// A local server needs no key, because nothing leaves.
@@ -427,7 +404,10 @@ mod tests {
             model: None,
         };
         assert!(!ask.ready(true));
-        assert!(ask.why_not(true).is_some_and(|why| why.contains("model")));
+        assert!(
+            ask.why_not(true, Language::English)
+                .is_some_and(|why| why.contains("model"))
+        );
     }
 
     /// A key and a question about this machine's traffic must not cross the network in the clear.
@@ -481,7 +461,7 @@ mod tests {
         };
         assert!(!ask.ready(true));
         assert!(
-            ask.why_not(true)
+            ask.why_not(true, Language::English)
                 .is_some_and(|why| why.contains("in the clear"))
         );
     }
@@ -496,7 +476,7 @@ mod tests {
             endpoint: Some(LOCAL_ENDPOINT.to_owned()),
             model: Some("llama3.2".to_owned()),
         };
-        let said = local.disclose().join(" ");
+        let said = local.disclose(Language::English).join(" ");
         assert!(said.contains("Nothing crosses the internet"));
         assert!(said.contains("never a request target") || said.contains("Never a row"));
 
@@ -505,7 +485,7 @@ mod tests {
             endpoint: Some("https://api.anthropic.com/v1/messages".to_owned()),
             ..local
         };
-        let said = hosted.disclose().join(" ");
+        let said = hosted.disclose(Language::English).join(" ");
         assert!(said.contains("will be sent to https://api.anthropic.com/v1/messages"));
         // And that Flowlight records its own connection to the provider, which is the thing it would be
         // easiest to leave out.

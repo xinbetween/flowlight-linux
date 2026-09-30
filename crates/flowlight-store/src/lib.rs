@@ -39,6 +39,7 @@ pub use ask::Ask;
 pub use budget::{Budget, Paths};
 pub use export::Export;
 pub use flowlight_rules::{Guardrail, Mock};
+pub use flowlight_text::{EVERY_LANGUAGE, Language};
 pub use intercept::Intercept;
 
 use anyhow::{Context as _, Result};
@@ -441,20 +442,15 @@ impl Retention {
     ///
     /// Printed rather than documented, because a retention period nobody is told about is a retention period
     /// nobody agreed to.
-    pub fn describe(&self) -> String {
-        format!(
-            "keeping individual requests for {} day{}, and a daily summary for {} day{}",
-            self.detail_days,
-            plural(self.detail_days),
-            self.summary_days,
-            plural(self.summary_days)
+    pub fn describe(&self, language: Language) -> String {
+        language.fill(
+            "retention.describe",
+            &[
+                ("detail", &language.days(self.detail_days)),
+                ("summary", &language.days(self.summary_days)),
+            ],
         )
     }
-}
-
-/// `s`, unless there is one of the thing.
-fn plural(count: u32) -> &'static str {
-    if count == 1 { "" } else { "s" }
 }
 
 /// The database.
@@ -1436,6 +1432,40 @@ impl Store {
             .is_some_and(|value| value == "1"))
     }
 
+    /// The language the daemon renders its sentences in, or `None` for the environment's.
+    ///
+    /// A setting rather than a guess, because the daemon is what renders a disclosure and the daemon's
+    /// environment is not the reader's: it runs as root from a unit file with whatever locale that unit
+    /// happens to have, while the person reading is at a desktop with their own. `None` means read the
+    /// daemon's environment anyway, which is the right answer when somebody runs it from their own shell.
+    ///
+    /// A stored tag that this build does not know is `None` rather than an error. A language could be removed,
+    /// and refusing to start over a setting about wording would be a worse failure than saying it in English.
+    pub fn language(&self) -> Result<Option<Language>> {
+        Ok(self
+            .connection
+            .query_row("SELECT value FROM meta WHERE key = 'language'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .as_deref()
+            .and_then(Language::parse))
+    }
+
+    /// Sets it, or clears it back to the environment's.
+    pub fn set_language(&mut self, wanted: Option<Language>) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('language', ?1)",
+            params![wanted.map_or("auto", Language::tag)],
+        )?;
+        Ok(())
+    }
+
+    /// The language to say something in: the setting, or the environment, or English.
+    pub fn speaking(&self) -> Result<Language> {
+        Ok(self.language()?.unwrap_or_else(Language::detected))
+    }
+
     /// Turns it on or off.
     pub fn set_watching_devices(&mut self, wanted: bool) -> Result<()> {
         self.connection.execute(
@@ -2310,14 +2340,14 @@ mod tests {
     /// about is a retention period nobody agreed to.
     #[test]
     fn the_retention_period_can_be_said_out_loud() {
-        let described = Retention::default().describe();
+        let described = Retention::default().describe(Language::English);
         assert!(described.contains("7 days"), "{described}");
         assert!(described.contains("90 days"), "{described}");
         let one = Retention {
             detail_days: 1,
             summary_days: 1,
         }
-        .describe();
+        .describe(Language::English);
         assert!(one.contains("1 day,"), "{one}");
     }
 
@@ -2735,6 +2765,36 @@ mod tests {
         assert!(!store.watching_devices().unwrap());
         store.set_watching_devices(true).unwrap();
         assert!(store.watching_devices().unwrap());
+    }
+
+    /// Nothing is set until somebody sets it, and clearing it is different from choosing English: one says
+    /// "whatever this machine says" and the other says "English, whatever this machine says".
+    #[test]
+    fn the_language_is_a_setting_and_auto_is_not_a_language() {
+        let mut store = Store::in_memory().unwrap();
+        assert_eq!(store.language().unwrap(), None);
+
+        store.set_language(Some(Language::Japanese)).unwrap();
+        assert_eq!(store.language().unwrap(), Some(Language::Japanese));
+        assert_eq!(store.speaking().unwrap(), Language::Japanese);
+
+        store.set_language(None).unwrap();
+        assert_eq!(store.language().unwrap(), None);
+    }
+
+    /// A tag written by a later version, read by an earlier one. Saying it in English is a smaller failure
+    /// than refusing to start over a setting about wording.
+    #[test]
+    fn a_language_this_build_does_not_have_is_not_an_error() {
+        let store = Store::in_memory().unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('language', 'sv')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.language().unwrap(), None);
     }
 
     /// A device attached before a restart is not an arrival after one, which is why the store remembers
