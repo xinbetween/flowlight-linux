@@ -35,6 +35,7 @@ cleanup() {
     rm -rf "$(dirname "$fake_agent")"
     [ "${agent_tested:-no}" = yes ] && rm -f "$agent_config"
     sudo rm -rf "$(dirname "$database")" "$export_dir" "$(dirname "$certificates")"
+    [ -n "${demo:-}" ] && sudo rm -rf "$(dirname "$demo")"
     return 0
 }
 trap cleanup EXIT
@@ -449,6 +450,100 @@ sudo "$binary" --database "$database" --certificates "$certificates" devices --o
 sudo "$binary" --database "$database" --certificates "$certificates" --json devices \
     | jq -e '.watching == false' >/dev/null || fail "turning it off did not take."
 echo "OK: turning it off stops the watching and keeps what was seen"
+
+# Focus: one thing to look at, and every count below it a count of that. What matters is not that the filter
+# works — that is a unit test — but that a narrowed screen says it is narrowed, and that the one slice which
+# cannot be narrowed returns nothing rather than the whole machine.
+sudo "$binary" --database "$database" --certificates "$certificates" --json focus \
+    | jq -e '(has("focus") | not)' >/dev/null || fail "something was in focus before anything was asked for."
+
+everything=$(sudo "$binary" --database "$database" --certificates "$certificates" --json report --by host --since 3600 \
+    | jq '.rows | length')
+sudo "$binary" --database "$database" --certificates "$certificates" focus --process curl \
+    | grep -q "Narrowed to process curl" \
+    || fail "narrowing did not say what it narrowed to."
+narrowed=$(sudo "$binary" --database "$database" --certificates "$certificates" --json report --by host --since 3600)
+printf '%s' "$narrowed" | jq -e '.focus == "process:curl" and .narrowed == true' >/dev/null \
+    || fail "the report does not say what it was narrowed to."
+if [ "$(printf '%s' "$narrowed" | jq '.rows | length')" -ge "$everything" ]; then
+    fail "narrowing to one process did not narrow anything."
+fi
+# The terminal says so above the rows, every time, because a count of a subset read as a total is the whole
+# failure this feature can cause.
+#
+# Read from a variable rather than piped into `head`: `head` closes the pipe after one line, the daemon gets
+# EPIPE for the rest of the report, and `pipefail` then fails the pipeline whatever the line said. That is how
+# this assertion first "failed" against output that was correct.
+printed=$(sudo "$binary" --database "$database" --certificates "$certificates" report --by host --since 3600)
+case "${printed%%$'\n'*}" in
+    "Narrowed to process curl"*) ;;
+    *) fail "a narrowed report does not say so above its rows." ;;
+esac
+
+# And the one it cannot narrow. An address is recorded at connect(), where the name was already resolved and
+# thrown away, so "these addresses, but only api.example.com" is a question the data cannot answer.
+sudo "$binary" --database "$database" --certificates "$certificates" focus --host example.com >/dev/null
+sudo "$binary" --database "$database" --certificates "$certificates" --json report --by address --since 3600 \
+    | jq -e '.narrowed == false and (.rows | length == 0)' >/dev/null \
+    || fail "a slice that cannot be narrowed to a host showed rows anyway."
+
+sudo "$binary" --database "$database" --certificates "$certificates" focus --clear | grep -q "Showing everything" \
+    || fail "clearing the focus did not take."
+echo "OK: a focus narrows what is shown, says so, and refuses the slice it cannot narrow"
+
+# Starter rules. Listing them writes nothing, applying one writes exactly its own rules, and applying it twice
+# changes nothing the second time.
+sudo "$binary" --database "$database" --certificates "$certificates" --json starters \
+    | jq -e 'length >= 4 and ([.[] | select(.action == "allow")] | length == 0)' >/dev/null \
+    || fail "the starters are missing, or one of them allows something."
+# `rules --json` is one object per line rather than an array, so every count of it is slurped. Counting the
+# lines of `jq length` instead gives the number of keys in each rule, which is a number that looks plausible
+# and means nothing.
+before=$(sudo "$binary" --database "$database" --certificates "$certificates" --json rules | jq -s 'length')
+sudo "$binary" --database "$database" --certificates "$certificates" starters >/dev/null
+after=$(sudo "$binary" --database "$database" --certificates "$certificates" --json rules | jq -s 'length')
+[ "$before" = "$after" ] || fail "listing the starters wrote a rule."
+
+applied=$(sudo "$binary" --database "$database" --certificates "$certificates" --json starters --apply metadata)
+printf '%s' "$applied" | jq -e '.added | length >= 3' >/dev/null || fail "applying a starter wrote nothing."
+sudo "$binary" --database "$database" --certificates "$certificates" --json rules \
+    | jq -s -e '[.[] | select(.subject == "169.254.169.254" and .action == "block")] | length == 1' \
+    >/dev/null || fail "the metadata service is not blocked after applying the starter that blocks it."
+sudo "$binary" --database "$database" --certificates "$certificates" --json starters --apply metadata \
+    | jq -e '(.added | length == 0) and (.unchanged | length >= 3)' >/dev/null \
+    || fail "applying the same starter twice wrote it again."
+for subject in $(printf '%s' "$applied" | jq -r '.added[]'); do
+    sudo "$binary" --database "$database" --certificates "$certificates" --json rules \
+        | jq -s -e --arg s "$subject" '[.[] | select(.subject == $s)] | length == 1' >/dev/null \
+        || fail "the starter left more than one rule for $subject."
+done
+echo "OK: the starters are written when they are asked for, once, and not before"
+
+# A demonstration database, which is the only way a tool that watches a private machine gets photographed.
+demo=$(mktemp -d)/demonstration.db
+sudo "$binary" --database "$database" --certificates "$certificates" demo --into "$demo" \
+    | grep -q "Nothing in it happened" || fail "the demonstration does not say what it is."
+sudo "$binary" --database "$demo" --certificates "$certificates" --json report --by host --since 86400 \
+    | jq -e '.rows | length >= 3' >/dev/null || fail "the demonstration has nothing to photograph."
+# On stderr, not stdout: stdout is the answer, and a notice printed into it makes `--json` unparseable.
+said=$(sudo "$binary" --database "$demo" --certificates "$certificates" coverage 2>&1 >/dev/null)
+case "$said" in
+    *"This is a demonstration database."*) ;;
+    *) fail "reading a demonstration does not say that is what it is." ;;
+esac
+# And the answer itself stays machine-readable, which is the reason the notice is not in it.
+sudo "$binary" --database "$demo" --certificates "$certificates" --json coverage 2>/dev/null \
+    | jq -e '.requests > 0' >/dev/null \
+    || fail "a demonstration's JSON is not parseable, or says nothing was read."
+# It will not write over anything, and the daemon will not watch into one: real traffic mixed into a
+# demonstration would leave two things nobody can tell apart.
+if sudo "$binary" --database "$database" --certificates "$certificates" demo --into "$demo" >/dev/null 2>&1; then
+    fail "a demonstration was written over a file that already existed."
+fi
+if sudo "$binary" --database "$demo" --certificates "$certificates" --seconds 2 >/dev/null 2>&1; then
+    fail "the daemon watched into a demonstration database."
+fi
+echo "OK: a demonstration can be photographed, says what it is, and cannot be watched into"
 
 # Nine languages. What is asserted is not the wording — that is what the unit tests are for — but that the
 # sentences somebody is asked to agree to actually change language, that the facts inside them survive being

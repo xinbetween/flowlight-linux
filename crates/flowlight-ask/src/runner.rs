@@ -89,7 +89,9 @@ fn produced(
 
 /// How much moved.
 fn totals(store: &mut Store, window: Window, process: Option<&str>) -> Result<Produced> {
-    let rows = store.processes(window.from)?;
+    // Never narrowed by a focus. A focus is a setting about what somebody is looking at; a model asked what
+    // this machine did would otherwise answer with a subset and say it was the machine.
+    let rows = store.processes(window.from, None)?;
     let counted: Vec<_> = rows
         .iter()
         .filter(|row| process.is_none_or(|name| row.process == name))
@@ -120,7 +122,7 @@ fn totals(store: &mut Store, window: Window, process: Option<&str>) -> Result<Pr
 
 /// The busiest processes.
 fn top_processes(store: &mut Store, window: Window, limit: usize) -> Result<Produced> {
-    let rows = store.processes(window.from)?;
+    let rows = store.processes(window.from, None)?;
     let listed: Vec<Value> = rows
         .iter()
         .take(limit)

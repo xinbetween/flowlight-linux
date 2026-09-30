@@ -979,6 +979,16 @@ pub struct ReportView {
     pub by: String,
     /// Whether the bytes column means anything for this slice.
     pub counts_bytes: bool,
+    /// What this was narrowed to, when it was narrowed to anything.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
+    /// Whether the focus could be applied to this slice at all.
+    ///
+    /// A host focus cannot narrow a breakdown by address: an address is recorded at `connect()`, where the
+    /// name had already been resolved and thrown away. When this is false the rows are empty rather than
+    /// unnarrowed, because a slice quietly showing the whole machine while a focus was in force would be the
+    /// one screen nobody could trust.
+    pub narrowed: bool,
     /// The rows, busiest first.
     pub rows: Vec<ShareView>,
     /// Everything in the window, so a share can be a share of something.
@@ -1014,18 +1024,32 @@ pub struct StandingView {
 }
 
 /// Traffic sliced one way, with the outliers named.
-pub fn report(store: &mut Store, by: &str, since: i64, limit: usize) -> Result<ReportView> {
+pub fn report(
+    store: &mut Store,
+    by: &str,
+    since: i64,
+    limit: usize,
+    focus: Option<&flowlight_store::Focus>,
+) -> Result<ReportView> {
     use anyhow::Context as _;
     let slice = flowlight_store::Slice::parse(by)
         .with_context(|| format!("`{by}` is not one of: process, host, address, protocol"))?;
-    let rows = store.breakdown(slice, since, rows(limit))?;
+    let narrowed = focus.is_none_or(|focus| slice.narrows_to(focus));
+    let rows = if narrowed {
+        store.breakdown(slice, since, rows(limit), focus)?
+    } else {
+        Vec::new()
+    };
     let total_events: i64 = rows.iter().map(|row| row.events).sum();
     let total_bytes: i64 = rows.iter().map(|row| row.bytes).sum();
 
     // The outliers are always judged by process, whatever the slice: "this host is not like the others" is a
     // statement about a host's operator, which Flowlight has no business making.
     let mut counts: Vec<i64> = Vec::new();
-    let processes = store.processes(since)?;
+    // The outliers are judged against the machine rather than against the focus: "this process reached far
+    // more hosts than the usual process here" is a comparison with everything, and comparing a narrowed list
+    // with itself would make every process on it normal.
+    let processes = store.processes(since, None)?;
     for row in &processes {
         counts.push(row.hosts);
     }
@@ -1071,6 +1095,8 @@ pub fn report(store: &mut Store, by: &str, since: i64, limit: usize) -> Result<R
     Ok(ReportView {
         by: slice.as_str().to_owned(),
         counts_bytes: slice.counts_bytes(),
+        focus: focus.map(flowlight_store::Focus::as_str),
+        narrowed,
         rows: rows
             .into_iter()
             .map(|row| ShareView {
@@ -1088,6 +1114,175 @@ pub fn report(store: &mut Store, by: &str, since: i64, limit: usize) -> Result<R
         total_bytes,
         standing,
     })
+}
+
+/// What every terminal answer is narrowed to.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FocusView {
+    /// `process:claude`, `host:api.anthropic.com`, or nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
+    /// `process` or `host`, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// The thing itself, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// The sentence a narrowed screen carries above its rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub said: Option<String>,
+}
+
+/// What is being looked at, described.
+pub fn focus(store: &mut Store) -> Result<FocusView> {
+    Ok(describe_focus(store.focus()?.as_ref()))
+}
+
+/// Narrows what is shown, or stops narrowing it.
+///
+/// A focus that names nothing recorded is written anyway. It is a question about the future as much as the
+/// past — somebody narrows to a host *before* watching what reaches it — and refusing it because nothing has
+/// reached it yet would refuse the useful case.
+pub fn set_focus(store: &mut Store, wanted: Option<&str>) -> Result<FocusView> {
+    match wanted {
+        None => store.set_focus(None)?,
+        Some(text) => {
+            let parsed = flowlight_store::Focus::parse(text).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "`{text}` is not a focus. It is `process:<name>` or `host:<name>` — the kind has to be \
+                     said, because `focus node` meaning a process on one machine and a host on another is \
+                     worse than six more characters."
+                )
+            })?;
+            store.set_focus(Some(&parsed))?;
+        }
+    }
+    focus(store)
+}
+
+/// The sentence a narrowed screen carries above its rows, when it is narrowed to anything.
+pub fn narrowing_said(focus: Option<&flowlight_store::Focus>) -> Option<String> {
+    describe_focus(focus).said
+}
+
+/// Turns a focus into what an interface shows, including the sentence a narrowed screen says.
+fn describe_focus(focus: Option<&flowlight_store::Focus>) -> FocusView {
+    let Some(focus) = focus else {
+        return FocusView {
+            focus: None,
+            kind: None,
+            subject: None,
+            said: None,
+        };
+    };
+    let (kind, subject) = match focus {
+        flowlight_store::Focus::Process(process) => ("process", process.clone()),
+        flowlight_store::Focus::Host(host) => ("host", host.clone()),
+    };
+    FocusView {
+        focus: Some(focus.as_str()),
+        kind: Some(kind.to_owned()),
+        subject: Some(subject.clone()),
+        // Said rather than implied. Every count under a focus is a count of a subset, and a subset presented
+        // as a total is the mistake this sentence exists to prevent.
+        said: Some(format!(
+            "Narrowed to {kind} {subject}. Every count below is a count of that, not of this machine. \
+             `flowlightd focus --clear` shows everything again."
+        )),
+    }
+}
+
+/// One starter rule, and whether it is in place.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StarterView {
+    /// What to call it.
+    pub id: String,
+    /// `block` or `ask`.
+    pub action: String,
+    /// Why somebody would want it.
+    pub why: String,
+    /// What it is about reaching.
+    pub subjects: Vec<String>,
+    /// How many of its rules are already written, saying exactly this.
+    pub in_place: usize,
+}
+
+/// The rules people write first, and how much of each is already written.
+pub fn starters(store: &mut Store) -> Result<Vec<StarterView>> {
+    let existing = store.rules()?;
+    Ok(flowlight_rules::starters::EVERY_STARTER
+        .iter()
+        .map(|starter| StarterView {
+            id: starter.id.to_owned(),
+            action: starter.action.as_str().to_owned(),
+            why: starter.why.to_owned(),
+            subjects: starter.subjects.iter().map(|&it| it.to_owned()).collect(),
+            in_place: starter
+                .subjects
+                .iter()
+                .filter(|subject| {
+                    existing.iter().any(|rule| {
+                        rule.subject == **subject && rule.action == starter.action.as_str()
+                    })
+                })
+                .count(),
+        })
+        .collect())
+}
+
+/// What applying a starter wrote.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AppliedView {
+    /// Which one.
+    pub id: String,
+    /// What it does.
+    pub action: String,
+    /// Who it applies to: `everyone`, or one agent.
+    pub scope: String,
+    /// The rules that were not there before.
+    pub added: Vec<String>,
+    /// The rules that said something else and now say this.
+    pub changed: Vec<String>,
+    /// The rules that already said exactly this.
+    pub unchanged: Vec<String>,
+}
+
+/// Writes one starter's rules.
+///
+/// Named one at a time on purpose. There is no `--all`: a command that writes twenty-eight rules because
+/// somebody liked the idea of starter rules is a command that writes rules nobody read.
+pub fn apply_starter(store: &mut Store, id: &str, agent: Option<&str>) -> Result<AppliedView> {
+    let starter = flowlight_rules::starters::starter(id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "`{id}` is not one of: {}",
+            flowlight_rules::starters::EVERY_STARTER
+                .iter()
+                .map(|candidate| candidate.id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    let scope = agent.map_or_else(
+        || "everyone".to_owned(),
+        |agent| format!("agent:{}", agent.trim()),
+    );
+    let note = format!("starter: {}", starter.id);
+    let mut applied = AppliedView {
+        id: starter.id.to_owned(),
+        action: starter.action.as_str().to_owned(),
+        scope: scope.clone(),
+        added: Vec::new(),
+        changed: Vec::new(),
+        unchanged: Vec::new(),
+    };
+    for subject in starter.subjects {
+        match store.put_rule(starter.action.as_str(), subject, 0, &scope, Some(&note))? {
+            flowlight_store::Wrote::Added => applied.added.push((*subject).to_owned()),
+            flowlight_store::Wrote::Changed => applied.changed.push((*subject).to_owned()),
+            flowlight_store::Wrote::Unchanged => applied.unchanged.push((*subject).to_owned()),
+        }
+    }
+    Ok(applied)
 }
 
 /// Which language Flowlight says things in, and which it could.
@@ -1311,9 +1506,14 @@ pub fn rows(limit: usize) -> usize {
 }
 
 /// Requests since a moment, newest first.
-pub fn requests(store: &mut Store, since: i64, limit: usize) -> Result<Vec<RequestView>> {
+pub fn requests(
+    store: &mut Store,
+    since: i64,
+    limit: usize,
+    focus: Option<&flowlight_store::Focus>,
+) -> Result<Vec<RequestView>> {
     Ok(store
-        .requests_since(since, rows(limit))?
+        .requests_since(since, rows(limit), focus)?
         .into_iter()
         .map(|row| RequestView {
             at: row.at,
@@ -1337,9 +1537,13 @@ pub fn requests(store: &mut Store, since: i64, limit: usize) -> Result<Vec<Reque
 }
 
 /// Processes, busiest first.
-pub fn processes(store: &mut Store, since: i64) -> Result<Vec<ProcessView>> {
+pub fn processes(
+    store: &mut Store,
+    since: i64,
+    focus: Option<&flowlight_store::Focus>,
+) -> Result<Vec<ProcessView>> {
     Ok(store
-        .processes(since)?
+        .processes(since, focus)?
         .into_iter()
         .map(|row| ProcessView {
             process: row.process,
@@ -1353,9 +1557,14 @@ pub fn processes(store: &mut Store, since: i64) -> Result<Vec<ProcessView>> {
 }
 
 /// The hosts one process reached.
-pub fn hosts(store: &mut Store, process: &str, since: i64) -> Result<Vec<HostView>> {
+pub fn hosts(
+    store: &mut Store,
+    process: &str,
+    since: i64,
+    focus: Option<&flowlight_store::Focus>,
+) -> Result<Vec<HostView>> {
     Ok(store
-        .hosts_for(process, since, 100)?
+        .hosts_for(process, since, 100, focus)?
         .into_iter()
         .map(|row| HostView {
             host: row.host,
@@ -1694,7 +1903,7 @@ mod tests {
                 rpc_tool: None,
             })
             .unwrap();
-        let view = requests(&mut store, 0, 10).unwrap();
+        let view = requests(&mut store, 0, 10, None).unwrap();
         assert_eq!(view.len(), 1);
         let json = serde_json::to_string(&view[0]).unwrap();
         for expected in [

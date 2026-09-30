@@ -58,6 +58,9 @@ pub fn run(
             | Command::Owners { .. }
             | Command::Devices { .. }
             | Command::Language { .. }
+            | Command::Focus { .. }
+            | Command::Starters { .. }
+            | Command::Demo { .. }
     );
     if !writes && !database.exists() {
         bail!(
@@ -66,8 +69,42 @@ pub fn run(
             database.display()
         );
     }
+
+    // Answered before the real database is opened, because `Store::open` creates what is not there and
+    // writing a demonstration is no reason to leave an empty database behind somewhere else.
+    if let Command::Demo { into, hours } = command {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs() as i64);
+        let (requests, connections) = flowlight_store::demonstration::write(into, now, *hours)?;
+        let mut out = std::io::stdout().lock();
+        writeln!(
+            out,
+            "Wrote {requests} request(s) and {connections} connection(s) to {}. Nothing in it happened.",
+            into.display()
+        )?;
+        writeln!(
+            out,
+            "\n  flowlightd --database {} report --by host\n  flowlightd --database {} coverage",
+            into.display(),
+            into.display()
+        )?;
+        return Ok(());
+    }
+
     let mut store = Store::open(database)?;
     let mut out = std::io::stdout().lock();
+
+    // Before anything else it says, and on stderr rather than stdout. A demonstration database is meant to be
+    // photographed, and a screenshot that does not say what it is of is a screenshot somebody will read as a
+    // machine's real traffic — but stdout is the answer, and a notice printed into it turns `--json` into
+    // something no program can parse. Which is how this was found.
+    //
+    // There is no equivalent for the socket, because the socket never serves one: the daemon refuses to start
+    // against a demonstration database at all.
+    if store.is_demonstration()? {
+        eprintln!("This is a demonstration database. Nothing in it happened.");
+    }
 
     match command {
         Command::History { since, limit } => {
@@ -76,7 +113,11 @@ pub fn run(
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs() as i64);
-            let rows = store.requests_since(now - window, *limit)?;
+            let narrowing = store.focus()?;
+            if !json && let Some(said) = crate::views::narrowing_said(narrowing.as_ref()) {
+                writeln!(out, "{said}\n")?;
+            }
+            let rows = store.requests_since(now - window, *limit, narrowing.as_ref())?;
             if rows.is_empty() {
                 // A count of zero and an empty screen look the same and mean different things. One of them
                 // is "nothing happened" and the other is "you are looking in the wrong place".
@@ -558,6 +599,84 @@ pub fn run(
                 }
             }
         }
+        Command::Focus {
+            process,
+            host,
+            clear,
+        } => {
+            let view = if *clear {
+                crate::views::set_focus(&mut store, None)?
+            } else if let Some(name) = process {
+                crate::views::set_focus(&mut store, Some(&format!("process:{name}")))?
+            } else if let Some(name) = host {
+                crate::views::set_focus(&mut store, Some(&format!("host:{name}")))?
+            } else {
+                crate::views::focus(&mut store)?
+            };
+            if json {
+                writeln!(out, "{}", line(&view))?;
+            } else {
+                match &view.said {
+                    Some(said) => writeln!(out, "{said}")?,
+                    None => writeln!(
+                        out,
+                        "Showing everything. `flowlightd focus --process <name>` or `--host <name>` narrows \
+                         it."
+                    )?,
+                }
+            }
+        }
+        Command::Starters { apply, agent } => {
+            if let Some(id) = apply {
+                let view = crate::views::apply_starter(&mut store, id, agent.as_deref())?;
+                if json {
+                    writeln!(out, "{}", line(&view))?;
+                } else {
+                    writeln!(
+                        out,
+                        "{}: {} rule(s) added, {} changed, {} already said this, for {}.",
+                        view.id,
+                        view.added.len(),
+                        view.changed.len(),
+                        view.unchanged.len(),
+                        view.scope
+                    )?;
+                    // Named, not counted: somebody who just wrote five rules should be able to read which.
+                    for subject in view.added.iter().chain(view.changed.iter()) {
+                        writeln!(out, "  {} {subject}", view.action)?;
+                    }
+                    writeln!(
+                        out,
+                        "\n`flowlightd rules` lists them and `flowlightd forget <id>` takes one away."
+                    )?;
+                }
+                return Ok(());
+            }
+            let view = crate::views::starters(&mut store)?;
+            if json {
+                writeln!(out, "{}", line(&view))?;
+            } else {
+                for starter in &view {
+                    writeln!(
+                        out,
+                        "{:<10} {:<6} {} of {} in place",
+                        starter.id,
+                        starter.action,
+                        starter.in_place,
+                        starter.subjects.len()
+                    )?;
+                    writeln!(out, "    {}", starter.why)?;
+                    writeln!(out, "    {}", starter.subjects.join(", "))?;
+                }
+                writeln!(
+                    out,
+                    "\nNothing above is written. `flowlightd starters --apply <name>` writes one, and \
+                     `--agent <name>` writes it for one agent rather than for everything here."
+                )?;
+            }
+        }
+        // Answered above, before the real database was opened.
+        Command::Demo { .. } => unreachable!("answered before the database was opened"),
         Command::Language { language, auto } => {
             let view = if *auto {
                 crate::views::set_language(&mut store, None)?
@@ -652,7 +771,12 @@ pub fn run(
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs() as i64);
-            let view = crate::views::report(&mut store, by, now - window, *limit)?;
+            let narrowing = store.focus()?;
+            if !json && let Some(said) = crate::views::narrowing_said(narrowing.as_ref()) {
+                writeln!(out, "{said}\n")?;
+            }
+            let view =
+                crate::views::report(&mut store, by, now - window, *limit, narrowing.as_ref())?;
             if json {
                 writeln!(out, "{}", line(&view))?;
             } else if view.rows.is_empty() {

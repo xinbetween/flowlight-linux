@@ -32,6 +32,7 @@
 
 pub mod ask;
 pub mod budget;
+pub mod demonstration;
 pub mod export;
 pub mod intercept;
 
@@ -183,6 +184,67 @@ pub struct RuleRow {
     pub scope: String,
     /// Why, if whoever wrote it said.
     pub note: Option<String>,
+}
+
+/// One thing to look at, to the exclusion of the rest.
+///
+/// A setting rather than an argument on every command, so that narrowing happens once and stays. The cost of
+/// that is a screen showing a number which is not the total, which is why every terminal answer says what it
+/// was narrowed to, above the rows, before anybody reads them.
+///
+/// Coverage is deliberately not narrowed by it. Coverage's job is to say what was *missed*, over everything,
+/// and a narrowed Coverage would hide exactly the thing it exists to show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Focus {
+    /// One process, by the name Flowlight calls it.
+    Process(String),
+    /// One host, as it was recorded.
+    Host(String),
+}
+
+impl Focus {
+    /// Reads `process:claude` or `host:api.anthropic.com`.
+    ///
+    /// The kind has to be said. A bare name would have to be guessed at, and `focus node` meaning a host on
+    /// one machine and a process on another is worse than being asked to type six more characters.
+    pub fn parse(text: &str) -> Option<Self> {
+        let (kind, value) = text.trim().split_once(':')?;
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        match kind.trim().to_lowercase().as_str() {
+            "process" => Some(Self::Process(value.to_owned())),
+            // Lowercased, because that is how a host is recorded and a focus that does not match anything is
+            // indistinguishable from a machine with nothing on it.
+            "host" => Some(Self::Host(value.to_lowercase())),
+            _ => None,
+        }
+    }
+
+    /// How it is written down.
+    pub fn as_str(&self) -> String {
+        match self {
+            Self::Process(process) => format!("process:{process}"),
+            Self::Host(host) => format!("host:{host}"),
+        }
+    }
+
+    /// The process this narrows to, when it narrows to one.
+    pub fn process(&self) -> Option<&str> {
+        match self {
+            Self::Process(process) => Some(process),
+            Self::Host(_) => None,
+        }
+    }
+
+    /// The host this narrows to, when it narrows to one.
+    pub fn host(&self) -> Option<&str> {
+        match self {
+            Self::Host(host) => Some(host),
+            Self::Process(_) => None,
+        }
+    }
 }
 
 /// What writing a rule did.
@@ -338,6 +400,20 @@ impl Slice {
     /// records an address. Showing a column of zeroes would be worse than not showing one.
     pub fn counts_bytes(self) -> bool {
         !matches!(self, Self::Address)
+    }
+
+    /// Whether a focus can narrow this slice.
+    ///
+    /// Every slice narrows to a process. Only the ones built from requests narrow to a host: an address is
+    /// recorded at `connect()`, where the name had already been resolved and thrown away, so "these
+    /// addresses, but only the ones that were `api.example.com`" is a question this data cannot answer. It is
+    /// reported rather than approximated, because a slice that quietly showed the whole machine's traffic
+    /// while a focus was in force would be the one screen nobody could trust.
+    pub fn narrows_to(self, focus: &Focus) -> bool {
+        match focus {
+            Focus::Process(_) => true,
+            Focus::Host(_) => self != Self::Address,
+        }
     }
 }
 
@@ -869,14 +945,28 @@ impl Store {
     }
 
     /// Requests since a moment, newest first.
-    pub fn requests_since(&mut self, since: i64, limit: usize) -> Result<Vec<RequestRow>> {
+    /// A focus narrows it. The condition is written as `?3 IS NULL OR ...` rather than by building the SQL
+    /// string, so there is one statement with one meaning whether or not anything is narrowing it — and no
+    /// place where a value could be concatenated into a query.
+    pub fn requests_since(
+        &mut self,
+        since: i64,
+        limit: usize,
+        focus: Option<&Focus>,
+    ) -> Result<Vec<RequestRow>> {
         self.flush()?;
         let mut statement = self.connection.prepare(
             "SELECT at, process, confidence, pid, direction, protocol, method, target, host,
                     status, bytes, truncated, unreadable, agent, rpc_method, rpc_tool
-             FROM requests WHERE at >= ?1 ORDER BY at DESC, id DESC LIMIT ?2",
+             FROM requests
+             WHERE at >= ?1
+               AND (?3 IS NULL OR process = ?3)
+               AND (?4 IS NULL OR host = ?4)
+             ORDER BY at DESC, id DESC LIMIT ?2",
         )?;
-        let rows = statement.query_map(params![since, limit as i64], |row| {
+        let narrowed = focus.and_then(Focus::process);
+        let host = focus.and_then(Focus::host);
+        let rows = statement.query_map(params![since, limit as i64, narrowed, host], |row| {
             Ok(RequestRow {
                 at: row.get(0)?,
                 process: row.get(1)?,
@@ -1047,16 +1137,21 @@ impl Store {
     /// and the *worst* name a process was given over the window is the one worth showing — a process named
     /// from its path nine times out of ten and from a truncated `comm` once is a process whose rules might
     /// not match.
-    pub fn processes(&mut self, since: i64) -> Result<Vec<ProcessRow>> {
+    pub fn processes(&mut self, since: i64, focus: Option<&Focus>) -> Result<Vec<ProcessRow>> {
         self.flush()?;
         let mut statement = self.connection.prepare(
             "SELECT process, min(confidence), count(*), count(DISTINCT host),
                     coalesce(sum(bytes), 0), max(at)
-             FROM requests WHERE at >= ?1
+             FROM requests
+             WHERE at >= ?1
+               AND (?2 IS NULL OR process = ?2)
+               AND (?3 IS NULL OR host = ?3)
              GROUP BY process
              ORDER BY count(*) DESC",
         )?;
-        let rows = statement.query_map(params![since], |row| {
+        let narrowed = focus.and_then(Focus::process);
+        let host = focus.and_then(Focus::host);
+        let rows = statement.query_map(params![since, narrowed, host], |row| {
             Ok(ProcessRow {
                 process: row.get(0)?,
                 confidence: row.get(1)?,
@@ -1432,6 +1527,57 @@ impl Store {
             .is_some_and(|value| value == "1"))
     }
 
+    /// Whether this database holds a demonstration rather than anything that happened.
+    ///
+    /// Asked before anything is printed, and asked by the daemon before it watches: real traffic written into
+    /// a demonstration would leave two things nobody can tell apart, and the one people would believe is the
+    /// wrong one.
+    pub fn is_demonstration(&self) -> Result<bool> {
+        Ok(self
+            .connection
+            .query_row("SELECT value FROM meta WHERE key = 'demo'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .is_some_and(|value| value == "1"))
+    }
+
+    /// Marks it as one, for as long as it exists.
+    ///
+    /// There is no unmarking. A file that was a demonstration stays one — the alternative is a command that
+    /// turns made-up history into history, which is the one thing a demonstration mode must not be able to do.
+    pub fn mark_demonstration(&mut self) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('demo', '1')",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// What every terminal answer is narrowed to, when it is narrowed to anything.
+    ///
+    /// A focus nobody can parse any more — written by a later version, or edited by hand — reads as no focus.
+    /// Showing everything is the safe failure; showing a subset while believing it is everything is not.
+    pub fn focus(&self) -> Result<Option<Focus>> {
+        Ok(self
+            .connection
+            .query_row("SELECT value FROM meta WHERE key = 'focus'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .as_deref()
+            .and_then(Focus::parse))
+    }
+
+    /// Narrows what is shown, or stops narrowing it.
+    pub fn set_focus(&mut self, wanted: Option<&Focus>) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('focus', ?1)",
+            params![wanted.map_or_else(|| "everything".to_owned(), Focus::as_str)],
+        )?;
+        Ok(())
+    }
+
     /// The language the daemon renders its sentences in, or `None` for the environment's.
     ///
     /// A setting rather than a guess, because the daemon is what renders a disclosure and the daemon's
@@ -1646,33 +1792,49 @@ impl Store {
     ///
     /// One query with the column chosen rather than four queries, because four drift: the first bug that shape
     /// prevents is a window applied to three of them.
-    pub fn breakdown(&mut self, by: Slice, since: i64, limit: usize) -> Result<Vec<Share>> {
+    /// A focus narrows it, where it can. A host focus cannot narrow the address slice at all — an address is
+    /// recorded by the kernel at `connect()`, where the name was already resolved and thrown away — and that
+    /// is reported by [`Slice::narrows_to`] rather than by quietly returning the whole machine's traffic.
+    pub fn breakdown(
+        &mut self,
+        by: Slice,
+        since: i64,
+        limit: usize,
+        focus: Option<&Focus>,
+    ) -> Result<Vec<Share>> {
         self.flush()?;
         let statement = match by {
             Slice::Process => {
                 "SELECT process, count(*), coalesce(sum(bytes), 0) FROM requests
-                 WHERE at >= ?1 GROUP BY process ORDER BY sum(bytes) DESC LIMIT ?2"
+                 WHERE at >= ?1 AND (?3 IS NULL OR process = ?3) AND (?4 IS NULL OR host = ?4)
+                 GROUP BY process ORDER BY sum(bytes) DESC LIMIT ?2"
             }
             Slice::Host => {
                 "SELECT host, count(*), coalesce(sum(bytes), 0) FROM requests
                  WHERE at >= ?1 AND host IS NOT NULL AND host != ''
+                   AND (?3 IS NULL OR process = ?3) AND (?4 IS NULL OR host = ?4)
                  GROUP BY host ORDER BY sum(bytes) DESC LIMIT ?2"
             }
             Slice::Protocol => {
                 "SELECT coalesce(protocol, 'http/1.1'), count(*), coalesce(sum(bytes), 0) FROM requests
-                 WHERE at >= ?1 GROUP BY coalesce(protocol, 'http/1.1')
+                 WHERE at >= ?1 AND (?3 IS NULL OR process = ?3) AND (?4 IS NULL OR host = ?4)
+                 GROUP BY coalesce(protocol, 'http/1.1')
                  ORDER BY sum(bytes) DESC LIMIT ?2"
             }
             // Addresses come from connections, which is the only place one is recorded: a probe on a TLS
-            // library never sees an address, and the kernel never sees a name.
+            // library never sees an address, and the kernel never sees a name. Which is also why `?4` — a
+            // host — cannot appear in this one, and why asking for it returns nothing rather than everything.
             Slice::Address => {
                 "SELECT destination, count(*), 0 FROM connections
                  WHERE at >= ?1 AND destination IS NOT NULL AND destination != ''
+                   AND (?3 IS NULL OR process = ?3) AND ?4 IS NULL
                  GROUP BY destination ORDER BY count(*) DESC LIMIT ?2"
             }
         };
         let mut prepared = self.connection.prepare(statement)?;
-        let rows = prepared.query_map(params![since, limit as i64], |row| {
+        let narrowed = focus.and_then(Focus::process);
+        let host = focus.and_then(Focus::host);
+        let rows = prepared.query_map(params![since, limit as i64, narrowed, host], |row| {
             Ok(Share {
                 name: row.get(0)?,
                 events: row.get(1)?,
@@ -2075,20 +2237,33 @@ impl Store {
     }
 
     /// The hosts one process reached, busiest first.
-    pub fn hosts_for(&mut self, process: &str, since: i64, limit: usize) -> Result<Vec<HostRow>> {
+    pub fn hosts_for(
+        &mut self,
+        process: &str,
+        since: i64,
+        limit: usize,
+        focus: Option<&Focus>,
+    ) -> Result<Vec<HostRow>> {
         self.flush()?;
         let mut statement = self.connection.prepare(
             "SELECT host, count(*), max(at) FROM requests
              WHERE at >= ?1 AND process = ?2 AND host IS NOT NULL
+               AND (?4 IS NULL OR process = ?4)
+               AND (?5 IS NULL OR host = ?5)
              GROUP BY host ORDER BY count(*) DESC LIMIT ?3",
         )?;
-        let rows = statement.query_map(params![since, process, limit as i64], |row| {
-            Ok(HostRow {
-                host: row.get(0)?,
-                requests: row.get(1)?,
-                last_seen: row.get(2)?,
-            })
-        })?;
+        let narrowed = focus.and_then(Focus::process);
+        let host = focus.and_then(Focus::host);
+        let rows = statement.query_map(
+            params![since, process, limit as i64, narrowed, host],
+            |row| {
+                Ok(HostRow {
+                    host: row.get(0)?,
+                    requests: row.get(1)?,
+                    last_seen: row.get(2)?,
+                })
+            },
+        )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -2180,7 +2355,7 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         let row = request(1_000, "claude", "api.anthropic.com", 3_800);
         store.record_request(row.clone()).unwrap();
-        assert_eq!(store.requests_since(0, 10).unwrap(), vec![row]);
+        assert_eq!(store.requests_since(0, 10, None).unwrap(), vec![row]);
     }
 
     #[test]
@@ -2192,7 +2367,7 @@ mod tests {
                 .unwrap();
         }
         let times: Vec<_> = store
-            .requests_since(0, 10)
+            .requests_since(0, 10, None)
             .unwrap()
             .iter()
             .map(|row| row.at)
@@ -2209,7 +2384,7 @@ mod tests {
         store
             .record_request(request(900, "curl", "example.com", 10))
             .unwrap();
-        assert_eq!(store.requests_since(500, 10).unwrap().len(), 1);
+        assert_eq!(store.requests_since(500, 10, None).unwrap().len(), 1);
     }
 
     /// Detail expires; the shape of what happened does not. A month later the question is "was this normal",
@@ -2237,7 +2412,7 @@ mod tests {
         assert_eq!(swept.requests_rolled, 2);
 
         // The recent one is untouched.
-        assert_eq!(store.requests_since(0, 10).unwrap().len(), 1);
+        assert_eq!(store.requests_since(0, 10, None).unwrap().len(), 1);
 
         let summary = store.summary(10).unwrap();
         assert_eq!(summary.len(), 1);
@@ -2284,7 +2459,7 @@ mod tests {
             .unwrap();
         let swept = store.sweep(30 * DAY, Retention::default()).unwrap();
         assert_eq!(swept, Swept::default());
-        assert_eq!(store.requests_since(0, 10).unwrap().len(), 1);
+        assert_eq!(store.requests_since(0, 10, None).unwrap().len(), 1);
     }
 
     /// Nothing is kept forever, including the summary.
@@ -2528,7 +2703,7 @@ mod tests {
             .record_request(request(1_050, "curl", "example.com", 10))
             .unwrap();
 
-        let processes = store.processes(0).unwrap();
+        let processes = store.processes(0, None).unwrap();
         assert_eq!(processes.len(), 2);
         assert_eq!(processes[0].process, "claude");
         assert_eq!(processes[0].requests, 4);
@@ -2549,7 +2724,7 @@ mod tests {
         let mut weak = request(1_001, "claude", "api.anthropic.com", 1);
         weak.confidence = "comm".to_owned();
         store.record_request(weak).unwrap();
-        assert_eq!(store.processes(0).unwrap()[0].confidence, "comm");
+        assert_eq!(store.processes(0, None).unwrap()[0].confidence, "comm");
     }
 
     #[test]
@@ -2567,7 +2742,7 @@ mod tests {
             .record_request(request(1_000, "curl", "example.com", 1))
             .unwrap();
 
-        let hosts = store.hosts_for("claude", 0, 10).unwrap();
+        let hosts = store.hosts_for("claude", 0, 10, None).unwrap();
         assert_eq!(hosts.len(), 2);
         assert_eq!(hosts[0].host, "api.anthropic.com");
         assert_eq!(hosts[0].requests, 2);
@@ -2603,7 +2778,7 @@ mod tests {
         writer.flush().unwrap();
 
         let mut reader = Store::open_read_only(&path).unwrap();
-        assert_eq!(reader.requests_since(0, 10).unwrap().len(), 1);
+        assert_eq!(reader.requests_since(0, 10, None).unwrap().len(), 1);
         assert!(
             reader.record_note("unprobed-library", "/x", "y").is_err(),
             "the interface has no business writing"
@@ -2686,7 +2861,7 @@ mod tests {
         assert_eq!(store.schema_version().unwrap(), Store::SCHEMA);
 
         // The old row is still there, and reads back with no agent rather than failing.
-        let rows = store.requests_since(0, 10).unwrap();
+        let rows = store.requests_since(0, 10, None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].process, "claude");
         assert_eq!(rows[0].agent, None);
@@ -2697,7 +2872,9 @@ mod tests {
         store.record_request(fresh).unwrap();
         store.flush().unwrap();
         assert_eq!(
-            store.requests_since(1_500, 10).unwrap()[0].agent.as_deref(),
+            store.requests_since(1_500, 10, None).unwrap()[0]
+                .agent
+                .as_deref(),
             Some("claude")
         );
     }
@@ -2765,6 +2942,146 @@ mod tests {
         assert!(!store.watching_devices().unwrap());
         store.set_watching_devices(true).unwrap();
         assert!(store.watching_devices().unwrap());
+    }
+
+    /// A demonstration database says so for as long as it exists, and nothing turns one back into a real
+    /// history: that command would be a way of making up traffic and then believing it.
+    #[test]
+    fn a_demonstration_database_stays_one() {
+        let mut store = Store::in_memory().unwrap();
+        assert!(!store.is_demonstration().unwrap());
+        store.mark_demonstration().unwrap();
+        assert!(store.is_demonstration().unwrap());
+        store.mark_demonstration().unwrap();
+        assert!(store.is_demonstration().unwrap());
+    }
+
+    /// A focus is read back as what was set, and a focus has to say which kind of thing it names.
+    #[test]
+    fn a_focus_says_what_kind_of_thing_it_names() {
+        assert_eq!(
+            Focus::parse("process:claude"),
+            Some(Focus::Process("claude".to_owned()))
+        );
+        // Lowercased, because that is how a host is recorded, and a focus that matches nothing looks exactly
+        // like a machine with nothing on it.
+        assert_eq!(
+            Focus::parse("host:API.Anthropic.com"),
+            Some(Focus::Host("api.anthropic.com".to_owned()))
+        );
+        assert_eq!(Focus::parse("node"), None);
+        assert_eq!(Focus::parse("agent:claude"), None);
+        assert_eq!(Focus::parse("host:"), None);
+        assert_eq!(
+            Focus::parse("process:claude").map(|it| it.as_str()),
+            Some("process:claude".to_owned())
+        );
+    }
+
+    /// Set, read back, and cleared. A stored focus nobody can parse reads as no focus, because showing
+    /// everything is the safe failure and showing a subset while believing it is everything is not.
+    #[test]
+    fn a_focus_is_a_setting_and_an_unreadable_one_is_no_focus() {
+        let mut store = Store::in_memory().unwrap();
+        assert_eq!(store.focus().unwrap(), None);
+
+        let one = Focus::Host("api.anthropic.com".to_owned());
+        store.set_focus(Some(&one)).unwrap();
+        assert_eq!(store.focus().unwrap(), Some(one));
+
+        store.set_focus(None).unwrap();
+        assert_eq!(store.focus().unwrap(), None);
+
+        store
+            .connection
+            .execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('focus', 'sideways:left')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.focus().unwrap(), None);
+    }
+
+    /// What a focus is for: every answer about traffic narrows to one thing, and the totals narrow with it.
+    #[test]
+    fn a_focus_narrows_every_answer_about_traffic() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .record_request(request(1_000, "node", "api.anthropic.com", 100))
+            .unwrap();
+        store
+            .record_request(request(1_100, "node", "registry.npmjs.org", 200))
+            .unwrap();
+        store
+            .record_request(request(1_200, "git", "github.com", 400))
+            .unwrap();
+        store.flush().unwrap();
+
+        let process = Focus::Process("node".to_owned());
+        assert_eq!(store.requests_since(0, 10, None).unwrap().len(), 3);
+        assert_eq!(
+            store.requests_since(0, 10, Some(&process)).unwrap().len(),
+            2
+        );
+
+        let processes = store.processes(0, Some(&process)).unwrap();
+        assert_eq!(processes.len(), 1);
+        assert_eq!(processes[0].requests, 2);
+        assert_eq!(processes[0].bytes, 300);
+
+        // A host focus narrows the same answers, including the per-process totals: a process's two hundred
+        // bytes to one host is what was asked for, not its three hundred altogether.
+        let host = Focus::Host("registry.npmjs.org".to_owned());
+        let narrowed = store.processes(0, Some(&host)).unwrap();
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0].bytes, 200);
+        assert_eq!(
+            store
+                .hosts_for("node", 0, 10, Some(&host))
+                .unwrap()
+                .iter()
+                .map(|row| row.host.clone())
+                .collect::<Vec<_>>(),
+            vec!["registry.npmjs.org".to_owned()]
+        );
+
+        // And the slices. `address` cannot be narrowed to a host, and returns nothing rather than the whole
+        // machine's connections — which is the one answer that would be worse than no answer.
+        assert_eq!(
+            store
+                .breakdown(Slice::Host, 0, 10, Some(&process))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(Slice::Address.narrows_to(&process));
+        assert!(!Slice::Address.narrows_to(&host));
+        store
+            .record_connection(ConnectionRow {
+                at: 1_000,
+                process: "node".to_owned(),
+                confidence: "path".to_owned(),
+                pid: 1,
+                agent: None,
+                destination: Some("1.2.3.4".to_owned()),
+                port: 443,
+                blocked: false,
+            })
+            .unwrap();
+        store.flush().unwrap();
+        assert_eq!(
+            store
+                .breakdown(Slice::Address, 0, 10, Some(&process))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .breakdown(Slice::Address, 0, 10, Some(&host))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Nothing is set until somebody sets it, and clearing it is different from choosing English: one says
@@ -2874,17 +3191,17 @@ mod tests {
             .unwrap();
         store.flush().unwrap();
 
-        let by_process = store.breakdown(Slice::Process, 0, 10).unwrap();
+        let by_process = store.breakdown(Slice::Process, 0, 10, None).unwrap();
         assert_eq!(by_process[0].name, "node");
         assert_eq!(by_process[0].events, 3);
         assert_eq!(by_process[0].bytes, 3_000);
         assert_eq!(by_process[1].name, "curl");
 
-        let by_host = store.breakdown(Slice::Host, 0, 10).unwrap();
+        let by_host = store.breakdown(Slice::Host, 0, 10, None).unwrap();
         assert_eq!(by_host[0].name, "api.example");
 
         // An address comes from a connection, which is the only place one is recorded.
-        let by_address = store.breakdown(Slice::Address, 0, 10).unwrap();
+        let by_address = store.breakdown(Slice::Address, 0, 10, None).unwrap();
         assert_eq!(by_address[0].name, "1.2.3.4");
 
         // A request with no protocol recorded is HTTP/1.1, which is what it was: the column is only set when
@@ -2893,7 +3210,7 @@ mod tests {
         plain.protocol = None;
         store.record_request(plain).unwrap();
         store.flush().unwrap();
-        let by_protocol = store.breakdown(Slice::Protocol, 0, 10).unwrap();
+        let by_protocol = store.breakdown(Slice::Protocol, 0, 10, None).unwrap();
         let named: Vec<&str> = by_protocol.iter().map(|row| row.name.as_str()).collect();
         assert!(named.contains(&"http/1.1"), "{named:?}");
         assert!(named.contains(&"http/2"), "{named:?}");
@@ -3723,7 +4040,7 @@ mod tests {
 
         let mut store = Store::open(&path).unwrap();
         assert_eq!(store.schema_version().unwrap(), Store::SCHEMA);
-        let rows = store.requests_since(0, 10).unwrap();
+        let rows = store.requests_since(0, 10, None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].rpc_method, None);
     }
@@ -3922,7 +4239,7 @@ mod tests {
         drop(store);
 
         let mut store = Store::open(&path).unwrap();
-        assert_eq!(store.requests_since(0, 10).unwrap().len(), 1);
+        assert_eq!(store.requests_since(0, 10, None).unwrap().len(), 1);
         assert_eq!(store.earliest_request().unwrap(), Some(1_000));
     }
 
@@ -3934,6 +4251,6 @@ mod tests {
             .record_request(request(1, "curl", "example.com", 1))
             .unwrap();
         // No explicit flush.
-        assert_eq!(store.requests_since(0, 10).unwrap().len(), 1);
+        assert_eq!(store.requests_since(0, 10, None).unwrap().len(), 1);
     }
 }
