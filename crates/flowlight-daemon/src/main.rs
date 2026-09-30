@@ -18,6 +18,7 @@ mod http2;
 mod libraries;
 mod payload;
 mod record;
+mod spending;
 mod tracefs;
 mod ui;
 mod views;
@@ -37,9 +38,10 @@ use flowlight_common::connection::{ConnectionEvent, Layout, TaskLayout};
 use flowlight_common::procmaps::TlsLibrary;
 use flowlight_common::tls::TlsChunk;
 use flowlight_common::tracepoint::Format;
-use flowlight_store::{Retention, Store};
+use flowlight_store::Store;
 use payload::Payloads;
 use record::Record;
+use spending::Spending;
 use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::net::SocketAddr;
@@ -151,14 +153,6 @@ struct Args {
     #[arg(long)]
     no_store: bool,
 
-    /// Days to keep individual requests.
-    #[arg(long, value_name = "DAYS", default_value_t = flowlight_store::DEFAULT_RETENTION_DAYS)]
-    retention_days: u32,
-
-    /// Days to keep the daily summary that expired requests are folded into.
-    #[arg(long, value_name = "DAYS", default_value_t = flowlight_store::DEFAULT_SUMMARY_DAYS)]
-    summary_days: u32,
-
     /// Where the native interface connects. An owner and a mode, which the kernel enforces.
     #[arg(long, value_name = "PATH", default_value = control::DEFAULT_SOCKET)]
     socket: PathBuf,
@@ -215,6 +209,32 @@ enum Command {
     Ask(RuleArgs),
     /// Every rule, with the identifiers `forget` takes.
     Rules,
+    /// What Flowlight is allowed to read, and for how long.
+    ///
+    /// With no options, says what the budget is. With any, changes it.
+    Budget {
+        /// Read payloads, or stop reading them.
+        #[arg(long, value_name = "yes|no")]
+        payloads: Option<String>,
+        /// Minutes before payload capture has to be renewed. Zero for no limit.
+        #[arg(long, value_name = "MINUTES")]
+        session: Option<u32>,
+        /// Start the session again from now.
+        #[arg(long)]
+        renew: bool,
+        /// Megabytes of payload one process may contribute in a day. Zero for no ceiling.
+        #[arg(long, value_name = "MB")]
+        daily: Option<i64>,
+        /// How much of a request target to keep.
+        #[arg(long, value_parser = ["full", "host-only", "none"])]
+        paths: Option<String>,
+        /// Days to keep individual requests.
+        #[arg(long, value_name = "DAYS")]
+        detail_days: Option<u32>,
+        /// Days to keep the daily summary that expired requests are folded into.
+        #[arg(long, value_name = "DAYS")]
+        summary_days: Option<u32>,
+    },
     /// What a rule would change, without writing it.
     ///
     /// The answer is a claim about the past: every piece of traffic in the window is decided twice, once
@@ -248,16 +268,6 @@ enum Command {
         #[arg(long, value_name = "WINDOW", default_value = "24h")]
         since: String,
     },
-}
-
-impl Args {
-    /// How long things are kept, as the store wants it.
-    fn retention(&self) -> Retention {
-        Retention {
-            detail_days: self.retention_days,
-            summary_days: self.summary_days,
-        }
-    }
 }
 
 /// What every rule-writing command takes.
@@ -404,16 +414,33 @@ fn main() -> anyhow::Result<()> {
          attributed.",
         env!("CARGO_PKG_VERSION")
     );
-    match &store {
-        // Said every time rather than written in a manual. A tool that reads every HTTPS request on a
-        // machine and quietly accumulates them is a liability however good its intentions.
-        Some(_) => eprintln!(
-            "storing to {}, {}",
-            args.database.display(),
-            args.retention().describe()
-        ),
-        None => eprintln!("storing nothing"),
-    }
+    // The budget, read before anything is captured and said out loud every time rather than written in a
+    // manual. A tool that reads every HTTPS request on a machine and quietly accumulates them is a
+    // liability however good its intentions.
+    let mut spending = match store.as_mut() {
+        Some(store) => {
+            eprintln!("storing to {}", args.database.display());
+            let budget = spending::begin_session(store, now())?;
+            for line in budget.describe(now()) {
+                eprintln!("  {line}");
+            }
+            match take_budget_maps(&mut ebpf) {
+                Ok((capturing, spent)) => {
+                    Some(Spending::new(capturing, spent, budget, store, now()))
+                }
+                Err(err) => {
+                    // Without these the kernel's switch stays at zero, which means no payloads at all.
+                    // Saying so beats a daemon that looks like it is reading and is not.
+                    eprintln!("no payloads: {err:#}");
+                    None
+                }
+            }
+        }
+        None => {
+            eprintln!("storing nothing, so no payloads are read either");
+            None
+        }
+    };
 
     if !args.no_socket {
         if store.is_none() {
@@ -464,6 +491,7 @@ fn main() -> anyhow::Result<()> {
         &args,
         store.as_mut(),
         enforcing.as_mut(),
+        spending.as_mut(),
     )
 }
 
@@ -509,6 +537,7 @@ fn run(
     args: &Args,
     mut store: Option<&mut Store>,
     mut enforcing: Option<&mut Blocking>,
+    mut spending: Option<&mut Spending>,
 ) -> anyhow::Result<()> {
     let deadline = args
         .seconds
@@ -535,7 +564,12 @@ fn run(
         if let Some(store) = store.as_deref_mut()
             && Instant::now() >= next_sweep
         {
-            match store.sweep(now(), args.retention()) {
+            let retention = spending
+                .as_deref()
+                .map_or_else(flowlight_store::Retention::default, |spending| {
+                    spending.budget().retention()
+                });
+            match store.sweep(now(), retention) {
                 Ok(swept) if swept.requests_rolled > 0 || swept.connections_removed > 0 => {
                     eprintln!(
                         "folded {} expired request(s) into the daily summary and removed {} \
@@ -575,6 +609,21 @@ fn run(
             next_agent_scan = Instant::now() + AGENT_SCAN;
         }
 
+        // The budget lives in the database, so an interface or a subcommand can change it while this is
+        // running. Read back on the same timer as the rules, for the same reason: a change somebody just
+        // made should take effect without them having to restart anything.
+        if let (Some(store), Some(spending)) = (store.as_deref_mut(), spending.as_deref_mut())
+            && Instant::now() >= next_rules
+            && let Ok(budget) = store.budget()
+            && budget != spending.budget()
+        {
+            spending.set(budget, now());
+            eprintln!("the budget changed:");
+            for line in budget.describe(now()) {
+                eprintln!("  {line}");
+            }
+        }
+
         if let (Some(store), Some(enforcing)) = (store.as_deref_mut(), enforcing.as_deref_mut())
             && Instant::now() >= next_rules
         {
@@ -609,6 +658,21 @@ fn run(
                 Err(err) => eprintln!("could not read the rules: {err:#}"),
             }
             next_rules = Instant::now() + RULES;
+        }
+
+        if let Some(spending) = spending.as_deref_mut() {
+            let change = spending.tick(now());
+            if !change.is_quiet() {
+                if change.session_ended {
+                    eprintln!(
+                        "payload capture has run out and has stopped. Connections are still attributed. \
+                         `flowlightd budget --renew` starts it again."
+                    );
+                }
+                if change.day_began {
+                    eprintln!("a new day: every process has its share of payload capture back.");
+                }
+            }
         }
 
         if let Some(store) = store.as_deref_mut()
@@ -668,8 +732,26 @@ fn run(
                 let exe = executable_of(chunk.tgid);
                 let agent = agents.of(chunk.tgid);
                 let mut records = payloads.observe(&chunk, exe.as_deref());
+                let paths = spending
+                    .as_deref()
+                    .map_or(flowlight_store::Paths::Full, |spending| {
+                        spending.budget().paths
+                    });
                 for record in &mut records {
                     record.agent.clone_from(&agent);
+                    // Applied before the record exists in any form that could be printed, stored or
+                    // exported, so there is no copy of the path anywhere for the policy to have missed.
+                    record.target = paths.apply(record.target.take());
+                }
+                if let Some(spending) = spending.as_deref_mut()
+                    && let Some(stopped) = records.first().and_then(|record| {
+                        spending.record(&record.process, chunk.tgid, chunk.total)
+                    })
+                {
+                    eprintln!(
+                        "{stopped} has reached its share of payload capture for today. Its connections \
+                         are still attributed; nothing more of what it sends is read until tomorrow."
+                    );
                 }
                 if records.is_empty() {
                     if !args.all {
@@ -895,6 +977,17 @@ fn keep(result: anyhow::Result<()>) {
     if let Err(err) = result {
         eprintln!("could not store a record: {err:#}. Still watching.");
     }
+}
+
+/// Takes the two maps the budget is held against.
+fn take_budget_maps(ebpf: &mut Ebpf) -> anyhow::Result<spending::Maps> {
+    let capturing = ebpf
+        .take_map("CAPTURING")
+        .ok_or_else(|| anyhow!("the compiled program has no CAPTURING map"))?;
+    let spent = ebpf
+        .take_map("SPENT")
+        .ok_or_else(|| anyhow!("the compiled program has no SPENT map"))?;
+    Ok((Array::try_from(capturing)?, BpfHashMap::try_from(spent)?))
 }
 
 /// Loads the two `connect` hooks and attaches them to the root cgroup.

@@ -43,7 +43,7 @@ use aya_ebpf::{
         bpf_probe_read_user_buf,
     },
     macros::{map, uprobe, uretprobe},
-    maps::{HashMap, PerCpuArray, PerfEventArray},
+    maps::{Array, HashMap, PerCpuArray, PerfEventArray},
     programs::{ProbeContext, RetProbeContext},
 };
 use flowlight_common::tls::{DIRECTION_IN, DIRECTION_OUT, TLS_CHUNK_BYTES, TlsChunk};
@@ -51,6 +51,21 @@ use flowlight_common::tls::{DIRECTION_IN, DIRECTION_OUT, TLS_CHUNK_BYTES, TlsChu
 /// Plaintext on its way up.
 #[map]
 static TLS_EVENTS: PerfEventArray<TlsChunk> = PerfEventArray::new(0);
+
+/// Whether payloads are being read at all, written by the daemon from the budget.
+///
+/// Zero until told otherwise, which is the important part: nothing is copied out of an application's memory
+/// before the daemon has read what it is allowed to read. A default of "on" would mean capture beginning the
+/// instant the probes attach, which is a moment earlier than anybody agreed to.
+#[map]
+static CAPTURING: Array<u8> = Array::with_max_entries(1, 0);
+
+/// Processes that have used up their share for the day.
+///
+/// Written by the daemon, which does the accounting: the kernel's part is one lookup, and the decision about
+/// what a fair share is belongs somewhere it can be changed without reloading a program.
+#[map]
+static SPENT: HashMap<u32, u8> = HashMap::with_max_entries(4096, 0);
 
 /// One chunk per CPU, to build events in.
 ///
@@ -196,14 +211,25 @@ fn capture<C: EbpfContext>(
         return Ok(());
     }
 
+    // Before anything is copied, not after. The cheapest possible exit, and the one that has to come first:
+    // a budget that is checked after the copy is a budget that has already been exceeded.
+    if CAPTURING.get(0).copied().unwrap_or(0) == 0 {
+        return Ok(());
+    }
+    let thread = bpf_get_current_pid_tgid();
+    let tgid = (thread >> 32) as u32;
+    // SAFETY: the value is a `u8` written by the daemon, and the reference does not outlive the lookup.
+    if unsafe { SPENT.get(&tgid) }.is_some() {
+        return Ok(());
+    }
+
     let chunk = SCRATCH.get_ptr_mut(0).ok_or(0_i32)?;
     // SAFETY: a per-CPU map value, so this CPU is the only thing that can be writing it, and a BPF program
     // is not preempted by another BPF program on the same CPU.
     let chunk = unsafe { &mut *chunk };
 
-    let thread = bpf_get_current_pid_tgid();
     chunk.ssl = ssl;
-    chunk.tgid = (thread >> 32) as u32;
+    chunk.tgid = tgid;
     chunk.pid = thread as u32;
     chunk.comm = bpf_get_current_comm()?;
     chunk.total = length.min(u32::MAX as i64) as u32;

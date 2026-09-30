@@ -142,6 +142,30 @@ pub struct RuleView {
     pub created: i64,
 }
 
+/// What Flowlight is allowed to read, and for how long.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BudgetView {
+    /// Whether payloads are read at all.
+    pub payloads: bool,
+    /// Whether they are being read *now*, which the session can decide otherwise.
+    pub reading: bool,
+    /// Minutes before capture has to be renewed. Zero for no limit.
+    pub session_minutes: u32,
+    /// Seconds of the session left, or `None` if it does not end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_remaining: Option<i64>,
+    /// Bytes one process may contribute in a day. Zero for no ceiling.
+    pub daily_bytes: i64,
+    /// `full`, `host-only` or `none`.
+    pub paths: String,
+    /// Days of individual requests.
+    pub detail_days: u32,
+    /// Days of the daily summary.
+    pub summary_days: u32,
+    /// The whole thing in sentences, which is what an interface should show rather than seven numbers.
+    pub described: Vec<String>,
+}
+
 /// One thing a candidate rule would change.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ChangeView {
@@ -338,6 +362,85 @@ pub fn rules(store: &mut Store) -> Result<Vec<RuleView>> {
         .collect())
 }
 
+/// What Flowlight is allowed to read, described.
+pub fn budget(store: &mut Store, now: i64) -> Result<BudgetView> {
+    Ok(describe(&store.budget()?, now))
+}
+
+/// Turns a budget into what an interface shows.
+fn describe(budget: &flowlight_store::Budget, now: i64) -> BudgetView {
+    BudgetView {
+        payloads: budget.payloads,
+        reading: budget.reading_payloads(now),
+        session_minutes: budget.session_minutes,
+        session_remaining: budget.session_remaining(now),
+        daily_bytes: budget.daily_bytes,
+        paths: budget.paths.as_str().to_owned(),
+        detail_days: budget.detail_days,
+        summary_days: budget.summary_days,
+        described: budget.describe(now),
+    }
+}
+
+/// What one request may change about the budget.
+///
+/// Every field optional, because changing one thing should not mean restating the other six — and a caller
+/// that had to restate them would silently overwrite whatever somebody else had changed in between.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct BudgetChange {
+    /// Read payloads, or stop.
+    pub payloads: Option<bool>,
+    /// Minutes before capture has to be renewed.
+    pub session_minutes: Option<u32>,
+    /// Start the session again from now.
+    #[serde(default)]
+    pub renew: bool,
+    /// Bytes one process may contribute in a day.
+    pub daily_bytes: Option<i64>,
+    /// `full`, `host-only` or `none`.
+    pub paths: Option<String>,
+    /// Days of individual requests.
+    pub detail_days: Option<u32>,
+    /// Days of the daily summary.
+    pub summary_days: Option<u32>,
+}
+
+/// Changes the budget, and says what it now is.
+pub fn set_budget(store: &mut Store, change: &BudgetChange, now: i64) -> Result<BudgetView> {
+    use anyhow::Context as _;
+    let mut budget = store.budget()?;
+    if let Some(payloads) = change.payloads {
+        // Turning capture back on starts the session again, because the session is how long *this* decision
+        // lasts, and the old one belonged to a decision somebody has just replaced.
+        if payloads && !budget.payloads {
+            budget.session_began = now;
+        }
+        budget.payloads = payloads;
+    }
+    if let Some(minutes) = change.session_minutes {
+        budget.session_minutes = minutes;
+        budget.session_began = now;
+    }
+    if change.renew {
+        budget.session_began = now;
+    }
+    if let Some(bytes) = change.daily_bytes {
+        budget.daily_bytes = bytes.max(0);
+    }
+    if let Some(paths) = &change.paths {
+        budget.paths = flowlight_store::Paths::parse(paths)
+            .with_context(|| format!("`{paths}` is not full, host-only or none"))?;
+    }
+    if let Some(days) = change.detail_days {
+        budget.detail_days = days;
+    }
+    if let Some(days) = change.summary_days {
+        budget.summary_days = days;
+    }
+    store.set_budget(&budget)?;
+    Ok(describe(&budget, now))
+}
+
 /// What adding a rule would change, judged against traffic that actually happened.
 ///
 /// A claim about the past, not a promise about the future: a host that was not reached in the window does
@@ -509,6 +612,87 @@ mod tests {
             assert!(json.contains(expected), "{expected} missing from {json}");
         }
         assert!(!json.contains("status"), "{json}");
+    }
+
+    /// An interface should show sentences, not seven numbers.
+    #[test]
+    fn a_budget_comes_with_its_own_description() {
+        let mut store = Store::in_memory().unwrap();
+        let view = budget(&mut store, 0).unwrap();
+        assert!(view.payloads);
+        assert_eq!(view.paths, "full");
+        assert_eq!(view.described.len(), 4);
+        assert!(view.described[1].contains("64 MB"), "{:?}", view.described);
+    }
+
+    /// Changing one thing must not mean restating the other six: a caller that had to would silently
+    /// overwrite whatever somebody else had changed in between.
+    #[test]
+    fn changing_one_thing_leaves_the_rest_alone() {
+        let mut store = Store::in_memory().unwrap();
+        let view = set_budget(
+            &mut store,
+            &BudgetChange {
+                paths: Some("host-only".to_owned()),
+                ..BudgetChange::default()
+            },
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(view.paths, "host-only");
+        assert_eq!(
+            view.daily_bytes,
+            flowlight_store::budget::DEFAULT_DAILY_BYTES
+        );
+        assert_eq!(
+            view.session_minutes,
+            flowlight_store::budget::DEFAULT_SESSION_MINUTES
+        );
+    }
+
+    /// The session is how long *this* decision lasts. Turning capture back on is a new decision.
+    #[test]
+    fn turning_payloads_back_on_starts_the_session_again() {
+        let mut store = Store::in_memory().unwrap();
+        set_budget(
+            &mut store,
+            &BudgetChange {
+                payloads: Some(false),
+                ..BudgetChange::default()
+            },
+            1_000,
+        )
+        .unwrap();
+        let view = set_budget(
+            &mut store,
+            &BudgetChange {
+                payloads: Some(true),
+                ..BudgetChange::default()
+            },
+            100_000,
+        )
+        .unwrap();
+        assert!(view.reading);
+        assert_eq!(
+            view.session_remaining,
+            Some(i64::from(flowlight_store::budget::DEFAULT_SESSION_MINUTES) * 60)
+        );
+    }
+
+    #[test]
+    fn a_path_policy_that_is_not_one_is_refused() {
+        let mut store = Store::in_memory().unwrap();
+        assert!(
+            set_budget(
+                &mut store,
+                &BudgetChange {
+                    paths: Some("some".to_owned()),
+                    ..BudgetChange::default()
+                },
+                0
+            )
+            .is_err()
+        );
     }
 
     /// The sentence somebody can act on before the rule is real.

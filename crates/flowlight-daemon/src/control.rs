@@ -77,6 +77,14 @@ pub enum Request {
     },
     /// Every rule.
     Rules,
+    /// What Flowlight is allowed to read, and for how long.
+    Budget,
+    /// Change what Flowlight is allowed to read.
+    SetBudget {
+        /// The fields to change. Anything left out is left alone.
+        #[serde(flatten)]
+        change: crate::views::BudgetChange,
+    },
     /// Write a rule.
     Write {
         /// `allow`, `ask` or `block`.
@@ -264,7 +272,9 @@ fn handle(line: &str, database: &Path, hello: &Hello) -> Result<String> {
     let mut store = match &request {
         // Writing a rule is the one thing that needs to write, and it is also the one thing worth doing
         // when nothing has been recorded yet.
-        Request::Write { .. } | Request::Forget { .. } => Store::open(database)?,
+        Request::Write { .. } | Request::Forget { .. } | Request::SetBudget { .. } => {
+            Store::open(database)?
+        }
         _ => Store::open_read_only(database)?,
     };
 
@@ -294,6 +304,10 @@ fn handle(line: &str, database: &Path, hello: &Hello) -> Result<String> {
             crate::views::window(now, since),
         )?)?,
         Request::Rules => serde_json::to_string(&crate::views::rules(&mut store)?)?,
+        Request::Budget => serde_json::to_string(&crate::views::budget(&mut store, now)?)?,
+        Request::SetBudget { change } => {
+            serde_json::to_string(&crate::views::set_budget(&mut store, &change, now)?)?
+        }
         Request::Simulate {
             action,
             subject,
@@ -439,6 +453,29 @@ mod tests {
         let reply = answer(r#"{"op":"rules"}"#, &database, &hello());
         assert!(reply.contains("error"), "{reply}");
         assert!(!database.exists());
+    }
+
+    /// Changing one field must leave the others alone, over the socket as much as anywhere.
+    #[test]
+    fn the_budget_can_be_read_and_changed_over_the_socket() {
+        let directory = std::env::temp_dir().join("flowlight-control-budget");
+        let _ = std::fs::remove_dir_all(&directory);
+        let database = directory.join("flowlight.db");
+        // Brought into being by a write, as the daemon would.
+        drop(Store::open(&database).unwrap());
+
+        let reply = answer(r#"{"op":"budget"}"#, &database, &hello());
+        assert!(reply.contains(r#""paths":"full""#), "{reply}");
+
+        let reply = answer(
+            r#"{"op":"set-budget","paths":"none","payloads":false}"#,
+            &database,
+            &hello(),
+        );
+        assert!(reply.contains(r#""paths":"none""#), "{reply}");
+        assert!(reply.contains(r#""payloads":false"#), "{reply}");
+        // And the retention it never mentioned is untouched.
+        assert!(reply.contains(r#""detail_days":7"#), "{reply}");
     }
 
     /// Asked before writing, which is what makes a rule something somebody will enable.
