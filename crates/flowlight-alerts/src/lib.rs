@@ -4,6 +4,9 @@
 //! and what it found — "moved 412 MB in the hour from 14:00, 4.2σ above its baseline of 31 MB/h" rather than
 //! "unusual activity". Somebody who disagrees can go and check.
 //!
+//! [`profile`] answers a different question with the same rule: not *something happened* but *this one is not
+//! like the others*, which is a judgement and has to show its working or it is a rumour.
+//!
 //! # What is here and what is in the daemon
 //!
 //! The deciding is here, over numbers, so that every judgement can be tested without a database or a kernel.
@@ -15,7 +18,10 @@
 //! rest on there being a keyboard and a session to be away from, and this runs on servers. They are absent
 //! rather than approximated, because a signal that fires because a machine has no display is not a signal.
 
+extern crate alloc;
+
 pub mod baseline;
+pub mod profile;
 
 pub use baseline::{Baseline, update};
 

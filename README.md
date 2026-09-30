@@ -182,7 +182,8 @@ Useful flags:
 
 Plus subcommands that read the database rather than the kernel — `history --since 6h`, `agents`, `summary`,
 `coverage --since 24h`, `budget`, `export`, `model`, `query`, `intercept`, `trust`, `mock`, `mocks`,
-`forget-mock`, `guardrail`, `guardrails`, `forget-guardrail`, `owners`, `alerts` — and six for rules: `block`, `allow`, `ask`,
+`forget-mock`, `guardrail`, `guardrails`, `forget-guardrail`, `owners`, `alerts`, `report` — and six for
+rules: `block`, `allow`, `ask`,
 `simulate`, `rules`, `forget`. `--json` works on all
 of them. One subcommand is not like the others: `launch` runs as you rather than as root, because the agent it
 starts has to.
@@ -845,6 +846,51 @@ pointer forwards, which is how a parser is made to loop for ever.
 An address nobody announces is recorded as such rather than left unknown, because otherwise it would be asked
 about again on every pass for ever. A resolver that is temporarily unreachable is a different thing and is
 *not* recorded, so it is asked again later — conflating the two would make a transient failure permanent.
+
+### Reports
+
+What a table cannot show: traffic sliced one way, over a window somebody picks.
+
+```console
+$ flowlightd report --by host --since 24h
+
+By host, over the last 24h: 1284 request(s) or connection(s), 412.8 MB
+
+  api.anthropic.com                             847   66.0%  █████████████  381.2 MB
+  github.com                                    201   15.7%  ███             18.4 MB
+  registry.npmjs.org                            134   10.4%  ██              11.9 MB
+  …
+
+Processes that do not look like the rest. The order is the sum of the reasons' weights, which means nothing
+on its own — it is an ordering, not a score:
+
+  gh
+      opened 412 connection(s) and nothing was read from any of them
+  node
+      reached 47 distinct host(s), where the usual process on this machine reached 4
+```
+
+Four slices: `process`, `host`, `address`, `protocol`. A slice says whether its **bytes mean anything** — they
+do not for an address, because bytes are counted from requests, which record a host, while a connection records
+an address. A column of zeroes would be worse than no column.
+
+Underneath, the processes that do not look like the rest, each with the count behind every reason: reaching far
+more hosts than anything else, mostly reaching addresses rather than names, names that look generated,
+sending far more than receiving, and nothing readable at all.
+
+Three decisions:
+
+- **Outliers are judged by process, whatever the slice.** "This host is not like the others" is a statement
+  about a host's operator, which Flowlight has no business making.
+- **Normal is the median, not the mean.** The thing being looked for is one process reaching four hundred
+  hosts, and a mean would let it drag normal up towards itself on the way past — hiding exactly the case this
+  exists to find.
+- **The order is not a score.** It is the sum of the reasons' weights, it has no threshold, and a process at
+  the top is one to look at rather than one that has done something. A number people can quote is a number
+  people will quote.
+
+The signal for "nothing could be read from this one" is the same honesty Coverage gives about the whole
+machine, said where somebody is looking at one process.
 
 ### Alerts
 

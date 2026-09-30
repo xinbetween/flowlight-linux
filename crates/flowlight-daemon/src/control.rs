@@ -133,6 +133,18 @@ pub enum Request {
     },
     /// Every guardrail, with how often each has refused something.
     Guardrails,
+    /// Traffic sliced one way, and the processes that do not look like the rest.
+    Report {
+        /// `process`, `host`, `address` or `protocol`.
+        #[serde(default = "by_process")]
+        by: String,
+        /// How far back, in seconds.
+        #[serde(default = "a_day")]
+        since: i64,
+        /// At most this many rows.
+        #[serde(default = "twenty")]
+        limit: usize,
+    },
     /// What was noticed recently.
     Alerts {
         /// How far back, in seconds.
@@ -219,6 +231,16 @@ pub enum Request {
 fn an_hour() -> i64 {
     3_600
 }
+/// What a report slices by when nothing says otherwise.
+fn by_process() -> String {
+    "process".to_owned()
+}
+
+/// How many rows a report returns when nothing says otherwise.
+fn twenty() -> usize {
+    20
+}
+
 fn a_day() -> i64 {
     86_400
 }
@@ -522,6 +544,12 @@ fn handle(
             crate::history::authority_paths(database, certificates),
         )?)?,
         Request::Guardrails => serde_json::to_string(&crate::views::guardrails(&mut store)?)?,
+        Request::Report { by, since, limit } => serde_json::to_string(&crate::views::report(
+            &mut store,
+            &by,
+            crate::views::window(now, since),
+            limit,
+        )?)?,
         Request::Alerts { since, limit } => serde_json::to_string(&crate::views::alerts(
             &mut store,
             crate::views::window(now, since),

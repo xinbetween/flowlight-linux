@@ -551,6 +551,62 @@ pub fn run(
                 }
             }
         }
+        Command::Report { by, since, limit } => {
+            let window = parse_window(since)
+                .with_context(|| format!("reading `{since}` as a length of time"))?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs() as i64);
+            let view = crate::views::report(&mut store, by, now - window, *limit)?;
+            if json {
+                writeln!(out, "{}", line(&view))?;
+            } else if view.rows.is_empty() {
+                eprintln!("Nothing was recorded in the last {since}.");
+                return Ok(());
+            } else {
+                writeln!(
+                    out,
+                    "\nBy {}, over the last {since}: {} request(s) or connection(s){}\n",
+                    view.by,
+                    view.total_events,
+                    if view.counts_bytes {
+                        format!(", {}", flowlight_alerts::bytes_said(view.total_bytes))
+                    } else {
+                        String::new()
+                    }
+                )?;
+                for row in &view.rows {
+                    writeln!(
+                        out,
+                        "  {:<44} {:>6}  {:>5.1}%  {}{}",
+                        row.name,
+                        row.events,
+                        row.share,
+                        // A bar, because a column of numbers is a column of numbers. Twenty characters wide,
+                        // so the widest row is readable and the narrowest is still visible.
+                        "\u{2588}".repeat(((row.share / 5.0).round() as usize).clamp(1, 20)),
+                        if view.counts_bytes {
+                            format!("  {}", flowlight_alerts::bytes_said(row.bytes))
+                        } else {
+                            String::new()
+                        }
+                    )?;
+                }
+                if !view.standing.is_empty() {
+                    writeln!(
+                        out,
+                        "\nProcesses that do not look like the rest. The order is the sum of the reasons' \
+                         weights, which means nothing on its own — it is an ordering, not a score:\n"
+                    )?;
+                    for standing in &view.standing {
+                        writeln!(out, "  {}", standing.process)?;
+                        for reason in &standing.reasons {
+                            writeln!(out, "      {reason}")?;
+                        }
+                    }
+                }
+            }
+        }
         Command::Alerts {
             since,
             limit,
