@@ -66,6 +66,15 @@ impl Paths {
         }
     }
 
+    /// Whether a tool's name may be kept.
+    ///
+    /// `None` means keep as little as possible, and a tool's name says what was asked for in the same way a
+    /// path does. The *method* is kept either way: `tools/call` is a fact about the shape of the traffic and
+    /// says nothing about the work.
+    pub fn keeps_tool_names(self) -> bool {
+        self != Self::None
+    }
+
     /// Applies the policy to a target.
     ///
     /// `Full` keeps it, `HostOnly` keeps the fact that there was one, `None` keeps nothing. The middle one
@@ -396,6 +405,15 @@ mod tests {
         assert_eq!(Paths::None.apply(target), None);
         // And a request that had no path still has none.
         assert_eq!(Paths::HostOnly.apply(None), None);
+    }
+
+    /// `none` means keep as little as possible, and a tool's name says what was asked for. The method is
+    /// kept either way: it is a fact about the shape of the traffic.
+    #[test]
+    fn keeping_nothing_keeps_no_tool_names_either() {
+        assert!(Paths::Full.keeps_tool_names());
+        assert!(Paths::HostOnly.keeps_tool_names());
+        assert!(!Paths::None.keeps_tool_names());
     }
 
     #[test]

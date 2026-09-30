@@ -55,6 +55,12 @@ pub struct Payload {
     /// `http/2` when the connection is one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<&'static str>,
+    /// The JSON-RPC method, for something said to an MCP server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpc_method: Option<String>,
+    /// The tool, for an MCP `tools/call`. Never its arguments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpc_tool: Option<String>,
     /// Why this connection cannot be read, when it cannot.
     ///
     /// A sentence rather than a flag, because the two reasons — joined late, or a large write cut through a
@@ -85,6 +91,8 @@ impl Payload {
             host: None,
             status: None,
             protocol: None,
+            rpc_method: None,
+            rpc_tool: None,
             unreadable: None,
         };
         match summarise(chunk.bytes()) {
@@ -122,6 +130,8 @@ impl Payload {
             host: None,
             status: None,
             protocol: None,
+            rpc_method: None,
+            rpc_tool: None,
             unreadable: None,
         }
     }
@@ -175,6 +185,20 @@ impl Payload {
             bytes: self.bytes,
             truncated: self.truncated,
             unreadable: self.unreadable.map(str::to_owned),
+            rpc_method: self.rpc_method.clone(),
+            rpc_tool: self.rpc_tool.clone(),
+        }
+    }
+
+    /// Something an agent said to an MCP server.
+    ///
+    /// A record of its own rather than a field on the request that carried it: one write can carry a batch,
+    /// and a tool call is the event somebody is looking for.
+    fn from_call(chunk: &TlsChunk, exe: Option<&str>, call: flowlight_agents::wire::Call) -> Self {
+        Self {
+            rpc_method: Some(call.method),
+            rpc_tool: call.tool,
+            ..Self::bare(chunk, exe)
         }
     }
 
@@ -184,6 +208,7 @@ impl Payload {
             || self.status.is_some()
             || self.unreadable.is_some()
             || self.protocol.is_some()
+            || self.rpc_method.is_some()
     }
 
     /// One line, for a person.
@@ -193,7 +218,12 @@ impl Payload {
         } else {
             "←"
         };
-        let what = if let Some(method) = &self.method {
+        let what = if let Some(rpc) = &self.rpc_method {
+            match &self.rpc_tool {
+                Some(tool) => format!("{rpc} {tool}"),
+                None => rpc.clone(),
+            }
+        } else if let Some(method) = &self.method {
             let target = self.target.as_deref().unwrap_or("");
             match &self.host {
                 Some(host) => format!("{method} {host}{target}"),
@@ -255,7 +285,7 @@ impl Payloads {
     /// Usually nothing: most buffers are the middles of bodies. One request produces one record when the
     /// headers land, however many buffers the rest of it takes.
     pub fn observe(&mut self, chunk: &TlsChunk, exe: Option<&str>) -> Vec<Payload> {
-        match self.protocol_of(chunk) {
+        let mut records = match self.protocol_of(chunk) {
             Some(Protocol::Http1) => {
                 let payload = Payload::describe(chunk, exe);
                 if payload.is_notable() {
@@ -274,7 +304,17 @@ impl Payloads {
                 })
                 .collect(),
             None => Vec::new(),
-        }
+        };
+
+        // MCP is JSON-RPC, and the envelope is somewhere in the same bytes whichever protocol carried it.
+        // Looked for regardless, and after the rest, so that a buffer which is *only* a tool call still
+        // produces a record where it would otherwise have produced none.
+        records.extend(
+            flowlight_agents::wire::calls(chunk.bytes())
+                .into_iter()
+                .map(|call| Payload::from_call(chunk, exe, call)),
+        );
+        records
     }
 
     /// A record for a buffer that produced nothing, for `--all`.

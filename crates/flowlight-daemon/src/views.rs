@@ -58,6 +58,12 @@ pub struct RequestView {
     /// Why this connection could not be read, when it could not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unreadable: Option<String>,
+    /// The JSON-RPC method, for something said to an MCP server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpc_method: Option<String>,
+    /// The tool, for an MCP `tools/call`. Never its arguments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpc_tool: Option<String>,
 }
 
 /// One process, and what it has been doing.
@@ -107,6 +113,24 @@ pub struct AgentView {
     pub local: Vec<String>,
     /// Hosts, and how each one stands.
     pub domains: Vec<DomainView>,
+    /// What it actually said to them.
+    pub tools: Vec<ToolView>,
+}
+
+/// One thing an agent said to an MCP server.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ToolView {
+    /// The JSON-RPC method.
+    pub method: String,
+    /// The tool, for a `tools/call`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// The host it was said to.
+    pub host: String,
+    /// How many times.
+    pub calls: i64,
+    /// The most recent one.
+    pub last_seen: i64,
 }
 
 /// One host an agent reached or was configured to reach.
@@ -267,6 +291,8 @@ pub fn requests(store: &mut Store, since: i64, limit: usize) -> Result<Vec<Reque
             bytes: row.bytes,
             truncated: row.truncated,
             unreadable: row.unreadable,
+            rpc_method: row.rpc_method,
+            rpc_tool: row.rpc_tool,
         })
         .collect())
 }
@@ -318,6 +344,7 @@ pub fn agents(store: &mut Store, since: i64, homes: &[PathBuf]) -> Result<Vec<Ag
             .filter(|server| server.agent == row.agent)
             .cloned()
             .collect();
+        let tools = store.tools_for_agent(&row.agent, since, 100)?;
         let domains = mcp::merge(&mine, &contacted, mcp::endpoints_for(&row.agent));
         views.push(AgentView {
             agent: row.agent,
@@ -338,6 +365,16 @@ pub fn agents(store: &mut Store, since: i64, homes: &[PathBuf]) -> Result<Vec<Ag
                     standing: domain.standing.as_str().to_owned(),
                     requests: domain.requests,
                     servers: domain.servers,
+                })
+                .collect(),
+            tools: tools
+                .into_iter()
+                .map(|row| ToolView {
+                    method: row.method,
+                    tool: row.tool,
+                    host: row.host,
+                    calls: row.calls,
+                    last_seen: row.last_seen,
                 })
                 .collect(),
         });
@@ -597,6 +634,8 @@ mod tests {
                 bytes: 3_800,
                 truncated: true,
                 unreadable: None,
+                rpc_method: None,
+                rpc_tool: None,
             })
             .unwrap();
         let view = requests(&mut store, 0, 10).unwrap();
@@ -714,6 +753,8 @@ mod tests {
             bytes: 10,
             truncated: false,
             unreadable: None,
+            rpc_method: None,
+            rpc_tool: None,
         };
         store.record_request(row.clone()).unwrap();
         store.record_request(row.clone()).unwrap();
@@ -772,6 +813,8 @@ mod tests {
             bytes: 10,
             truncated: false,
             unreadable: None,
+            rpc_method: None,
+            rpc_tool: None,
         };
         store.record_request(row.clone()).unwrap();
         row.host = Some("telemetry.example".to_owned());

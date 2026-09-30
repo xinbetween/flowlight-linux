@@ -13,6 +13,8 @@
 //!   that what an agent *reached* can be compared with what it was *given*. The gap in either direction is
 //!   the interesting part: a server configured and never used is clutter, and a host reached that is in no
 //!   configuration is the thing worth a second look.
+//! - [`wire`] — **what did it actually say?** MCP is JSON-RPC, so the method and the name of the tool are
+//!   in plaintext a uprobe has already copied. Never the arguments.
 //!
 //! No Linux-only dependency, so it builds and its tests run anywhere — the same reason `flowlight-common`
 //! and `flowlight-store` are crates of their own. The `/proc` walking that feeds [`ancestry`] lives in the
@@ -20,3 +22,4 @@
 
 pub mod ancestry;
 pub mod mcp;
+pub mod wire;

@@ -81,6 +81,21 @@ await() {
 await "reading openssl"
 await "interface socket at"
 
+# The same idea for the database rather than the log: a question derived from stored traffic has to wait for
+# that traffic to be stored. The daemon writes a partial batch once a second, which is fast and is not
+# instant, and asking a moment too early is how a correct answer looks like an empty one.
+await_stored() {
+    local filter=$1 seconds=${2:-20}
+    for _ in $(seq "$((seconds * 4))"); do
+        if ask '{"op":"requests","since":900,"limit":400}' | jq -e "[.ok[] | select($filter)] | length > 0" \
+            >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.25
+    done
+    fail "the database never held a request matching $filter."
+}
+
 # The interface. An ephemeral port, because a fixed one is a fixed way for this to fail on a machine that
 # happens to be using it.
 url=$(grep -o 'http://127\.0\.0\.1:[0-9]*/?token=[0-9a-f]*' "$log" | head -1)
@@ -123,6 +138,15 @@ curl -sS --max-time 10 "https://$target_host" -o /dev/null
 secret="aVeryLongOpaqueTokenValue1234567890ABCdef"
 echo "Connecting once more, with a credential in the query string..."
 curl -sS --http1.1 --max-time 10 "https://$target_host/?token=$secret" -o /dev/null
+
+# MCP, which is JSON-RPC over HTTPS. The server will refuse the request; what matters is that the envelope
+# was in the plaintext and that only the method and the tool's name came out of it.
+mcp_secret="do-not-keep-this-argument"
+echo "Making an MCP tool call..."
+curl -sS --http1.1 --max-time 10 -X POST \
+    -H 'Content-Type: application/json' \
+    --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"smoke_tool\",\"arguments\":{\"secret\":\"$mcp_secret\"}}}" \
+    "https://$target_host/mcp" -o /dev/null || true
 
 # GnuTLS, through a different pair of functions. `gnutls-cli` rather than wget, because whether wget is built
 # against GnuTLS varies by distribution and an assertion that quietly tests OpenSSL twice is worse than no
@@ -174,6 +198,8 @@ if curl -sS --max-time 8 "https://$blocked_address/" -o /dev/null 2>/dev/null; t
     # everything it starts, before the child can run.
     # Asked before it is written, which is the path the window's button takes: it shows what the rule would
     # have changed and only writes it if somebody says yes.
+    # Derived from stored traffic, so wait for the traffic to be stored first.
+    await_stored ".host == \"$target_host\" and .method == \"GET\""
     simulated=$(ask "{\"op\":\"simulate\",\"action\":\"block\",\"subject\":\"$target_host\",\"since\":600}")
     echo "$simulated"
     printf '%s' "$simulated" \
@@ -363,6 +389,21 @@ if [ "$gnutls_tested" = yes ]; then
 else
     echo "SKIP: gnutls-cli is not installed, so GnuTLS was not exercised"
 fi
+
+check "the MCP tool call was read out of the plaintext" \
+    '.rpc_method == "tools/call" and .rpc_tool == "smoke_tool"'
+
+# The whole shape of the parser, asked of everything it produced: a tool's name is a fact about what an
+# agent is doing; the argument it was given is the contents of somebody's work.
+if grep -q "$mcp_secret" "$output"; then
+    echo "FAIL: an MCP call's arguments were reported." >&2
+    exit 1
+fi
+if sudo grep -qa "$mcp_secret" "$database"; then
+    echo "FAIL: an MCP call's arguments were stored." >&2
+    exit 1
+fi
+echo "OK: the tool's name was kept and its arguments were not, anywhere"
 
 check "the credential in the query string was redacted" \
     '.process == "curl" and ((.target // "") | contains("token=…"))'

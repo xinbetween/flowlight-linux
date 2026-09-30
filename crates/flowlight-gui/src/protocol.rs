@@ -56,6 +56,10 @@ pub struct Request {
     pub truncated: bool,
     /// Why this connection could not be read.
     pub unreadable: Option<String>,
+    /// The JSON-RPC method, for something said to an MCP server.
+    pub rpc_method: Option<String>,
+    /// The tool, for an MCP `tools/call`. Never its arguments.
+    pub rpc_tool: Option<String>,
 }
 
 /// One agent.
@@ -77,6 +81,23 @@ pub struct Agent {
     pub local: Vec<String>,
     /// Hosts, and how each stands.
     pub domains: Vec<Domain>,
+    /// What it actually said to them.
+    pub tools: Vec<Tool>,
+}
+
+/// One thing an agent said to an MCP server.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Tool {
+    /// The JSON-RPC method.
+    pub method: String,
+    /// The tool, for a `tools/call`.
+    pub tool: Option<String>,
+    /// The host it was said to.
+    pub host: String,
+    /// How many times.
+    pub calls: i64,
+    /// The most recent one.
+    pub last_seen: i64,
 }
 
 /// One host an agent reached or was configured to reach.

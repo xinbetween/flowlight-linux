@@ -905,6 +905,8 @@ mod tests {
             bytes: 3_800,
             truncated: true,
             unreadable: None,
+            rpc_method: None,
+            rpc_tool: None,
         };
         let json = line(&RequestView::from(&row));
         for expected in [
@@ -939,6 +941,8 @@ mod tests {
             bytes: 10,
             truncated: false,
             unreadable: None,
+            rpc_method: None,
+            rpc_tool: None,
         };
         assert!(request_line(&row).contains("claude/node"));
     }
