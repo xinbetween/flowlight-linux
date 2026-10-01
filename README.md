@@ -108,6 +108,13 @@ including an installation from it with a throwaway key, and goes live once a sig
 [`packaging/apt/README.md`](packaging/apt/README.md) says why that key is not something this code can create for
 you. Until it is, the commands above have nothing to answer them.
 
+**The application icon.** It is one SVG, at
+`/usr/share/icons/hicolor/scalable/apps/com.xinbetween.Flowlight.svg`, and the desktop draws it through
+gdk-pixbuf — which recognises the format by sniffing the first bytes of the file. Keep `<svg` near the start.
+Until v0.5.15 a comment sat above it, `<svg` began 501 bytes in, and every desktop answered "couldn't
+recognize the image file format" and drew no icon, with the file remaining valid SVG throughout. CI now draws
+the icon through the same loader on every push.
+
 **An empty Live page says which kind of empty it is.** Payload capture runs for a session — eight hours by
 default — and stops when that session ends. Until v0.5.14 the window then showed "Nothing read in this
 window", which reads as "your machine was quiet" when it means "Flowlight stopped reading". It now says the

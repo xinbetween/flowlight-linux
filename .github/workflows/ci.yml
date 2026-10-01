@@ -87,6 +87,32 @@ jobs:
           fi
           echo "every row goes through the helper"
 
+      # The desktop draws this file through gdk-pixbuf, which recognises a format by sniffing the first
+      # bytes of it: the SVG loader looks for `<svg` near the start. A comment written above the element
+      # pushed `<svg` 501 bytes in, and every consumer answered "couldn't recognize the image file format"
+      # while the file stayed perfectly valid SVG — so the dock, the app grid and the window all drew
+      # nothing, and nothing anywhere said why.
+      #
+      # It has to be this tool. `rsvg-convert` parses the file directly, accepts the broken one and exits 0,
+      # so a check built on it proves nothing. And the thumbnailer warns and *also* exits 0, so the check
+      # has to look at what came out rather than at the exit status. Both were tried against the broken
+      # file before this was written.
+      - name: The icon is an icon as far as the desktop is concerned
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq libgdk-pixbuf2.0-bin librsvg2-common
+          icon=packaging/desktop/com.xinbetween.Flowlight.svg
+          at=$(grep -abo '<svg' "$icon" | head -1 | cut -d: -f1)
+          echo "<svg starts at byte $at"
+          rm -f /tmp/icon.png
+          gdk-pixbuf-thumbnailer -s 64 "$icon" /tmp/icon.png || true
+          if [ ! -s /tmp/icon.png ]; then
+            echo "gdk-pixbuf cannot draw this file, so no desktop will either."
+            echo "<svg is $at bytes in; the loader sniffs the start of the file. Keep comments inside the element."
+            exit 1
+          fi
+          echo "the icon draws: $(stat -c %s /tmp/icon.png) bytes of PNG"
+
       - name: A row shows the text it was given
         run: |
           set -euo pipefail
