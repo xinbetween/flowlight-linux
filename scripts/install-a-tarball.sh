@@ -32,9 +32,18 @@ done
 
 test -x /usr/sbin/flowlightd || fail "the daemon is not where the installer said it would be"
 /usr/sbin/flowlightd --version || fail "the daemon does not run on $name"
-test -f /usr/lib/systemd/system/flowlightd.service || fail "the unit was not installed"
-if ls /etc/systemd/system/multi-user.target.wants/flowlightd.service >/dev/null 2>&1; then
-    fail "the unit is enabled; an installer must not start this"
+
+# The unit, where there is a systemd to read it. Alpine has none, and an installer that wrote a unit file
+# there anyway would be leaving a file that nothing will ever open — so what is asserted is the decision.
+if [ -d /usr/lib/systemd ]; then
+    test -f /usr/lib/systemd/system/flowlightd.service || fail "the unit was not installed on $name"
+    if ls /etc/systemd/system/multi-user.target.wants/flowlightd.service >/dev/null 2>&1; then
+        fail "the unit is enabled; an installer must not start this"
+    fi
+else
+    test ! -e /usr/lib/systemd/system/flowlightd.service \
+        || fail "a unit was installed on $name, which has no systemd to read it"
+    echo "no systemd here, and the installer did not pretend otherwise"
 fi
 
 ( cd "$directory" && ./install.sh --uninstall ) || fail "the uninstaller failed on $name"

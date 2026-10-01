@@ -56,14 +56,16 @@ test -f "$here/flowlightd" || { echo "no flowlightd beside this script" >&2; exi
 install -d -m 755 "$prefix/sbin"
 install -m 755 "$here/flowlightd" "$prefix/sbin/flowlightd"
 
+# Only where systemd keeps its units. A machine without systemd — Alpine, Void — gets the binary and is told
+# so, rather than getting a unit file nothing will ever read.
+unit_installed=no
 if [ -d "$(dirname "$units")" ]; then
     install -d -m 755 "$units"
     install -m 644 "$here/flowlightd.service" "$units/flowlightd.service"
+    unit_installed=yes
     if command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload >/dev/null 2>&1 || true
     fi
-else
-    echo "No $units, so the unit was not installed. Run it yourself: sudo $prefix/sbin/flowlightd"
 fi
 
 cat <<SAID
@@ -74,7 +76,17 @@ That is on purpose: it reads every HTTPS request on this machine, and starting
 that because somebody ran an installer would be the wrong way round.
 
   sudo $prefix/sbin/flowlightd                watch, in this terminal
-  sudo systemctl enable --now flowlightd      watch from now on, if this machine has systemd
+SAID
+
+# Offered only where it would work. A suggestion that cannot run on the machine reading it is worse than no
+# suggestion: it sends somebody looking for what they did wrong.
+if [ "$unit_installed" = yes ]; then
+    echo "  sudo systemctl enable --now flowlightd      watch from now on"
+else
+    echo "  (no $units here, so no systemd unit was installed)"
+fi
+
+cat <<SAID
   $prefix/sbin/flowlightd budget              what it is allowed to read, and for how long
 
   ./install.sh --uninstall                    take it off again
