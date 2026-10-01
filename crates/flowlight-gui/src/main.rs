@@ -37,6 +37,32 @@ const WINDOWS: &[(&str, i64)] = &[
 ];
 
 fn main() -> glib::ExitCode {
+    // Answered before GTK is touched, because both answers are useful on a machine with no display — which is
+    // most machines a package is installed on before anybody logs in. A window that can only be asked its
+    // version by opening it is a window nobody can check from a script.
+    for argument in std::env::args().skip(1) {
+        match argument.as_str() {
+            "--version" | "-V" => {
+                println!("flowlight {}", env!("CARGO_PKG_VERSION"));
+                return glib::ExitCode::SUCCESS;
+            }
+            "--help" | "-h" => {
+                println!(
+                    "flowlight {} — the window for Flowlight, run as yourself and not as root\n\n\
+                     usage: flowlight [--socket PATH]\n\n  \
+                     --socket PATH  where the daemon is listening; {} by default\n  \
+                     --version      what this is\n\n\
+                     The daemon holds the privileges, the probes and the database. This holds a list and \
+                     four buttons.",
+                    env!("CARGO_PKG_VERSION"),
+                    protocol::DEFAULT_SOCKET
+                );
+                return glib::ExitCode::SUCCESS;
+            }
+            _ => {}
+        }
+    }
+
     let socket = socket_from_arguments();
     let application = adw::Application::builder()
         .application_id("com.xinbetween.Flowlight")
