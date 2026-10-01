@@ -117,6 +117,36 @@ struct State {
     turns: RefCell<Vec<Turn>>,
     /// Whether a question is in flight, so the page can say so rather than looking broken for a minute.
     thinking: std::cell::Cell<bool>,
+    /// Whether the daemon is reading payloads at all, as of the last refresh.
+    reading: std::cell::Cell<Reading>,
+}
+
+/// Whether payloads are being read, which is the difference between "nothing happened" and "nothing was
+/// read" — two empty pages that look identical and have different remedies.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+enum Reading {
+    /// Being read, so an empty page means an empty hour.
+    Yes,
+    /// Switched off entirely. Nothing will appear until somebody turns it on.
+    Off,
+    /// The session ended. Renewing starts it again.
+    RunOut,
+    /// The daemon has not been asked yet, or did not answer.
+    Unknown,
+}
+
+impl Reading {
+    /// What the budget amounts to, from the window's point of view.
+    ///
+    /// Switched off and run out are different sentences with different remedies, and the budget says both
+    /// in two fields: `payloads` is the decision, `reading` is whether it is in force right now.
+    fn of(budget: &protocol::Budget) -> Self {
+        match (budget.payloads, budget.reading) {
+            (false, _) => Self::Off,
+            (true, true) => Self::Yes,
+            (true, false) => Self::RunOut,
+        }
+    }
 }
 
 fn build(application: &adw::Application, socket: PathBuf) {
@@ -124,6 +154,7 @@ fn build(application: &adw::Application, socket: PathBuf) {
         socket,
         window: WINDOWS.get(1).map_or(3_600, |(_, seconds)| *seconds),
         drawn: RefCell::new(Default::default()),
+        reading: std::cell::Cell::new(Reading::Unknown),
         turns: RefCell::new(Vec::new()),
         thinking: std::cell::Cell::new(false),
     });
@@ -164,8 +195,21 @@ fn build(application: &adw::Application, socket: PathBuf) {
         .revealed(false)
         .use_markup(false)
         .build();
+    // A second banner, because the first belongs to the handshake and says something that was true when
+    // the window opened. This one says what is true now: whether anything is being read at all. It carries
+    // the remedy rather than naming it, since somebody reading "renew it" wants to renew it.
+    let capture = adw::Banner::builder()
+        .revealed(false)
+        .use_markup(false)
+        .build();
+    {
+        let state = Rc::clone(&state);
+        capture.connect_button_clicked(move |_| change(&state, "renew", "true"));
+    }
+
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&banner);
+    content.append(&capture);
     content.append(&stack);
 
     let toolbar = adw::ToolbarView::new();
@@ -215,7 +259,7 @@ fn build(application: &adw::Application, socket: PathBuf) {
     glib::spawn_future_local(async move {
         loop {
             let seconds = *window_seconds.borrow();
-            refresh(&state, seconds, &stack, &status, &pages).await;
+            refresh(&state, seconds, &stack, &status, &pages, &capture).await;
             glib::timeout_future_seconds(REFRESH_SECONDS).await;
         }
     });
@@ -252,9 +296,15 @@ async fn refresh(
     stack: &adw::ViewStack,
     status: &gtk::Label,
     pages: &Pages,
+    capture: &adw::Banner,
 ) {
     let visible = stack.visible_child_name().unwrap_or_else(|| "live".into());
     let socket = state.socket.clone();
+
+    // Asked on every page and every tick, because whether anything is being read is true of the window
+    // rather than of a page, and somebody who left the Live tab open is exactly who needs telling — at the
+    // speed the rest of the window moves, not slower.
+    watch_reading(state, capture).await;
 
     match visible.as_str() {
         "agents" => {
@@ -352,13 +402,58 @@ async fn refresh(
         }
         _ => match fetch::<Vec<Request>>(socket, protocol::recent(seconds, RECENT)).await {
             Ok(rows) => {
-                draw(state, 0, &rows, &pages.live, |column| {
-                    render_live(column, &rows)
+                // Why the page is empty is part of what the page says, so it is part of what decides
+                // whether the page is redrawn.
+                let reading = state.reading.get();
+                draw(state, 0, &(&rows, reading), &pages.live, |column| {
+                    render_live(column, &rows, reading)
                 });
                 say(status, "");
             }
             Err(err) => say(status, &err),
         },
+    }
+}
+
+/// Asks whether payloads are still being read, and says so in the banner when they are not.
+///
+/// Asked on every tick, with everything else. It was throttled to once every ten seconds on the reasoning
+/// that a session ending is not a second-by-second event — which is true of the session and false of the
+/// window. A live view that takes ten seconds to admit it has stopped being live is the bug this fixes,
+/// arriving later and quieter. One more question every two seconds, down a Unix socket on the same machine,
+/// buys a window that is either right or wrong within one refresh like everything else in it.
+///
+/// This exists because a window showing nothing looked the same whether nothing had happened or nothing was
+/// being read. The daemon knew which — it says so in its own log and in `flowlightd budget` — and the window
+/// never asked.
+async fn watch_reading(state: &Rc<State>, banner: &adw::Banner) {
+    let Ok(budget) =
+        fetch::<protocol::Budget>(state.socket.clone(), r#"{"op":"budget"}"#.to_owned()).await
+    else {
+        // An unreachable daemon is already said in the corner. Saying it twice helps nobody.
+        return;
+    };
+
+    let reading = Reading::of(&budget);
+    state.reading.set(reading);
+
+    match reading {
+        Reading::Off => {
+            banner.set_title(
+                "Payloads are not being read, so requests will not appear here. Budget has the switch.",
+            );
+            banner.set_button_label(None);
+            banner.set_revealed(true);
+        }
+        Reading::RunOut => {
+            banner.set_title(
+                "Payload capture has run out, so nothing new is being read. Connections are still \
+                 attributed.",
+            );
+            banner.set_button_label(Some("Renew"));
+            banner.set_revealed(true);
+        }
+        Reading::Yes | Reading::Unknown => banner.set_revealed(false),
     }
 }
 
@@ -458,12 +553,27 @@ fn who(agent: Option<&str>, process: &str) -> String {
     }
 }
 
-fn render_live(column: &gtk::Box, rows: &[Request]) {
+fn render_live(column: &gtk::Box, rows: &[Request], reading: Reading) {
     if rows.is_empty() {
-        column.append(&nothing(
-            "Nothing read in this window",
-            "That is not the same as nothing happening. Coverage says what could not be read.",
-        ));
+        // Four different silences. Telling somebody "nothing read" when the answer is "the session you
+        // started eight hours ago ended" wastes their afternoon, which is how this was found.
+        let (title, about) = match reading {
+            Reading::Off => (
+                "Payloads are not being read",
+                "This page shows what applications hand their TLS libraries, and that is switched off. \
+                 Budget has the switch.",
+            ),
+            Reading::RunOut => (
+                "Payload capture has run out",
+                "The session ended, so nothing new is being read. Renew it in the banner above or in \
+                 Budget — `sudo flowlightd budget --renew` does the same.",
+            ),
+            Reading::Yes | Reading::Unknown => (
+                "Nothing read in this window",
+                "That is not the same as nothing happening. Coverage says what could not be read.",
+            ),
+        };
+        column.append(&nothing(title, about));
         return;
     }
     let group = adw::PreferencesGroup::new();
@@ -1612,5 +1722,44 @@ fn duration(seconds: i64) -> String {
         } else {
             format!("{hours} hours and {minutes} minutes")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A budget with the parts this is about, and defaults for the rest.
+    fn budget(payloads: bool, reading: bool) -> protocol::Budget {
+        protocol::Budget {
+            payloads,
+            reading,
+            session_minutes: 480,
+            session_remaining: Some(if reading { 3_600 } else { 0 }),
+            daily_bytes: 64 * 1024 * 1024,
+            paths: "full".to_owned(),
+            detail_days: 7,
+            summary_days: 90,
+            described: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_session_that_ran_out_is_not_a_quiet_hour() {
+        // The case that sent somebody looking at Firefox for an afternoon: capture is on, the session
+        // ended, and the page used to say "nothing read in this window".
+        assert_eq!(Reading::of(&budget(true, false)), Reading::RunOut);
+    }
+
+    #[test]
+    fn switched_off_and_run_out_are_different_things() {
+        assert_eq!(Reading::of(&budget(false, false)), Reading::Off);
+        // Off stays off even if the session clock would allow it, because the decision is the decision.
+        assert_eq!(Reading::of(&budget(false, true)), Reading::Off);
+    }
+
+    #[test]
+    fn reading_means_an_empty_page_is_an_empty_hour() {
+        assert_eq!(Reading::of(&budget(true, true)), Reading::Yes);
     }
 }
