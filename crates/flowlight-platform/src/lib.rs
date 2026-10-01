@@ -217,6 +217,89 @@ pub fn kernel(proc_root: &Path) -> Option<Kernel> {
     Kernel::parse(&text)
 }
 
+/// One watcher per database, enforced rather than asked for.
+///
+/// Two daemons against one database is not a crash and not an error: it is both of them attaching uprobes to
+/// the same libraries, both reading every call, and both writing it down. Every number the thing reports is
+/// then doubled, and nothing says so — which is the worst shape a bug can take in a tool whose whole claim is
+/// that its numbers are what happened.
+///
+/// It is also easy to do by accident. Start the service, then run `sudo flowlightd` to look at something, and
+/// that is the state. That is exactly how it was found: a stray daemon left over from one test doubled the
+/// output of the next, and the arithmetic was correct both times.
+///
+/// An advisory lock on a file beside the database, held for as long as the process lives. `flock` rather than
+/// a pid file alone, because a pid file left behind by a daemon that was killed is a pid file that locks
+/// everybody out of their own machine — the kernel releases this when the process goes, however it goes.
+#[derive(Debug)]
+pub struct Watching {
+    /// Held open, because the lock lives on the open file description rather than on the path.
+    _file: std::fs::File,
+}
+
+/// Who holds it, when somebody does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Taken {
+    /// The lock file.
+    pub path: PathBuf,
+    /// The pid written in it, when it is readable and looks like one. It is a courtesy rather than a
+    /// guarantee: the lock is what is authoritative, and the number is what makes the sentence useful.
+    pub pid: Option<u32>,
+}
+
+/// Takes the right to watch with this database, or says who already has it.
+///
+/// The lock file is `<database>.watching`, beside the database rather than in `/run`: the thing being
+/// protected is the database, and somebody who names another database with `--database` is not in conflict
+/// with this one.
+pub fn watch_with(database: &Path) -> Result<Watching, Taken> {
+    let path = lock_path(database);
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+    {
+        Ok(file) => file,
+        // A directory nobody can write to is not two daemons, and refusing to start over it would be worse
+        // than the problem: the answer is to let the caller carry on without the guard.
+        Err(_) => return Err(Taken { path, pid: None }),
+    };
+
+    // `LOCK_NB`, because the point is to be told rather than to wait: a daemon that blocked here would look
+    // like one that had started.
+    let held = unsafe {
+        libc::flock(
+            std::os::unix::io::AsRawFd::as_raw_fd(&file),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+    };
+    if held != 0 {
+        let pid = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.trim().parse().ok());
+        return Err(Taken { path, pid });
+    }
+
+    // Written through the handle that already holds the lock, rather than by opening the path again: a second
+    // open would be a second file description, which is a second lock, which is the thing being prevented.
+    //
+    // Best effort, both of them. The lock is what is authoritative; the number only makes the sentence the
+    // other daemon prints more useful than "somebody".
+    let _ = file.set_len(0);
+    let _ = std::io::Write::write_all(&mut &file, format!("{}\n", std::process::id()).as_bytes());
+
+    Ok(Watching { _file: file })
+}
+
+/// Where the lock for a database lives.
+pub fn lock_path(database: &Path) -> PathBuf {
+    let mut path = database.as_os_str().to_owned();
+    path.push(".watching");
+    PathBuf::from(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,6 +443,39 @@ mod tests {
             fn geteuid() -> u32;
         }
         unsafe { geteuid() }
+    }
+
+    /// The thing this prevents, and the reason it exists: two daemons against one database both read every
+    /// call and both write it down, and every number is then doubled with nothing saying so.
+    #[test]
+    fn a_second_watcher_is_told_who_has_the_database() {
+        let root = scratch("watching");
+        let database = root.join("flowlight.db");
+
+        let first = watch_with(&database).expect("the first one takes it");
+        let refused = watch_with(&database).expect_err("the second one is refused");
+        assert_eq!(refused.path, lock_path(&database));
+        // The pid is a courtesy rather than a guarantee, but it is this process and so it is knowable here.
+        assert_eq!(refused.pid, Some(std::process::id()));
+
+        // And when the first one goes, the next one may have it. The kernel releases the lock when the file
+        // description closes, which is what makes this survive a daemon that was killed rather than stopped.
+        drop(first);
+        let second = watch_with(&database).expect("after the first one went");
+        drop(second);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A different database is a different question, so naming one with `--database` is the way out.
+    #[test]
+    fn two_watchers_with_two_databases_are_not_in_conflict() {
+        let root = scratch("two");
+        let one = watch_with(&root.join("one.db")).expect("one");
+        let other = watch_with(&root.join("other.db")).expect("the other");
+        drop(one);
+        drop(other);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

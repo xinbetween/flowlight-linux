@@ -108,6 +108,11 @@ including an installation from it with a throwaway key, and goes live once a sig
 [`packaging/apt/README.md`](packaging/apt/README.md) says why that key is not something this code can create for
 you. Until it is, the commands above have nothing to answer them.
 
+**One watcher per database.** A second daemon against the same database would attach the same probes, read
+every call a second time and write it down again — doubling every number with nothing to say it had. So the
+second one refuses to start and says which process holds the database. `--database` names another one if you
+genuinely want two.
+
 **It installs and does not start.** A tool that reads every HTTPS request on a machine should not begin doing
 that because somebody installed a package, so the systemd unit ships disabled and `apt` says as much. When you
 want it: `sudo systemctl enable --now flowlightd`.

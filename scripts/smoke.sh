@@ -21,6 +21,8 @@ coverage_json=$(mktemp)
 agents_json=$(mktemp)
 fake_agent=$(mktemp -d)/claude
 database=$(mktemp -d)/flowlight.db
+# A second one, for the check that two daemons with two databases are not in conflict.
+work_database=$(mktemp -d)/elsewhere.db
 export_dir=$(mktemp -d)
 export_file=$export_dir/exported.jsonl
 export_second=$export_dir/elsewhere.jsonl
@@ -35,6 +37,7 @@ cleanup() {
     rm -rf "$(dirname "$fake_agent")"
     [ "${agent_tested:-no}" = yes ] && rm -f "$agent_config"
     sudo rm -rf "$(dirname "$database")" "$export_dir" "$(dirname "$certificates")"
+    sudo rm -rf "$(dirname "$work_database")"
     [ -n "${demo:-}" ] && sudo rm -rf "$(dirname "$demo")"
     return 0
 }
@@ -450,6 +453,24 @@ sudo "$binary" --database "$database" --certificates "$certificates" devices --o
 sudo "$binary" --database "$database" --certificates "$certificates" --json devices \
     | jq -e '.watching == false' >/dev/null || fail "turning it off did not take."
 echo "OK: turning it off stops the watching and keeps what was seen"
+
+# One watcher per database. A second daemon would attach the same probes and write every request down twice,
+# which doubles every number without saying so — the shape of bug this test exists for, and the one that was
+# found by leaving a stray daemon running on a real machine.
+second=$(sudo "$binary" --database "$database" --certificates "$certificates" --seconds 5 2>&1 || true)
+case "$second" in
+    *"already watching"*) ;;
+    *) printf '%s\n' "$second"; fail "a second daemon started against a database another one is watching." ;;
+esac
+# And it says which process has it, because "somebody" is not something anybody can act on.
+case "$second" in
+    *"pid "*) ;;
+    *) printf '%s\n' "$second"; fail "the refusal does not say which process holds the database." ;;
+esac
+# A different database is a different question, and the way out of the refusal.
+sudo "$binary" --database "$work_database" --certificates "$certificates" --seconds 3 --no-intercept \
+    >/dev/null 2>&1 || fail "a daemon with its own database was refused as well."
+echo "OK: one watcher per database, and the refusal says who has it"
 
 # What this machine can do, asked before anything is loaded. On this runner everything essential is present,
 # so `check` has to say so and exit zero — and it has to be runnable by somebody who is not root, because that
