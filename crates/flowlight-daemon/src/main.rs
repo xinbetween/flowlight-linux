@@ -870,6 +870,41 @@ fn main() -> anyhow::Result<()> {
     // die, rather than leaving the main loop waiting on threads that are not coming back.
     drop(sender);
 
+    // One watcher per database, and the refusal names who has it.
+    //
+    // Two daemons against one database is not a crash: both attach uprobes to the same libraries, both read
+    // every call, and both write it down — so every number this reports is doubled and nothing says so. It is
+    // easy to arrive at, too. Start the service, then run `sudo flowlightd` to look at something, and that is
+    // the state. It was found exactly that way, by a stray daemon from one test doubling the output of the
+    // next, and the arithmetic was right both times.
+    //
+    // Held for as long as this process lives. The variable is named rather than dropped, because dropping it
+    // would release the lock immediately and leave the guard doing nothing at all.
+    let _watching = if args.no_store {
+        None
+    } else {
+        match flowlight_platform::watch_with(&args.database) {
+            Ok(held) => Some(held),
+            Err(taken) => {
+                bail!(
+                    "another flowlightd{} is already watching with {}. Two of them would each read every \
+                     request and write it down, which doubles every number this reports — so this one is \
+                     stopping instead. Stop that one, or name another database with --database.{}",
+                    taken
+                        .pid
+                        .map(|pid| format!(" (pid {pid})"))
+                        .unwrap_or_default(),
+                    args.database.display(),
+                    if taken.pid.is_none() {
+                        format!(" The lock is {}.", taken.path.display())
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+        }
+    };
+
     let mut store = if args.no_store {
         None
     } else {
