@@ -39,6 +39,7 @@ cleanup() {
     sudo rm -rf "$(dirname "$database")" "$export_dir" "$(dirname "$certificates")"
     sudo rm -rf "$(dirname "$work_database")"
     [ -n "${demo:-}" ] && sudo rm -rf "$(dirname "$demo")"
+    [ -n "${owner_database:-}" ] && sudo rm -rf "$(dirname "$owner_database")"
     return 0
 }
 trap cleanup EXIT
@@ -453,6 +454,36 @@ sudo "$binary" --database "$database" --certificates "$certificates" devices --o
 sudo "$binary" --database "$database" --certificates "$certificates" --json devices \
     | jq -e '.watching == false' >/dev/null || fail "turning it off did not take."
 echo "OK: turning it off stops the watching and keeps what was seen"
+
+# Who the interface socket belongs to. The window runs as a person and the daemon runs as root, so under a
+# systemd unit — where there is no `SUDO_UID` to infer from — the socket is root's and the window is refused
+# by the kernel. That is how it behaved until this was found on a real machine with the service running.
+# Its own database, because the daemon under test is already watching with the main one and one watcher per
+# database is the rule the check below this asserts. The first version of this used the same database and was
+# refused by that lock, which is the feature working and the test being wrong.
+owner_database=$(mktemp -d)/owner.db
+owner_socket=$(dirname "$owner_database")/owned.sock
+sudo "$binary" --database "$owner_database" --certificates "$certificates" --socket "$owner_socket" \
+    --socket-owner 0 --no-intercept --no-block --seconds 10 >/dev/null 2>&1 &
+owner_daemon=$!
+# Waited for rather than slept at: a fixed sleep is a test that fails on a slow machine and passes on yours.
+for _ in $(seq 1 20); do [ -S "$owner_socket" ] && break; sleep 1; done
+[ -S "$owner_socket" ] || fail "the daemon never created the socket it was told to put at $owner_socket."
+case "$(stat -c '%u' "$owner_socket")" in
+    0) echo "   a socket asked to belong to root belongs to root" ;;
+    *) fail "--socket-owner 0 did not give the socket to root; it belongs to uid $(stat -c '%u' "$owner_socket")." ;;
+esac
+wait "$owner_daemon" 2>/dev/null || true
+
+# And a name nobody has is refused rather than producing a socket nothing can open. Refused *before* anything
+# is loaded, which is why this takes a tenth of a second rather than the time it takes to attach probes.
+refusal=$(sudo "$binary" --database "$owner_database" --certificates "$certificates" \
+    --socket-owner nobody-by-that-name-at-all --seconds 5 2>&1 || true)
+case "$refusal" in
+    *"no such user"*) ;;
+    *) printf '%s\n' "$refusal"; fail "a socket owner nobody has was accepted." ;;
+esac
+echo "OK: the socket belongs to whoever was named, and a name nobody has is refused"
 
 # One watcher per database. A second daemon would attach the same probes and write every request down twice,
 # which doubles every number without saying so — the shape of bug this test exists for, and the one that was

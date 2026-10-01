@@ -735,7 +735,23 @@ fn chown(path: &Path, owner: (u32, u32)) -> Result<()> {
 ///
 /// The one who ran `sudo`, when there was one: they are the person at the machine, and the interface will
 /// run as them. Root otherwise, which on a box with no desktop session is the honest answer rather than a
-/// guess at who might want it.
+/// guess at who might want it — and is why `--socket-owner` exists for the box that has one.
+///
+/// Named explicitly, that name wins: somebody who wrote it down knows who is going to open the window.
+pub fn owner_from(named: Option<&str>) -> anyhow::Result<(u32, u32)> {
+    let Some(named) = named else {
+        return Ok(intended_owner());
+    };
+    flowlight_platform::user(std::path::Path::new("/etc/passwd"), named).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--socket-owner {named}: there is no such user in /etc/passwd. A socket belonging to a uid \
+             nobody has is a socket nothing can open, so this is refused rather than guessed at. A number \
+             is taken at its word if that is what you meant."
+        )
+    })
+}
+
+/// Who the socket belongs to when nobody said.
 pub fn intended_owner() -> (u32, u32) {
     let read = |name: &str| {
         std::env::var(name)
@@ -930,5 +946,24 @@ mod tests {
         // the value: whatever it returns must be a real pair of identifiers.
         let (uid, gid) = intended_owner();
         assert!(uid != u32::MAX && gid != u32::MAX);
+    }
+
+    /// The flag that makes the window work under a service, and the refusal that stops a socket belonging to
+    /// nobody.
+    #[test]
+    fn a_named_owner_wins_and_a_name_nobody_has_is_refused() {
+        // `root` is in every password file there is, which is what makes it the one name safe to assert on.
+        assert_eq!(owner_from(Some("root")).ok(), Some((0, 0)));
+        assert_eq!(owner_from(Some("0")).ok(), Some((0, 0)));
+        // A number nobody has is taken at its word: a container with no password file is a normal place for
+        // this to run, and refusing there would be refusing the common case.
+        assert_eq!(owner_from(Some("31337")).ok(), Some((31337, 31337)));
+        let refused = owner_from(Some("nobody-by-that-name-at-all")).expect_err("a refusal");
+        assert!(
+            format!("{refused:#}").contains("no such user"),
+            "{refused:#}"
+        );
+        // And nothing named is the behaviour that was there before this flag.
+        assert_eq!(owner_from(None).ok(), Some(intended_owner()));
     }
 }
