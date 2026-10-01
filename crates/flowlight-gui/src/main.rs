@@ -158,7 +158,10 @@ fn build(application: &adw::Application, socket: PathBuf) {
 
     // Shown only when the daemon says it is not enforcing. A window full of rules that do nothing is the
     // one thing worse than a window with no rules in it.
-    let banner = adw::Banner::builder().revealed(false).build();
+    let banner = adw::Banner::builder()
+        .revealed(false)
+        .use_markup(false)
+        .build();
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&banner);
     content.append(&stack);
@@ -494,6 +497,7 @@ fn render_live(column: &gtk::Box, rows: &[Request]) {
             about.push_str("  ·  truncated");
         }
         let entry = adw::ActionRow::builder()
+            .use_markup(false)
             .title(&what)
             .subtitle(&about)
             .build();
@@ -531,6 +535,7 @@ fn render_agents(state: &Rc<State>, seconds: i64, column: &gtk::Box, rows: &[Age
         if !agent.local.is_empty() {
             group.add(
                 &adw::ActionRow::builder()
+                    .use_markup(false)
                     .title(format!("{} local MCP server(s)", agent.local.len()))
                     .subtitle(format!(
                         "{} — these talk over a pipe, so nothing here can ever see them",
@@ -541,6 +546,7 @@ fn render_agents(state: &Rc<State>, seconds: i64, column: &gtk::Box, rows: &[Age
         }
         for domain in &agent.domains {
             let entry = adw::ActionRow::builder()
+                .use_markup(false)
                 .title(&domain.host)
                 .subtitle(if domain.servers.is_empty() {
                     format!("{} requests", domain.requests)
@@ -591,6 +597,7 @@ fn render_agents(state: &Rc<State>, seconds: i64, column: &gtk::Box, rows: &[Age
             for tool in &agent.tools {
                 said.add(
                     &adw::ActionRow::builder()
+                        .use_markup(false)
                         .title(match &tool.tool {
                             Some(name) => format!("{}  {name}", tool.method),
                             None => tool.method.clone(),
@@ -711,6 +718,7 @@ fn render_rules(state: &Rc<State>, column: &gtk::Box, rows: &[Rule]) {
     if rows.is_empty() {
         group.add(
             &adw::ActionRow::builder()
+                .use_markup(false)
                 .title("No rules")
                 .subtitle("Nothing is being refused.")
                 .build(),
@@ -731,6 +739,7 @@ fn render_rules(state: &Rc<State>, column: &gtk::Box, rows: &[Rule]) {
             about.push_str(&format!("  ·  {note}"));
         }
         let entry = adw::ActionRow::builder()
+            .use_markup(false)
             .title(format!("{} {}", rule.action, rule.subject))
             .subtitle(&about)
             .build();
@@ -784,6 +793,7 @@ fn render_coverage(column: &gtk::Box, row: &Coverage) {
     if row.unread.is_empty() {
         unread.add(
             &adw::ActionRow::builder()
+                .use_markup(false)
                 .title("Nothing")
                 .subtitle("Every process that opened an HTTPS connection was read.")
                 .build(),
@@ -848,6 +858,7 @@ fn render_coverage(column: &gtk::Box, row: &Coverage) {
         for library in &row.unprobed {
             unprobed.add(
                 &adw::ActionRow::builder()
+                    .use_markup(false)
                     .title(&library.path)
                     .subtitle(&library.reason)
                     .build(),
@@ -860,6 +871,7 @@ fn render_coverage(column: &gtk::Box, row: &Coverage) {
 /// A row that is mostly a number.
 fn counted(title: &str, value: i64, about: &str) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
+        .use_markup(false)
         .title(title)
         .subtitle(about)
         .build();
@@ -889,7 +901,12 @@ fn render_budget(state: &Rc<State>, column: &gtk::Box, row: &protocol::Budget) {
         .title("What is being read")
         .build();
     for sentence in &row.described {
-        said.add(&adw::ActionRow::builder().title(sentence).build());
+        said.add(
+            &adw::ActionRow::builder()
+                .use_markup(false)
+                .title(sentence)
+                .build(),
+        );
     }
     column.append(&said);
 
@@ -917,6 +934,7 @@ fn render_budget(state: &Rc<State>, column: &gtk::Box, row: &protocol::Budget) {
     }
 
     let renew = adw::ActionRow::builder()
+        .use_markup(false)
         .title("Session")
         .subtitle(match row.session_remaining {
             Some(0) => "Run out. Nothing is being read.".to_owned(),
@@ -995,12 +1013,14 @@ fn render_budget(state: &Rc<State>, column: &gtk::Box, row: &protocol::Budget) {
         .build();
     keeping.add(
         &adw::ActionRow::builder()
+            .use_markup(false)
             .title("Individual requests")
             .subtitle(format!("{} days", row.detail_days))
             .build(),
     );
     keeping.add(
         &adw::ActionRow::builder()
+            .use_markup(false)
             .title("Daily summary")
             .subtitle(format!("{} days", row.summary_days))
             .build(),
@@ -1022,11 +1042,17 @@ fn render_export(state: &Rc<State>, column: &gtk::Box, row: &protocol::Export) {
         })
         .build();
     for sentence in &row.disclosure {
-        said.add(&adw::ActionRow::builder().title(sentence).build());
+        said.add(
+            &adw::ActionRow::builder()
+                .use_markup(false)
+                .title(sentence)
+                .build(),
+        );
     }
     if let Some(reason) = &row.why_not {
         said.add(
             &adw::ActionRow::builder()
+                .use_markup(false)
                 .title("Nothing is being sent")
                 .subtitle(reason)
                 .build(),
@@ -1057,6 +1083,7 @@ fn render_export(state: &Rc<State>, column: &gtk::Box, row: &protocol::Export) {
     if row.headers.is_empty() {
         where_to.add(
             &adw::ActionRow::builder()
+                .use_markup(false)
                 .title("No headers")
                 .subtitle(
                     "A collector that needs a token wants one: `flowlightd export --header                      Authorization=…`. Set here or there, the value is never shown back.",
@@ -1066,6 +1093,7 @@ fn render_export(state: &Rc<State>, column: &gtk::Box, row: &protocol::Export) {
     } else {
         where_to.add(
             &adw::ActionRow::builder()
+                .use_markup(false)
                 .title("Headers")
                 // Names only. This window ends up in screenshots like any other.
                 .subtitle(row.headers.join(", "))
@@ -1112,6 +1140,7 @@ fn render_export(state: &Rc<State>, column: &gtk::Box, row: &protocol::Export) {
 
     let agreement = adw::PreferencesGroup::builder().title("Agreement").build();
     let state_of_it = adw::ActionRow::builder()
+        .use_markup(false)
         .title(if row.consented {
             "Agreed to the sentences above"
         } else {
@@ -1204,11 +1233,17 @@ fn render_ask(state: &Rc<State>, column: &gtk::Box, row: &protocol::Ask) {
         .title("What asking means")
         .build();
     for sentence in &row.disclosure {
-        said.add(&adw::ActionRow::builder().title(sentence).build());
+        said.add(
+            &adw::ActionRow::builder()
+                .use_markup(false)
+                .title(sentence)
+                .build(),
+        );
     }
     if let Some(reason) = &row.why_not {
         said.add(
             &adw::ActionRow::builder()
+                .use_markup(false)
                 .title("Not ready")
                 .subtitle(reason)
                 .build(),
@@ -1237,6 +1272,7 @@ fn render_ask(state: &Rc<State>, column: &gtk::Box, row: &protocol::Ask) {
     if state.thinking.get() {
         asking.add(
             &adw::ActionRow::builder()
+                .use_markup(false)
                 .title("Thinking…")
                 .subtitle(
                     "A model running on this machine can take a while over the first question.",
@@ -1253,12 +1289,14 @@ fn render_ask(state: &Rc<State>, column: &gtk::Box, row: &protocol::Ask) {
         match &turn.failure {
             Some(failure) => group.add(
                 &adw::ActionRow::builder()
+                    .use_markup(false)
                     .title("That could not be answered")
                     .subtitle(failure.clone())
                     .build(),
             ),
             None => group.add(
                 &adw::ActionRow::builder()
+                    .use_markup(false)
                     .title(turn.answer.clone())
                     .subtitle(if turn.work.is_empty() {
                         // An answer with no queries under it is a sentence a model made up, and saying so is
@@ -1338,6 +1376,7 @@ fn render_ask(state: &Rc<State>, column: &gtk::Box, row: &protocol::Ask) {
     if row.needs_key {
         configuring.add(
             &adw::ActionRow::builder()
+                .use_markup(false)
                 .title(if row.key_on_file {
                     "A key is on file"
                 } else {
@@ -1417,11 +1456,17 @@ fn render_intercept(state: &Rc<State>, column: &gtk::Box, row: &protocol::Interc
         })
         .build();
     for sentence in &row.intercept.disclosure {
-        said.add(&adw::ActionRow::builder().title(sentence).build());
+        said.add(
+            &adw::ActionRow::builder()
+                .use_markup(false)
+                .title(sentence)
+                .build(),
+        );
     }
     if let Some(reason) = &row.intercept.why_not {
         said.add(
             &adw::ActionRow::builder()
+                .use_markup(false)
                 .title("Nothing is being terminated")
                 .subtitle(reason)
                 .build(),
@@ -1439,6 +1484,7 @@ fn render_intercept(state: &Rc<State>, column: &gtk::Box, row: &protocol::Interc
     if row.mocks.is_empty() {
         answers.add(
             &adw::ActionRow::builder()
+                .use_markup(false)
                 .title("None")
                 .subtitle("`flowlightd mock <host> --status 503` writes one.")
                 .build(),
@@ -1446,6 +1492,7 @@ fn render_intercept(state: &Rc<State>, column: &gtk::Box, row: &protocol::Interc
     }
     for mock in &row.mocks {
         let line = adw::ActionRow::builder()
+            .use_markup(false)
             .title(format!(
                 "{} {}{}",
                 if mock.method.is_empty() {
@@ -1507,6 +1554,7 @@ fn render_intercept(state: &Rc<State>, column: &gtk::Box, row: &protocol::Interc
     if row.guardrails.is_empty() {
         guarded.add(
             &adw::ActionRow::builder()
+                .use_markup(false)
                 .title("None")
                 .subtitle("`flowlightd guardrail --tool write_file --agent claude` writes one.")
                 .build(),
@@ -1514,6 +1562,7 @@ fn render_intercept(state: &Rc<State>, column: &gtk::Box, row: &protocol::Interc
     }
     for guardrail in &row.guardrails {
         let line = adw::ActionRow::builder()
+            .use_markup(false)
             .title(guardrail.title.clone())
             .subtitle(format!(
                 "{}{}",
@@ -1601,6 +1650,7 @@ fn render_intercept(state: &Rc<State>, column: &gtk::Box, row: &protocol::Interc
         .build();
     certificate.add(
         &adw::ActionRow::builder()
+            .use_markup(false)
             .title("Certificate")
             .subtitle(
                 row.intercept
@@ -1613,6 +1663,7 @@ fn render_intercept(state: &Rc<State>, column: &gtk::Box, row: &protocol::Interc
     if let Some(bundle) = &row.intercept.bundle {
         certificate.add(
             &adw::ActionRow::builder()
+                .use_markup(false)
                 .title("This machine's roots plus it")
                 .subtitle(bundle.clone())
                 .build(),

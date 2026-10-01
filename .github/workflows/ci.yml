@@ -69,6 +69,25 @@ jobs:
       - name: Formatting
         run: cargo fmt --all --check
 
+      # Every row in the window carries text that came off the network — a host, a path, a process name — and
+      # libadwaita parses a row's title and subtitle as Pango markup unless told otherwise. A single `&` in a
+      # query string then renders as nothing at all, and `<span>` in one would render as markup.
+      #
+      # Found by opening the window on a real desktop and seeing a request row with no request in it.
+      - name: Data in the window is not markup
+        run: |
+          set -euo pipefail
+          rows=$(grep -c 'adw::ActionRow::builder()' crates/flowlight-gui/src/main.rs)
+          literal=$(grep -A 1 'adw::ActionRow::builder()' crates/flowlight-gui/src/main.rs \
+            | grep -c 'use_markup(false)')
+          echo "$literal of $rows rows say their text is not markup"
+          if [ "$rows" != "$literal" ]; then
+            echo "a row carries data and does not say it is not markup"
+            exit 1
+          fi
+          grep -q 'use_markup(false)' <(grep -A 3 'adw::Banner::builder()' crates/flowlight-gui/src/main.rs) \
+            || { echo "the banner carries error text and does not say it is not markup"; exit 1; }
+
       # `flowlight-ebpf` is excluded from the host-target commands and checked by being compiled for the BPF
       # target as part of the daemon's build script. Linting it here would mean linting it for x86_64, which
       # is not a target it has a meaning on.
