@@ -17,11 +17,27 @@ const CANDIDATES: [&str; 2] = ["/sys/kernel/tracing", "/sys/kernel/debug/tracing
 /// `check` can tell "there is no tracefs here" from "you are not root", which are a mount command and a
 /// `sudo` and should not be the same sentence.
 pub fn mounted(root: Option<&Path>) -> Option<PathBuf> {
-    let roots: Vec<PathBuf> = match root {
-        Some(path) => vec![path.to_path_buf()],
-        None => CANDIDATES.iter().map(PathBuf::from).collect(),
-    };
-    roots.into_iter().find(|root| root.join("events").is_dir())
+    if let Some(path) = root {
+        return path.join("events").is_dir().then(|| path.to_path_buf());
+    }
+    // `/proc/mounts` rather than the directory, because the directory is `drwx------` on Ubuntu and a person
+    // asking whether it exists is refused entry and told no. The mount table is readable by everybody and is
+    // the thing that actually knows.
+    if let Ok(table) = std::fs::read_to_string("/proc/mounts") {
+        for line in table.lines() {
+            let mut fields = line.split_whitespace();
+            let (_source, point, kind) = (fields.next(), fields.next(), fields.next());
+            if kind == Some("tracefs")
+                && let Some(point) = point
+            {
+                return Some(PathBuf::from(point));
+            }
+        }
+    }
+    CANDIDATES
+        .iter()
+        .map(PathBuf::from)
+        .find(|root| root.join("events").is_dir())
 }
 
 /// Reads the `format` file for one tracepoint.

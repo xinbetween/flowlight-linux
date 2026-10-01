@@ -11,6 +11,9 @@ Exec=flowlight
 Icon=com.xinbetween.Flowlight
 StartupWMClass=com.xinbetween.Flowlight
 Terminal=false
-Categories=System;Monitor;Network;Security;
+# One main category and two additional ones. `System;Monitor;Network;Security;` named three main categories —
+# System, Network and Security — and `desktop-file-validate` says what that costs: "application might appear
+# more than once in the application menu". Network is the main one here because that is what this watches.
+Categories=Network;Monitor;Security;
 Keywords=network;monitor;agent;traffic;https;ebpf;
 # It needs the daemon running to show anything, and says so in the window rather than here.

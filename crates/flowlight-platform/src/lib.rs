@@ -192,6 +192,22 @@ pub fn bpf(proc_root: &Path) -> Bpf {
     }
 }
 
+/// Whether a failure was the machine refusing permission, rather than something being absent.
+///
+/// The distinction is the whole of a useful report. "This machine has no tracefs" is a mount command; "you are
+/// not root" is a `sudo`; and a report that says the first when it means the second tells somebody their
+/// machine cannot do something it does perfectly well.
+///
+/// It looks through the chain rather than at the top, because by the time an error has been given its context
+/// the `io::Error` is several layers down — and the kind is the only part of it that is a fact rather than a
+/// sentence.
+pub fn permission_denied(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|cause| cause.kind() == std::io::ErrorKind::PermissionDenied)
+}
+
 /// The kernel release this machine is running, from `uname`.
 ///
 /// Read from `/proc/sys/kernel/osrelease` rather than by calling `uname`, so that it comes from a file like
@@ -291,6 +307,59 @@ mod tests {
         assert!(found.described().contains("cannot be refused"));
         assert!(found.described().contains("Watching is unaffected"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The distinction the whole report rests on, and the one a real machine caught being wrong: a directory
+    /// that is `drwx------` refuses a person *entry*, so looking inside it to find out whether it exists
+    /// answers "it does not" — and the report then told somebody their machine could not be watched.
+    #[test]
+    fn being_refused_is_not_the_same_as_being_absent() {
+        let root = scratch("refused");
+        let unreadable = root.join("locked");
+        std::fs::create_dir_all(&unreadable).expect("a directory");
+        write(&unreadable.join("secret"), "x");
+        std::fs::set_permissions(
+            &unreadable,
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .expect("a mode");
+
+        let refused: anyhow::Error = std::fs::read_to_string(unreadable.join("secret"))
+            .map_err(|err| {
+                anyhow::Error::new(err)
+                    .context("reading the layout")
+                    .context("checking")
+            })
+            .expect_err("a refusal");
+        let absent: anyhow::Error = std::fs::read_to_string(root.join("nothing/at/all"))
+            .map_err(|err| anyhow::Error::new(err).context("reading the layout"))
+            .expect_err("an absence");
+
+        // Running as root would read it anyway, and then this test would be asserting nothing — so it says so
+        // rather than passing quietly.
+        if permission_denied(&refused) {
+            assert!(!permission_denied(&absent), "an absence read as a refusal");
+        } else {
+            assert_eq!(
+                unsafe { libc_geteuid() },
+                0,
+                "a file with mode 000 was readable, and this is not root"
+            );
+        }
+
+        let _ = std::fs::set_permissions(
+            &unreadable,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `geteuid`, without a dependency for one call in one test.
+    unsafe fn libc_geteuid() -> u32 {
+        unsafe extern "C" {
+            fn geteuid() -> u32;
+        }
+        unsafe { geteuid() }
     }
 
     #[test]

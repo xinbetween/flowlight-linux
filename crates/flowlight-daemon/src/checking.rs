@@ -123,27 +123,30 @@ pub fn report(proc_root: &Path, sys_root: &Path, tracefs: Option<&Path>, root: b
                     .to_owned(),
                 true,
             ),
-            // The directory's existence is visible to anybody and the file inside it is readable only by
-            // root, so a person running this gets `unknown` rather than a report saying their machine cannot
-            // be watched. Those two are a `sudo` and a mount command, and telling them apart is the job.
-            Err(err) => match crate::tracefs::mounted(tracefs) {
-                Some(path) if !root => unknown(
-                    "tracefs",
-                    format!(
-                        "{} is mounted, and the file describing the tracepoint is readable only by root — so \
-                         whether its layout can be read cannot be answered from here.",
-                        path.display()
-                    ),
+            // Told apart by what the machine said, rather than by looking for the directory: on Ubuntu
+            // `/sys/kernel/tracing` is `drwx------`, which refuses a person *entry*, so asking whether it
+            // exists answers "it does not" — and the first version of this then told somebody their machine
+            // could not be watched when the honest answer was "you are not root". A real machine caught that;
+            // the one CI runs on has a searchable directory and agreed with the mistake.
+            Err(err) if !root && flowlight_platform::permission_denied(&err) => unknown(
+                "tracefs",
+                format!(
+                    "{}. The file describing the tracepoint is readable only by root, so whether its layout \
+                     can be read cannot be answered from here.",
+                    crate::tracefs::mounted(tracefs).map_or_else(
+                        || "tracefs refused to be read".to_owned(),
+                        |path| format!("{} is mounted", path.display())
+                    )
                 ),
-                _ => no(
-                    "tracefs",
-                    format!(
-                        "{err:#}. Without it the connection tracepoint cannot be read, which is most of \
-                         what Flowlight does."
-                    ),
-                    true,
+            ),
+            Err(err) => no(
+                "tracefs",
+                format!(
+                    "{err:#}. Without it the connection tracepoint cannot be read, which is most of what \
+                     Flowlight does."
                 ),
-            },
+                true,
+            ),
         },
     );
 

@@ -27,9 +27,15 @@ echo 'builder ALL=(ALL) NOPASSWD: ALL' >/etc/sudoers.d/builder
 
 # The desktop entry, checked by the tool whose job that is. A `.desktop` file with a mistake in it is a file
 # every desktop environment ignores in silence, which is the worst way for this to be wrong.
-desktop-file-validate packaging/desktop/com.xinbetween.Flowlight.desktop \
-    || fail "the desktop entry is not valid"
-echo "the desktop entry is valid"
+# `desktop-file-validate` exits zero for a hint and prints it, so the output is what is checked rather than
+# the status. The entry shipped with one for a week — three main categories, and a window that may appear twice
+# in a menu — because nothing was reading what the tool said.
+said=$(desktop-file-validate packaging/desktop/com.xinbetween.Flowlight.desktop 2>&1 || true)
+if [ -n "$said" ]; then
+    echo "$said"
+    fail "desktop-file-validate has something to say about the entry, and a hint nobody reads is a hint"
+fi
+echo "the desktop entry is valid, with nothing to add"
 
 work=/home/builder/build
 install -d -o builder -g builder "$work"
@@ -82,8 +88,11 @@ test -f /usr/share/applications/com.xinbetween.Flowlight.desktop \
     || fail "the window's package installs no desktop entry, so nothing in a launcher knows about it"
 test -f /usr/share/icons/hicolor/scalable/apps/com.xinbetween.Flowlight.svg \
     || fail "the window's package installs no icon"
-desktop-file-validate /usr/share/applications/com.xinbetween.Flowlight.desktop \
-    || fail "the installed desktop entry is not valid"
+installed_said=$(desktop-file-validate /usr/share/applications/com.xinbetween.Flowlight.desktop 2>&1 || true)
+if [ -n "$installed_said" ]; then
+    echo "$installed_said"
+    fail "the installed desktop entry is not clean"
+fi
 
 pacman -R --noconfirm flowlight-gui flowlight-bin >/dev/null || fail "the packages would not come off again"
 test ! -e /usr/share/applications/com.xinbetween.Flowlight.desktop \
