@@ -117,10 +117,8 @@ struct State {
     turns: RefCell<Vec<Turn>>,
     /// Whether a question is in flight, so the page can say so rather than looking broken for a minute.
     thinking: std::cell::Cell<bool>,
-    /// Whether the daemon is reading payloads at all, as of the last time it was asked.
+    /// Whether the daemon is reading payloads at all, as of the last refresh.
     reading: std::cell::Cell<Reading>,
-    /// When that was, so it is asked occasionally rather than four times a second.
-    asked_reading: std::cell::Cell<Option<std::time::Instant>>,
 }
 
 /// Whether payloads are being read, which is the difference between "nothing happened" and "nothing was
@@ -157,7 +155,6 @@ fn build(application: &adw::Application, socket: PathBuf) {
         window: WINDOWS.get(1).map_or(3_600, |(_, seconds)| *seconds),
         drawn: RefCell::new(Default::default()),
         reading: std::cell::Cell::new(Reading::Unknown),
-        asked_reading: std::cell::Cell::new(None),
         turns: RefCell::new(Vec::new()),
         thinking: std::cell::Cell::new(false),
     });
@@ -304,8 +301,9 @@ async fn refresh(
     let visible = stack.visible_child_name().unwrap_or_else(|| "live".into());
     let socket = state.socket.clone();
 
-    // Asked on every page, because whether anything is being read is true of the window rather than of a
-    // page, and somebody who left the Live tab open is exactly who needs telling.
+    // Asked on every page and every tick, because whether anything is being read is true of the window
+    // rather than of a page, and somebody who left the Live tab open is exactly who needs telling — at the
+    // speed the rest of the window moves, not slower.
     watch_reading(state, capture).await;
 
     match visible.as_str() {
@@ -419,22 +417,16 @@ async fn refresh(
 
 /// Asks whether payloads are still being read, and says so in the banner when they are not.
 ///
-/// Asked at most every ten seconds: a session running out is not a second-by-second event, and the Live page
-/// already asks a question every two. The answer is kept on the state so an empty page can say which kind of
-/// empty it is without asking again.
+/// Asked on every tick, with everything else. It was throttled to once every ten seconds on the reasoning
+/// that a session ending is not a second-by-second event — which is true of the session and false of the
+/// window. A live view that takes ten seconds to admit it has stopped being live is the bug this fixes,
+/// arriving later and quieter. One more question every two seconds, down a Unix socket on the same machine,
+/// buys a window that is either right or wrong within one refresh like everything else in it.
 ///
 /// This exists because a window showing nothing looked the same whether nothing had happened or nothing was
 /// being read. The daemon knew which — it says so in its own log and in `flowlightd budget` — and the window
 /// never asked.
 async fn watch_reading(state: &Rc<State>, banner: &adw::Banner) {
-    const ASK_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
-    if let Some(asked) = state.asked_reading.get()
-        && asked.elapsed() < ASK_EVERY
-    {
-        return;
-    }
-    state.asked_reading.set(Some(std::time::Instant::now()));
-
     let Ok(budget) =
         fetch::<protocol::Budget>(state.socket.clone(), r#"{"op":"budget"}"#.to_owned()).await
     else {
