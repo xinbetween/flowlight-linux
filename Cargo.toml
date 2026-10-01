@@ -36,7 +36,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.5.9"
+version = "0.5.10"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/xinbetween/flowlight-linux"
