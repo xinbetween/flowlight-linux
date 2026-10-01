@@ -63,8 +63,14 @@ cd flowlight-0.5.3-x86_64-linux && sudo ./install.sh
 sudo rpm -i flowlight-gui-0.5.5-1.fedora41.x86_64.rpm
 ```
 
-The Arch package and the tarball carry the daemon alone; the window for Arch is a source build, which is what
-the AUR is for and is the next item. The window links against the system's GTK *and* the system's glibc, so one
+```sh
+# Arch: the window is built from source, which is what the AUR is for — and on a rolling distribution the
+# only thing that works, since "built elsewhere" there means "built last week" too.
+makepkg -si                       # with PKGBUILD-gui from the release page
+```
+
+Every package that carries the window also carries a desktop entry and an icon, so it appears in a launcher
+rather than only on a command line. The tarball carries the daemon alone. The window links against the system's GTK *and* the system's glibc, so one
 built anywhere does not run everywhere — building it inside each distribution is on the
 [roadmap](ROADMAP.md) rather than pretended at here. The tarball is checked by installing it in
 Alpine, which has no systemd and no glibc at all — the honest test of "a kernel of 4.18 and nothing else".

@@ -271,7 +271,7 @@ jobs:
         with:
           path: source
 
-      - name: Write the PKGBUILD for this release
+      - name: Write the PKGBUILDs for this release
         env:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
@@ -281,6 +281,15 @@ jobs:
           second=$(ls packages/flowlight-"$version"-aarch64-linux.tar.gz)
           ./source/packaging/arch/render.sh release "$version" "$first" "$second" >packages/PKGBUILD
           cat packages/PKGBUILD
+
+          # And the window's, which builds from source. The source is the archive GitHub makes for the tag,
+          # downloaded here so that what is in the PKGBUILD is the hash of the file somebody will actually
+          # fetch rather than one computed from a tree that happens to be checked out.
+          archive="https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/$TAG.tar.gz"
+          curl -fsSL -o /tmp/source.tar.gz "$archive"
+          ./source/packaging/arch/render.sh window-release "$version" /tmp/source.tar.gz \
+            "${GITHUB_REPOSITORY#*/}-$version" "$archive" >packages/PKGBUILD-gui
+          cat packages/PKGBUILD-gui
 
       - name: Attach them to the release
         env:
@@ -292,5 +301,5 @@ jobs:
           # `--clobber` so that re-running this for a tag replaces what is there rather than failing, which is
           # what somebody wants when a release had to be built twice.
           gh release upload "$TAG" packages/*.deb packages/*.rpm packages/*.tar.gz packages/*.sha256 \
-            packages/PKGBUILD --clobber --repo "$GITHUB_REPOSITORY"
+            packages/PKGBUILD packages/PKGBUILD-gui --clobber --repo "$GITHUB_REPOSITORY"
           echo "attached to $TAG"

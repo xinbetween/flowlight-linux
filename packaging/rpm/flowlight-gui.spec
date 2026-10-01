@@ -45,7 +45,26 @@ database are the daemon's.
 rm -rf %{buildroot}
 install -D -m 755 %{built}/flowlight %{buildroot}%{_bindir}/flowlight
 install -D -m 644 %{licence} %{buildroot}%{_licensedir}/%{name}/COPYING
+install -D -m 644 %{desktop} \
+    %{buildroot}%{_datadir}/applications/com.xinbetween.Flowlight.desktop
+install -D -m 644 %{icon} \
+    %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/com.xinbetween.Flowlight.svg
 
 %files
 %{_bindir}/flowlight
 %{_licensedir}/%{name}/COPYING
+%{_datadir}/applications/com.xinbetween.Flowlight.desktop
+%{_datadir}/icons/hicolor/scalable/apps/com.xinbetween.Flowlight.svg
+
+# The caches a desktop environment reads instead of the directories. Written if the tools are there and skipped
+# if they are not, because a package that fails to install because a cache could not be rebuilt would be
+# refusing over a convenience.
+%post
+command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q %{_datadir}/applications || :
+command -v gtk-update-icon-cache >/dev/null 2>&1 \
+    && gtk-update-icon-cache -qtf %{_datadir}/icons/hicolor || :
+
+%postun
+command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q %{_datadir}/applications || :
+command -v gtk-update-icon-cache >/dev/null 2>&1 \
+    && gtk-update-icon-cache -qtf %{_datadir}/icons/hicolor || :

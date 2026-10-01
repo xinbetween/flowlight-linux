@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A plain mark rather than a logo: three flows crossing a lens, and one of them stopped.
+
+  That is the program — traffic read as it passes, and one connection refused — and it is drawn with four
+  shapes so that it still reads at 16 pixels, where anything with detail in it becomes a smudge. Replace it
+  with something better whenever there is something better; nothing in the packaging depends on what is in
+  here, only on the name of the file.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128"
+     role="img" aria-label="Flowlight">
+  <rect width="128" height="128" rx="28" fill="#16181d"/>
+
+  <!-- Two flows that pass. The gap in the middle is the lens, and the lines stop at its edge rather than
+       running under it, so the circle reads as something they go through. -->
+  <g stroke="#f5f3ef" stroke-width="9" stroke-linecap="round" fill="none">
+    <path d="M22 44 H44"/>
+    <path d="M84 44 H106"/>
+    <path d="M22 84 H44"/>
+    <path d="M84 84 H106"/>
+  </g>
+
+  <!-- The one that is refused: it arrives and does not leave. -->
+  <g stroke="#d86b5c" stroke-width="9" stroke-linecap="round" fill="none">
+    <path d="M22 64 H41"/>
+  </g>
+
+  <!-- The lens. Open, because Flowlight reads rather than terminates. -->
+  <circle cx="64" cy="64" r="23" fill="none" stroke="#f5f3ef" stroke-width="9"/>
+  <circle cx="64" cy="64" r="6" fill="#f5f3ef"/>
+</svg>

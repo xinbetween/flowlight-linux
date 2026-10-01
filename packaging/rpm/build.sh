@@ -62,6 +62,8 @@ rpmbuild -bb "$here/$spec" \
     --define "built $(cd "$built" && pwd)" \
     --define "unit $here/../deb/flowlightd.service" \
     --define "licence $root/LICENSE" \
+    --define "desktop $here/../desktop/com.xinbetween.Flowlight.desktop" \
+    --define "icon $here/../desktop/com.xinbetween.Flowlight.svg" \
     --define "_build_id_links none" \
     --define "_unitdir /usr/lib/systemd/system" \
     --define "_licensedir /usr/share/licenses" \
