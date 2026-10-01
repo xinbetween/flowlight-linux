@@ -30,21 +30,38 @@ name=$( (. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-$ID}") || echo "a
 echo "== building the window inside $name"
 
 if command -v dnf >/dev/null 2>&1; then
-    dnf install -y -q gcc rust cargo gtk4-devel libadwaita-devel rpm-build >/dev/null
+    dnf install -y -q gcc pkgconf-pkg-config curl gtk4-devel libadwaita-devel rpm-build >/dev/null
 elif command -v zypper >/dev/null 2>&1; then
-    zypper --non-interactive --quiet install gcc rust cargo gtk4-devel libadwaita-devel rpm-build >/dev/null
+    zypper --non-interactive --quiet install gcc pkg-config curl gtk4-devel libadwaita-devel rpm-build \
+        tar gzip >/dev/null
 else
     fail "this script knows dnf and zypper, and $name has neither"
+fi
+
+# The compiler comes from rustup; every library it links against comes from the distribution. That is the
+# split that matters here: the point of building the window inside Fedora is that it finds Fedora's GTK,
+# libadwaita and glibc — not that it is compiled by Fedora's rustc, which on Fedora 41 is 1.91 and older than
+# this workspace asks for. Which is how this was found: `rustc 1.91.1 is not supported by the following
+# packages`, from a build that never reached a library at all.
+if ! command -v cargo >/dev/null 2>&1; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain stable >/dev/null
+    . "$HOME/.cargo/env"
 fi
 
 echo "--- what it will link against"
 rustc --version
 pkg-config --modversion gtk4 libadwaita-1 || true
 
+# Asked before building, so that a distribution whose libadwaita is too old is *named* as that rather than
+# arriving as a wall of compiler output. The window asks for 1.5, which is where `AlertDialog` arrived.
+pkg-config --atleast-version=1.5 libadwaita-1 \
+    || fail "$name has libadwaita $(pkg-config --modversion libadwaita-1), and the window needs 1.5 or later"
+
 # `--locked`, so the versions are the ones this repository has resolved rather than whatever is newest today:
 # a window built here and a window built on Ubuntu should be the same program.
 cargo build --release --locked --package flowlight-gui \
-    || fail "the window does not compile on $name. Its GTK or libadwaita is likely older than this needs."
+    || fail "the window does not compile on $name; the compiler's own output is above"
 
 mkdir -p target/window
 install -m 755 target/release/flowlight target/window/flowlight

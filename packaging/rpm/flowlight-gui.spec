@@ -14,7 +14,10 @@ Version:        %{version}
 # Which distribution built this is part of what it is: two files called `flowlight-gui-0.5.5-1.x86_64.rpm`
 # that link against different libraries would be two files nobody can tell apart. `build.sh` fills it in from
 # `/etc/os-release` inside the container that did the building.
-Release:        1%{?suffix}
+#
+# `built_on` rather than `suffix`, which is a built-in macro name that newer rpm refuses to let `--define`
+# shadow — with the message `Macro %suffix is a built-in`, which is how this was found.
+Release:        1%{?built_on}
 Summary:        The window for Flowlight
 License:        GPL-3.0-only
 URL:            https://github.com/xinbetween/flowlight-linux

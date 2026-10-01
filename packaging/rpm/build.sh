@@ -47,14 +47,15 @@ mkdir -p "$work"/{BUILD,RPMS,SOURCES,SPECS,SRPMS} "$out"
 
 # The window is built where it will run, so its package carries the distribution that built it. The daemon's
 # does not, because the same file installs everywhere.
-suffix=()
+built_on=()
 if [ "$spec" = flowlight-gui.spec ]; then
     named=$( (. /etc/os-release 2>/dev/null && printf '.%s%s' "${ID%%-*}" "${VERSION_ID%%.*}") || echo '')
-    [ -n "$named" ] && suffix=(--define "suffix $named")
+    # `built_on`, because `%suffix` is a built-in macro name and rpm refuses to let a define shadow one.
+    [ -n "$named" ] && built_on=(--define "built_on $named")
 fi
 
 rpmbuild -bb "$here/$spec" \
-    ${suffix[@]+"${suffix[@]}"} \
+    ${built_on[@]+"${built_on[@]}"} \
     --define "_topdir $work" \
     --define "version $rpm_version" \
     --define "architecture $architecture" \
