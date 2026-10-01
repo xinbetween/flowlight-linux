@@ -173,6 +173,22 @@ struct Args {
     #[arg(long)]
     no_payloads: bool,
 
+    /// Who the interface socket belongs to: a user name, or a uid.
+    ///
+    /// The window runs as a person and the daemon runs as root, and they meet at a socket with an owner and a
+    /// mode — which is the whole reason it is a socket rather than a port with a token. So somebody has to own
+    /// it, and when this is a systemd service there is nobody to infer: no `SUDO_UID`, so the socket belongs
+    /// to root with mode 0600 and a person's window is refused by the kernel.
+    ///
+    /// That is what this is for. `--socket-owner you` in the unit file, and the window works. Without it the
+    /// owner is whoever ran `sudo`, and root when nobody did — which is right for a server with no desktop
+    /// and useless on a machine with one.
+    ///
+    /// A name nobody has is refused rather than guessed at, before anything is loaded: a socket belonging to
+    /// a uid nobody has is a socket nothing can open.
+    #[arg(long, value_name = "NAME|UID")]
+    socket_owner: Option<String>,
+
     /// An extra TLS library to probe, for one the search did not find. May be repeated.
     #[arg(long, value_name = "PATH")]
     libssl: Vec<PathBuf>,
