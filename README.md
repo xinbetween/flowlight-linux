@@ -108,6 +108,19 @@ including an installation from it with a throwaway key, and goes live once a sig
 [`packaging/apt/README.md`](packaging/apt/README.md) says why that key is not something this code can create for
 you. Until it is, the commands above have nothing to answer them.
 
+**The window is built on the same design system as the macOS app.** The palette lives in
+`crates/flowlight-gui/src/tokens.rs` — the same hexadecimal values, the same semantic roles — and feeds two
+consumers: the stylesheet, as generated `@define-color` lines, and the charts, as numbers for Cairo. GTK has
+no media query for the colour scheme, so the stylesheet is rebuilt and reloaded when libadwaita says the
+appearance changed. Nothing outside that file may name a colour.
+
+**Charts are drawn rather than depended on.** GTK has no chart widget, so `chart.rs` is a `GtkDrawingArea`
+and about forty lines of Cairo — no new dependency on a machine that is already asking the kernel for
+permission to read other processes' memory. What came back is drawn upward from a centre line and what went
+out downward from it, the way the macOS app does it, so the two directions read apart instead of being summed
+into one line that answers neither question. The arithmetic is separate from the drawing and tested, and CI
+renders a chart onto a buffer and counts the ink on every push.
+
 **The application icon.** It is one SVG, at
 `/usr/share/icons/hicolor/scalable/apps/com.xinbetween.Flowlight.svg`, and the desktop draws it through
 gdk-pixbuf — which recognises the format by sniffing the first bytes of the file. Keep `<svg` near the start.

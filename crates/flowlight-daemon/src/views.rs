@@ -1814,6 +1814,77 @@ pub fn simulate(
         .collect())
 }
 
+/// Traffic over time, in buckets, for drawing rather than reading.
+///
+/// The one shape a chart needs and a table cannot give: evenly spaced buckets across the whole window,
+/// including the empty ones. A series that skips quiet buckets draws a line that lies about when things
+/// happened — two requests an hour apart become adjacent points — so the gaps are filled here, where the
+/// window's start and the bucket size are both known, rather than guessed at by whoever draws it.
+pub fn series(store: &mut Store, since: i64, now: i64, buckets: i64) -> Result<SeriesView> {
+    let buckets = buckets.clamp(2, 600);
+    let span = (now - since).max(buckets);
+    // Bucket sizes are whole seconds, and the window is divided to get about as many buckets as asked for.
+    let width = (span / buckets).max(1);
+    let first = (since / width) * width;
+    let last = (now / width) * width;
+
+    let rows = store.series(None, first, last + width, width)?;
+    let found: std::collections::HashMap<i64, &flowlight_store::SeriesRow> =
+        rows.iter().map(|row| (row.at, row)).collect();
+
+    let mut points = Vec::new();
+    let mut at = first;
+    while at <= last {
+        let row = found.get(&at);
+        points.push(SeriesPoint {
+            at,
+            requests: row.map_or(0, |row| row.requests),
+            bytes: row.map_or(0, |row| row.bytes),
+            received: row.map_or(0, |row| row.received),
+            sent: row.map_or(0, |row| row.sent),
+        });
+        at += width;
+    }
+
+    Ok(SeriesView {
+        width,
+        busiest: points.iter().map(|point| point.bytes).max().unwrap_or(0),
+        total: points.iter().map(|point| point.bytes).sum(),
+        requests: points.iter().map(|point| point.requests).sum(),
+        points,
+    })
+}
+
+/// Traffic over time.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SeriesView {
+    /// How many seconds each bucket covers.
+    pub width: i64,
+    /// The most bytes in any one bucket, so a drawing has a scale without walking the points twice.
+    pub busiest: i64,
+    /// Bytes across the window.
+    pub total: i64,
+    /// Requests across the window.
+    pub requests: i64,
+    /// Every bucket, including the empty ones.
+    pub points: Vec<SeriesPoint>,
+}
+
+/// One bucket.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SeriesPoint {
+    /// Its start, in seconds since the epoch.
+    pub at: i64,
+    /// Requests in it.
+    pub requests: i64,
+    /// Bytes they carried.
+    pub bytes: i64,
+    /// Of those, what came back.
+    pub received: i64,
+    /// And what went out.
+    pub sent: i64,
+}
+
 /// What was seen, and what was not.
 pub fn coverage(store: &mut Store, since: i64) -> Result<CoverageView> {
     let coverage = store.coverage(since)?;

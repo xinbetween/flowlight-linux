@@ -113,6 +113,15 @@ jobs:
           fi
           echo "the icon draws: $(stat -c %s /tmp/icon.png) bytes of PNG"
 
+      # Cairo draws onto a buffer and the buffer is counted — no display, no window, no screenshot. A chart
+      # that draws nothing looks exactly like a quiet hour in a running window, which is the one way this
+      # could ship broken and nobody notice. Proven against a `render` that returns early before it was
+      # trusted: 0 of 180000 pixels, exit 1.
+      - name: The chart draws something
+        run: |
+          set -euo pipefail
+          cargo run -q -p flowlight-gui --example chart
+
       - name: A row shows the text it was given
         run: |
           set -euo pipefail
