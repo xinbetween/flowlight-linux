@@ -108,6 +108,12 @@ including an installation from it with a throwaway key, and goes live once a sig
 [`packaging/apt/README.md`](packaging/apt/README.md) says why that key is not something this code can create for
 you. Until it is, the commands above have nothing to answer them.
 
+**If the window opens blank, your machine has no working GL.** GTK 4 renders with the GPU, and a virtual
+machine without a working driver draws the header bar and nothing else — Mesa says so on the way past
+(`failed to choose pdev`, `DRI3 error`). `GSK_RENDERER=cairo flowlight` renders in software and shows
+everything. That is GTK's business rather than Flowlight's, and it is written here because the symptom looks
+exactly like a program with nothing to say.
+
 **If you want the window, tell the service who you are.** The window runs as a person and the daemon runs as
 root, and they meet at a Unix socket with an owner and a mode — which is the whole reason it is a socket rather
 than a port with a token. Started by hand with `sudo`, the owner is obvious. Started by systemd there is nobody
