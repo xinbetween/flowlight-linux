@@ -256,3 +256,43 @@ jobs:
             docker run --rm -v "$PWD:/work" -w /work "$image" \
               ./scripts/install-an-rpm.sh "$package"
           done
+
+  # Arch, and the tarball for everything nobody has packaged. Both built and then installed, like the `.deb`
+  # and the `.rpm`: what a package does when it is installed is the half that cannot be read off the file.
+  arch-and-tarball:
+    needs: check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: static-daemon
+          path: built
+
+      - name: Build the tarball
+        run: |
+          set -euo pipefail
+          chmod +x built/flowlightd
+          # `0.0.0.ci` rather than `0.0.0-ci`: an Arch `pkgver` may not contain a hyphen, and the name of the
+          # directory inside the tarball has to match what the PKGBUILD looks for.
+          ./packaging/tarball/build.sh 0.0.0.ci x86_64 built target/tarball
+
+      # In the two distributions that have nothing else: Arch, which gets a package of its own below, and
+      # Alpine, which has no systemd and no glibc and is therefore the honest test of "needs a kernel and
+      # nothing else".
+      - name: Install it from the tarball
+        run: |
+          set -euo pipefail
+          tarball=$(ls target/tarball/*.tar.gz | head -1)
+          for image in archlinux:base alpine:3.20; do
+            docker run --rm -v "$PWD:/work" -w /work "$image" \
+              sh -c "command -v bash >/dev/null || apk add --quiet bash; exec bash ./scripts/install-a-tarball.sh '$tarball'"
+          done
+
+      - name: Build and install the Arch package
+        run: |
+          set -euo pipefail
+          tarball=$(ls target/tarball/*.tar.gz | head -1)
+          docker run --rm -v "$PWD:/work" -w /work archlinux:base \
+            ./scripts/install-on-arch.sh "$tarball" 0.0.0.ci
