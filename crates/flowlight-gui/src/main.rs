@@ -1771,23 +1771,55 @@ fn change(state: &Rc<State>, field: &str, value: &str) {
 /// A length of time, in words.
 fn duration(seconds: i64) -> String {
     if seconds < 60 {
-        format!("{seconds} seconds")
+        plural(seconds, "second")
     } else if seconds < 3_600 {
-        format!("{} minutes", seconds / 60)
+        plural(seconds / 60, "minute")
     } else {
         let hours = seconds / 3_600;
         let minutes = (seconds % 3_600) / 60;
         if minutes == 0 {
-            format!("{hours} hours")
+            plural(hours, "hour")
         } else {
-            format!("{hours} hours and {minutes} minutes")
+            format!(
+                "{} and {}",
+                plural(hours, "hour"),
+                plural(minutes, "minute")
+            )
         }
+    }
+}
+
+/// A count and its unit, with the `s` only when there is more than one of them.
+///
+/// "1 minutes per bucket" was on screen under a chart. English is the only language this window speaks —
+/// the daemon owns the translated text — so this is the whole of the problem and the whole of the fix.
+///
+/// Not `counted`: that name belongs to the row that is mostly a number, three hundred lines up.
+fn plural(value: i64, unit: &str) -> String {
+    if value == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{value} {unit}s")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_of_something_is_not_plural() {
+        assert_eq!(duration(60), "1 minute");
+        assert_eq!(duration(120), "2 minutes");
+        assert_eq!(duration(1), "1 second");
+        assert_eq!(duration(30), "30 seconds");
+        assert_eq!(duration(3_600), "1 hour");
+        assert_eq!(duration(7_200), "2 hours");
+        assert_eq!(duration(3_660), "1 hour and 1 minute");
+        assert_eq!(duration(7_380), "2 hours and 3 minutes");
+        // Nothing at all is plural, the way English has it: zero seconds, not zero second.
+        assert_eq!(duration(0), "0 seconds");
+    }
 
     /// A budget with the parts this is about, and defaults for the rest.
     fn budget(payloads: bool, reading: bool) -> protocol::Budget {
