@@ -18,6 +18,7 @@ flowlight-alerts.workspace = true
 flowlight-devices.workspace = true
 flowlight-ask.workspace = true
 flowlight-owners.workspace = true
+flowlight-platform.workspace = true
 flowlight-proxy.workspace = true
 flowlight-common = { workspace = true, features = ["user"] }
 flowlight-rules.workspace = true

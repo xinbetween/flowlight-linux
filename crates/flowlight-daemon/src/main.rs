@@ -14,6 +14,7 @@ mod agent;
 mod alerting;
 mod asking;
 mod blocking;
+mod checking;
 mod client;
 mod control;
 mod exporting;
@@ -90,6 +91,9 @@ const SWEEP: Duration = Duration::from_secs(3600);
 const RULES: Duration = Duration::from_secs(2);
 
 /// Where cgroup v2 is mounted on anything current.
+/// Where a machine mounts its cgroup hierarchy. Which *part* of it the hooks attach to is read rather than
+/// assumed — see [`flowlight_platform::hierarchy`] — because a hybrid hierarchy keeps the v2 tree one
+/// directory down and an attach to the top of one fails with a path in the message and no explanation.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// How often the channels that are not the network are looked at.
@@ -424,6 +428,14 @@ enum Command {
     },
     /// Every guardrail, with how often each has refused something.
     Guardrails,
+    /// What this machine can and cannot do, and what each missing thing costs.
+    ///
+    /// Read-only and harmless: it loads nothing, attaches nothing and writes nothing, so it can be run by
+    /// anybody before Flowlight has ever been started here. Run as a person rather than as root it says one
+    /// thing less, and says that it cannot know it.
+    ///
+    /// Exits non-zero when something essential is missing, so that a script can ask.
+    Check,
     /// Narrow every answer to one process or one host, until it is cleared.
     ///
     /// `history` and `report` then show that and nothing else, and say so above the rows: every count under a
@@ -1887,10 +1899,17 @@ fn attach_blocking(ebpf: &mut Ebpf, tracefs: Option<&Path>) -> anyhow::Result<En
             .with_context(|| format!("attaching to {category}/{name}"))?;
     }
 
-    let cgroup = std::fs::File::open(CGROUP_ROOT).with_context(|| {
+    // The v2 tree, wherever it is. On everything current that is `/sys/fs/cgroup`; on a hybrid hierarchy —
+    // RHEL 8's default, and Ubuntu's before 21.10 — it is `/sys/fs/cgroup/unified`, and attaching to the top
+    // of one fails. A machine with no v2 tree at all can watch but not refuse, and says so.
+    let layout = flowlight_platform::hierarchy(Path::new(CGROUP_ROOT));
+    let attach_to = layout
+        .root()
+        .ok_or_else(|| anyhow!("{}", layout.described()))?;
+    let cgroup = std::fs::File::open(attach_to).with_context(|| {
         format!(
-            "opening {CGROUP_ROOT}. Refusing connections needs cgroup v2, which every distribution has \
-             mounted there since 2019"
+            "opening {}, which is this machine's cgroup v2 tree",
+            attach_to.display()
         )
     })?;
     for name in ["connect4", "connect6"] {
@@ -1904,8 +1923,9 @@ fn attach_blocking(ebpf: &mut Ebpf, tracefs: Option<&Path>) -> anyhow::Result<En
                 .attach(&cgroup, CgroupAttachMode::AllowMultiple)
                 .map_err(|prog_attach_error| {
                     anyhow!(
-                        "attaching {name} to {CGROUP_ROOT} failed both ways: as a link, {link_error}; \
-                         and as a program attachment, {prog_attach_error}"
+                        "attaching {name} to {} failed both ways: as a link, {link_error}; and as a \
+                         program attachment, {prog_attach_error}",
+                        attach_to.display()
                     )
                 })?;
         }
