@@ -182,6 +182,10 @@ jobs:
           set -euo pipefail
           mkdir -p target/assets
           install -m 644 target/deb/*.deb target/rpm/*.rpm target/tarball/*.tar.gz target/assets/
+          # The checksum beside each tarball. It is written by the tarball build and was not being attached,
+          # which left the only published hash inside a PKGBUILD — fine for Arch and no use to anybody
+          # checking a download by hand.
+          install -m 644 target/tarball/*.sha256 target/assets/
           ls -l target/assets
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -190,8 +194,59 @@ jobs:
           path: target/assets/*
           if-no-files-found: error
 
-  attach:
+      # The binary itself, for the job that builds the window inside other distributions: it needs the daemon's
+      # package to install beside what it builds, and that package is the same file everywhere.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: static-daemon-${{ matrix.architecture }}
+          path: target/packaged/flowlightd
+          if-no-files-found: error
+
+  # The window, compiled inside the distributions it is for. It links against the system's GTK, libadwaita and
+  # glibc, so unlike the daemon it cannot be built once and carried — and unlike the daemon, its package says
+  # which distribution built it, because that is part of what the file is.
+  #
+  # x86_64 only. An arm64 desktop exists, and the way to have one is to build from source until somebody asks
+  # for the package; doubling this job to guess at demand would double the slowest thing in the release.
+  window:
     needs: packages
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [fedora:41, opensuse/tumbleweed]
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: static-daemon-amd64
+          path: built
+
+      - name: Build and check it inside ${{ matrix.image }}
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          chmod +x built/flowlightd
+          version=${TAG#v}
+          docker run --rm -v "$PWD:/work" -w /work -e "VERSION=$version" "${{ matrix.image }}" bash -c '
+            set -euo pipefail
+            if command -v dnf >/dev/null; then dnf install -y -q rpm-build >/dev/null; else
+              zypper --non-interactive --quiet install rpm-build >/dev/null; fi
+            ./packaging/rpm/build.sh "$VERSION" x86_64 built target/rpm
+            exec ./scripts/the-window-inside.sh "$VERSION" x86_64'
+          sudo chown -R "$(id -u):$(id -g)" target/rpm-gui
+          ls -l target/rpm-gui
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: window-${{ strategy.job-index }}
+          path: target/rpm-gui/*.rpm
+          if-no-files-found: error
+
+  attach:
+    needs: [packages, window]
     runs-on: ubuntu-24.04
     permissions:
       # The one job that writes anything, and it writes only to the release for this tag.
@@ -200,6 +255,13 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: packages-*
+          merge-multiple: true
+          path: packages
+
+      # The windows, which are named for the distribution that built each one and therefore do not collide.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: window-*
           merge-multiple: true
           path: packages
 
@@ -229,6 +291,6 @@ jobs:
           ls -l packages
           # `--clobber` so that re-running this for a tag replaces what is there rather than failing, which is
           # what somebody wants when a release had to be built twice.
-          gh release upload "$TAG" packages/*.deb packages/*.rpm packages/*.tar.gz packages/PKGBUILD \
-            --clobber --repo "$GITHUB_REPOSITORY"
+          gh release upload "$TAG" packages/*.deb packages/*.rpm packages/*.tar.gz packages/*.sha256 \
+            packages/PKGBUILD --clobber --repo "$GITHUB_REPOSITORY"
           echo "attached to $TAG"

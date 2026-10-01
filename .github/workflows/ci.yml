@@ -296,3 +296,37 @@ jobs:
           tarball=$(ls target/tarball/*.tar.gz | head -1)
           docker run --rm -v "$PWD:/work" -w /work archlinux:base \
             ./scripts/install-on-arch.sh "$tarball" 0.0.0.ci
+
+  # The window, compiled inside the distributions it is for. Slow — a Rust build per container, with no cache —
+  # and worth it: this is the one package that cannot be built anywhere and carried, because it links against
+  # the system's GTK, libadwaita and glibc.
+  #
+  # `fail-fast: false`, because "the window builds on Fedora and not on openSUSE Leap" is the useful sentence,
+  # and it is also a thing worth knowing rather than a red check to retry.
+  window:
+    needs: check
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [fedora:41, opensuse/tumbleweed]
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: static-daemon
+          path: built
+
+      - name: Build the window inside ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          chmod +x built/flowlightd
+          docker run --rm -v "$PWD:/work" -w /work "${{ matrix.image }}" bash -c '
+            set -euo pipefail
+            # The daemon package first, because the window requires it — which is one of the things being
+            # checked here. It is the same static binary everywhere, so it is packaged rather than compiled.
+            if command -v dnf >/dev/null; then dnf install -y -q rpm-build >/dev/null; else
+              zypper --non-interactive --quiet install rpm-build >/dev/null; fi
+            ./packaging/rpm/build.sh 0.0.0.ci x86_64 built target/rpm
+            exec ./scripts/the-window-inside.sh 0.0.0.ci x86_64'
