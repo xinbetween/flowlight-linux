@@ -115,22 +115,37 @@ pub fn report(proc_root: &Path, sys_root: &Path, tracefs: Option<&Path>, root: b
         )
     });
 
-    findings.push(match crate::tracefs::format_text(tracefs, "sock", "inet_sock_set_state") {
-        Ok(_) => yes(
-            "tracefs",
-            "the tracepoint's layout was read, which is how the offsets are worked out for this kernel"
-                .to_owned(),
-            true,
-        ),
-        Err(err) => no(
-            "tracefs",
-            format!(
-                "{err:#}. Without it the connection tracepoint cannot be read, which is most of what \
-                 Flowlight does."
+    findings.push(
+        match crate::tracefs::format_text(tracefs, "sock", "inet_sock_set_state") {
+            Ok(_) => yes(
+                "tracefs",
+                "the tracepoint's layout was read, which is how the offsets are worked out for this kernel"
+                    .to_owned(),
+                true,
             ),
-            true,
-        ),
-    });
+            // The directory's existence is visible to anybody and the file inside it is readable only by
+            // root, so a person running this gets `unknown` rather than a report saying their machine cannot
+            // be watched. Those two are a `sudo` and a mount command, and telling them apart is the job.
+            Err(err) => match crate::tracefs::mounted(tracefs) {
+                Some(path) if !root => unknown(
+                    "tracefs",
+                    format!(
+                        "{} is mounted, and the file describing the tracepoint is readable only by root — so \
+                         whether its layout can be read cannot be answered from here.",
+                        path.display()
+                    ),
+                ),
+                _ => no(
+                    "tracefs",
+                    format!(
+                        "{err:#}. Without it the connection tracepoint cannot be read, which is most of \
+                         what Flowlight does."
+                    ),
+                    true,
+                ),
+            },
+        },
+    );
 
     let layout = flowlight_platform::hierarchy(&sys_root.join("fs/cgroup"));
     findings.push(match &layout {

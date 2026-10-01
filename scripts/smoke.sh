@@ -471,10 +471,18 @@ printf '%s' "$checked" \
     | jq -e '[.findings[] | select(.about == "refusing connections" and .essential == false)] | length == 1' \
     >/dev/null || fail "check treats refusing connections as essential, which would make watching conditional on it."
 
-# As a person, where the one thing it cannot know is said to be unknown rather than guessed at.
-"$binary" --database "$database" --certificates "$certificates" --json check \
+# As a person, where two things cannot be answered and both say so rather than being guessed at: whether a
+# program could be loaded, and whether the tracepoint's layout can be read — that file is root's alone, and a
+# report telling somebody their machine cannot be watched because they are not root would be worse than silent.
+as_a_person=$("$binary" --database "$database" --certificates "$certificates" --json check)
+printf '%s' "$as_a_person" \
     | jq -e '[.findings[] | select(.about == "permission to load" and .answer == "unknown")] | length == 1' \
     >/dev/null || fail "run as a person, check claims to know whether a program could be loaded."
+printf '%s' "$as_a_person" \
+    | jq -e '[.findings[] | select(.about == "tracefs" and .answer == "unknown")] | length == 1' \
+    >/dev/null || fail "run as a person, check does not tell being root apart from tracefs being absent."
+printf '%s' "$as_a_person" | jq -e '.ready == true' >/dev/null \
+    || fail "run as a person, check says this machine cannot be watched, which is not a thing it can know."
 echo "OK: a machine can be asked what it can do before anything is loaded into it"
 
 # Focus: one thing to look at, and every count below it a count of that. What matters is not that the filter
