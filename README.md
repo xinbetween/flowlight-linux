@@ -108,6 +108,15 @@ including an installation from it with a throwaway key, and goes live once a sig
 [`packaging/apt/README.md`](packaging/apt/README.md) says why that key is not something this code can create for
 you. Until it is, the commands above have nothing to answer them.
 
+**An empty Live page says which kind of empty it is.** Payload capture runs for a session — eight hours by
+default — and stops when that session ends. Until v0.5.14 the window then showed "Nothing read in this
+window", which reads as "your machine was quiet" when it means "Flowlight stopped reading". It now says the
+session ran out and offers a Renew button, on whichever page you are looking at. `flowlightd budget` always
+said this; the window simply never asked.
+
+Note that the session is measured in wall-clock time. A machine whose clock jumps forward — a VM resuming
+from suspend, say — can find its session already over.
+
 **What the window shows is text, not markup.** Every row carries something that came off the network — a
 host, a path, a process name — and libadwaita reads a row's title as Pango markup unless it is told otherwise
 first. Until v0.5.13 a request with two query parameters rendered as an empty row, and a path containing
