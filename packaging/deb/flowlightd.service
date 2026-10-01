@@ -17,8 +17,11 @@ RestartSec=5
 # The database and the interception keys live here, and it is root's alone.
 StateDirectory=flowlight
 StateDirectoryMode=0700
-# The certificate anything must trust is published here instead, because an agent runs as a person.
+# The certificate anything must trust is published here instead, because an agent runs as a person. This is
+# also the only directory under `/etc` or `/usr` the service can write to, `ProtectSystem=full` making the rest
+# read-only — which is why the daemon's default certificate path is this one and not `/usr/local/share`.
 ConfigurationDirectory=flowlight
+ConfigurationDirectoryMode=0755
 
 # It needs to load programs, read /proc and attach to a cgroup. It does not need anything else.
 NoNewPrivileges=false

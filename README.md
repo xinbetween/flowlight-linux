@@ -571,8 +571,8 @@ available on its own:
 ```console
 $ flowlightd launch --agent claude --print-environment
 FLOWLIGHT_AGENT=claude
-NODE_EXTRA_CA_CERTS=/usr/local/share/flowlight/ca-bundle.pem
-SSL_CERT_FILE=/usr/local/share/flowlight/ca-bundle.pem
+NODE_EXTRA_CA_CERTS=/etc/flowlight/ca-bundle.pem
+SSL_CERT_FILE=/etc/flowlight/ca-bundle.pem
 …
 ```
 
@@ -717,15 +717,21 @@ restricted — and narrowed again on every open, because a directory somebody wi
 one that was never narrowed. Anybody who can read the authority's key can impersonate every site on the internet
 to anything that trusts it.
 
-The certificate itself goes somewhere else: `/usr/local/share/flowlight/`, readable by everybody, because an
+The certificate itself goes somewhere else: `/etc/flowlight/`, readable by everybody, because an
 agent runs as a person who has to be able to read the certificate they are being asked to trust. Beside it is
 `ca-bundle.pem` — this machine's own roots **plus** Flowlight's, so a tool pointed at it does not stop trusting
 everything else.
 
+`/etc/flowlight` rather than a tidier `/usr/local/share/flowlight`, for a reason worth knowing if you run this
+from the unit file: the unit sets `ProtectSystem=full`, which makes `/usr` read-only to the service, and grants
+write access to exactly one directory — `ConfigurationDirectory=flowlight`, which is this one. The default was
+the other path until v0.5.7, where it meant interception could never start from the service and said so in a
+line of the journal nobody reads.
+
 ```console
 $ sudo flowlightd trust
-The certificate is at /usr/local/share/flowlight/flowlight-ca.pem
-A bundle of this machine's roots plus it is at /usr/local/share/flowlight/ca-bundle.pem
+The certificate is at /etc/flowlight/flowlight-ca.pem
+A bundle of this machine's roots plus it is at /etc/flowlight/ca-bundle.pem
 
 the machine's trust store — present on this machine, and Flowlight can do it
     `sudo flowlightd trust --install` copies it to /usr/local/share/ca-certificates/flowlight.crt and runs

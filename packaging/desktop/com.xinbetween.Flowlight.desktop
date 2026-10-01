@@ -11,6 +11,13 @@ Exec=flowlight
 Icon=com.xinbetween.Flowlight
 StartupWMClass=com.xinbetween.Flowlight
 Terminal=false
-Categories=System;Monitor;Network;Security;
+# One main category, one additional, and nothing the validator has a word to say about.
+#
+# `System;Monitor;Network;Security;` named three main categories, and the cost is in what the tool says:
+# "application might appear more than once in the application menu". Dropping two of them left
+# `Network;Monitor;Security;`, and the tool had a second thing to say — `Security` asks for `Settings` or
+# `System` beside it, and adding either would bring back the first complaint. So `Security` goes: a menu
+# category is not worth being wrong about, and `Network;Monitor` is what a network monitor is.
+Categories=Network;Monitor;
 Keywords=network;monitor;agent;traffic;https;ebpf;
 # It needs the daemon running to show anything, and says so in the window rather than here.

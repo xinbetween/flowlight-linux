@@ -136,10 +136,30 @@ jobs:
           systemctl is-enabled flowlightd && { echo "the unit is enabled; it must not be"; exit 1; } || true
           systemctl is-active flowlightd && { echo "the daemon is running; it must not be"; exit 1; } || true
           /usr/sbin/flowlightd --version
+          # And then started, which is how almost everybody will run it and is the one path nothing here had
+          # ever taken. The unit sets `ProtectSystem=full`, so a default path under `/usr` is read-only to the
+          # service — which is exactly what happened: interception could never start from the unit and said so
+          # in a line of the journal nobody reads. Installing the package and asserting it had *not* started
+          # was not the same as finding out whether it could.
+          sudo systemctl start flowlightd
+          sleep 8
+          systemctl is-active flowlightd || { echo "the unit will not run"; exit 1; }
+          sudo journalctl -u flowlightd --no-pager -o cat | tee /tmp/unit.log
+          grep -q "watching sock/inet_sock_set_state" /tmp/unit.log \
+            || { echo "the unit started and is not watching"; exit 1; }
+          # The sandboxing and the daemon's defaults have to agree. Any read-only filesystem error means they
+          # do not, whichever path it was.
+          if grep -q "Read-only file system" /tmp/unit.log; then
+            echo "the unit cannot write somewhere the daemon expects to"; exit 1
+          fi
+          test -d /etc/flowlight || { echo "the certificate directory the unit grants is not there"; exit 1; }
+          sudo systemctl stop flowlightd
+          systemctl is-active flowlightd && { echo "it will not stop"; exit 1; } || true
+
           # And it comes off again without leaving the history behind, unless asked.
           sudo apt-get remove -y -qq flowlight
           test ! -x /usr/sbin/flowlightd
-          echo "the package installs, does not start itself, and comes off again"
+          echo "the package installs, does not start itself, runs when it is told to, and comes off again"
 
       # The archive that apt reads, built from the packages just built. Signing needs a key that exists in one
       # place and installing from it is the `apt` workflow's job; what is checked here is the part that needs

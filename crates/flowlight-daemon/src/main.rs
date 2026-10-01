@@ -76,9 +76,17 @@ const DEFAULT_DATABASE: &str = "/var/lib/flowlight/flowlight.db";
 
 /// Where the certificate anything has to trust is published, unless told otherwise.
 ///
-/// Under `/usr/local/share` because it is a file this machine's administrator put there, which is exactly what
-/// that directory is for — and because it is readable by everybody, which a certificate has to be.
-const DEFAULT_CERTIFICATES: &str = "/usr/local/share/flowlight";
+/// `/etc/flowlight`, which is what the unit file grants this write access to — `ConfigurationDirectory` — and
+/// is readable by everybody, which a certificate has to be.
+///
+/// It was `/usr/local/share/flowlight`, which is the better answer on paper: a file this machine's
+/// administrator put there is exactly what that directory is for. It is the wrong answer in practice, because
+/// the unit sets `ProtectSystem=full` and `/usr` is therefore read-only to the service — so interception could
+/// never start the way almost everybody runs this, and said so in a line of the journal nobody reads:
+/// `creating /usr/local/share/flowlight: Read-only file system`. Found by installing the package on a machine
+/// and starting the service, which neither the smoke test nor CI had ever done: the smoke test passes
+/// `--certificates` explicitly, so the default was the one path nothing exercised.
+const DEFAULT_CERTIFICATES: &str = "/etc/flowlight";
 
 /// How often expired detail is folded into the summary and removed.
 const SWEEP: Duration = Duration::from_secs(3600);
