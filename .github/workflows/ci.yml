@@ -223,3 +223,36 @@ jobs:
             -v "$PWD:/work" -w /work \
             "${{ matrix.image }}" \
             bash -c '${{ matrix.install }} >/dev/null && exec ./scripts/inside-a-distribution.sh built/flowlightd'
+
+  # The `.rpm`, built where there is an `rpmbuild` and installed where it is meant to be installed. Both
+  # halves matter: a package that builds is not a package that installs, and one that installs on Fedora is
+  # not one that installs on openSUSE until it has.
+  rpm:
+    needs: check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: static-daemon
+          path: built
+
+      - name: Build it in Fedora
+        run: |
+          set -euo pipefail
+          chmod +x built/flowlightd
+          docker run --rm -v "$PWD:/work" -w /work fedora:41 bash -c '
+            set -euo pipefail
+            dnf install -y -q rpm-build >/dev/null
+            ./packaging/rpm/build.sh 0.0.0-ci x86_64 built target/rpm'
+          ls -l target/rpm
+
+      - name: Install it in Fedora and in openSUSE
+        run: |
+          set -euo pipefail
+          package=$(ls target/rpm/flowlight-*.x86_64.rpm | head -1)
+          for image in fedora:41 opensuse/leap:15.6; do
+            docker run --rm -v "$PWD:/work" -w /work "$image" \
+              ./scripts/install-an-rpm.sh "$package"
+          done
