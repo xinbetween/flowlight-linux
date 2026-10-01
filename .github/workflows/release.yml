@@ -143,6 +143,16 @@ jobs:
           chmod 755 target/packaged/flowlightd target/packaged/flowlight
           ls -l target/packaged
 
+      # Before installing anything, because installing the window's package pulls GTK from the archive and
+      # the index a runner image ships with is as old as the image. v0.5.9's amd64 half failed exactly there:
+      # `404 Not Found` for a `libgstreamer-plugins-base` the index named and the pool no longer had.
+      #
+      # This step existed in the job this one was split out of — `apt-get update` was the first line of
+      # installing the interface's libraries, which went to the build job with the compiling. Splitting a job
+      # takes the things it quietly depended on with it.
+      - name: Refresh the package index
+        run: sudo apt-get update -qq
+
       - name: Build the packages
         id: build
         run: |
