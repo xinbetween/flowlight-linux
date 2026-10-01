@@ -108,6 +108,13 @@ including an installation from it with a throwaway key, and goes live once a sig
 [`packaging/apt/README.md`](packaging/apt/README.md) says why that key is not something this code can create for
 you. Until it is, the commands above have nothing to answer them.
 
+**What the window shows is text, not markup.** Every row carries something that came off the network — a
+host, a path, a process name — and libadwaita reads a row's title as Pango markup unless it is told otherwise
+first. Until v0.5.13 a request with two query parameters rendered as an empty row, and a path containing
+`<span>` would have been rendered rather than shown. Rows are now built by one helper that sets the property
+before the text, which is the only order that works, and an example under a virtual display proves it on every
+push.
+
 **If the window opens blank, your machine has no working GL.** GTK 4 renders with the GPU, and a virtual
 machine without a working driver draws the header bar and nothing else — Mesa says so on the way past
 (`failed to choose pdev`, `DRI3 error`). `GSK_RENDERER=cairo flowlight` renders in software and shows
