@@ -108,6 +108,23 @@ including an installation from it with a throwaway key, and goes live once a sig
 [`packaging/apt/README.md`](packaging/apt/README.md) says why that key is not something this code can create for
 you. Until it is, the commands above have nothing to answer them.
 
+**If you want the window, tell the service who you are.** The window runs as a person and the daemon runs as
+root, and they meet at a Unix socket with an owner and a mode — which is the whole reason it is a socket rather
+than a port with a token. Started by hand with `sudo`, the owner is obvious. Started by systemd there is nobody
+to infer, so the socket belongs to root with mode 0600 and the window is refused by the kernel:
+
+```sh
+sudo systemctl edit flowlightd    # and add:
+# [Service]
+# ExecStart=
+# ExecStart=/usr/sbin/flowlightd --socket-owner your-name
+```
+
+A name that is in no password file is refused rather than guessed at, before anything is loaded: a socket
+belonging to a uid nobody has is a socket nothing can open. The name is resolved by reading `/etc/passwd`
+directly, for the same reason the address lookup speaks DNS itself — the daemon is statically linked and does
+not consult NSS.
+
 **One watcher per database.** A second daemon against the same database would attach the same probes, read
 every call a second time and write it down again — doubling every number with nothing to say it had. So the
 second one refuses to start and says which process holds the database. `--database` names another one if you

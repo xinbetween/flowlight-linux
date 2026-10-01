@@ -192,6 +192,56 @@ pub fn bpf(proc_root: &Path) -> Bpf {
     }
 }
 
+/// Reads a user out of `/etc/passwd`, by name or by the number they already gave.
+///
+/// By hand rather than through `getpwnam`, for the reason the ASN lookup speaks DNS itself: the daemon is
+/// statically linked against musl, which resolves a name by reading this file and not by asking NSS. Parsing
+/// it here means the answer is the same whatever it was linked against, and it can be tested against a file
+/// written out rather than against whoever happens to exist on the machine running the tests.
+///
+/// A name that is not in the file is `None`, which is a refusal and not a guess: the alternative is a socket
+/// belonging to a uid nobody has.
+pub fn user(passwd: &Path, named: &str) -> Option<(u32, u32)> {
+    let named = named.trim();
+    if named.is_empty() {
+        return None;
+    }
+
+    // A number is taken at its word. Somebody who writes `--socket-owner 1000` knows which uid they mean, and
+    // a machine where that uid is in no password file is a normal thing — a container, mostly.
+    if let Ok(uid) = named.parse::<u32>() {
+        let gid = read_passwd(passwd)
+            .into_iter()
+            .find(|(_, found, _)| *found == uid)
+            .map(|(_, _, gid)| gid);
+        return Some((uid, gid.unwrap_or(uid)));
+    }
+
+    read_passwd(passwd)
+        .into_iter()
+        .find(|(name, _, _)| name == named)
+        .map(|(_, uid, gid)| (uid, gid))
+}
+
+/// Every name, uid and gid in a password file, skipping anything that is not those three things.
+fn read_passwd(passwd: &Path) -> Vec<(String, u32, u32)> {
+    let Ok(text) = std::fs::read_to_string(passwd) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            // `name:password:uid:gid:…`, and a line that is not that shape is a line to step over rather than
+            // a reason to fail: a password file with a comment in it is still a password file.
+            let mut fields = line.split(':');
+            let name = fields.next()?;
+            let _password = fields.next()?;
+            let uid = fields.next()?.parse().ok()?;
+            let gid = fields.next()?.parse().ok()?;
+            Some((name.to_owned(), uid, gid))
+        })
+        .collect()
+}
+
 /// Whether a failure was the machine refusing permission, rather than something being absent.
 ///
 /// The distinction is the whole of a useful report. "This machine has no tracefs" is a mount command; "you are
@@ -475,6 +525,38 @@ mod tests {
         let other = watch_with(&root.join("other.db")).expect("the other");
         drop(one);
         drop(other);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The socket a window talks to belongs to one person, so naming them has to work the way a person would
+    /// write it: by name, or by the number they already know.
+    #[test]
+    fn a_user_is_found_by_name_or_by_number() {
+        let root = scratch("passwd");
+        let passwd = root.join("passwd");
+        write(
+            &passwd,
+            "root:x:0:0:root:/root:/bin/bash\n\
+             # a comment, which is not a user\n\
+             daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n\
+             blessdyb:x:1000:1000:,,,:/home/blessdyb:/bin/bash\n\
+             broken:x:not-a-number:1000::/:/bin/false\n",
+        );
+
+        assert_eq!(user(&passwd, "blessdyb"), Some((1000, 1000)));
+        assert_eq!(user(&passwd, "root"), Some((0, 0)));
+        // A number is taken at its word, and its group comes from the file when the file knows it.
+        assert_eq!(user(&passwd, "1000"), Some((1000, 1000)));
+        // And when it does not, the uid stands for both rather than the lookup failing: a container with no
+        // password file is a normal place to run this.
+        assert_eq!(user(&passwd, "4242"), Some((4242, 4242)));
+        // Names that are not there are refused rather than guessed at.
+        assert_eq!(user(&passwd, "nobody-by-that-name"), None);
+        assert_eq!(user(&passwd, ""), None);
+        assert_eq!(user(&passwd, "broken"), None);
+        // A file that is not there is not a reason to invent a uid.
+        assert_eq!(user(&root.join("nothing"), "blessdyb"), None);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

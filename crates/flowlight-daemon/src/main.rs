@@ -761,6 +761,48 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Everything that can be settled without touching the kernel is settled here, before anything is loaded
+    // into it. The first version of both of these was further down, and the cost showed: a daemon that was
+    // about to refuse to run still loaded its programs, attached its probes and tried to bind the proxy port,
+    // so the refusal arrived underneath a line about an address already being in use.
+    //
+    // One watcher per database. Two daemons against one database is not a crash: both attach uprobes to the
+    // same libraries, both read every call, and both write it down — so every number is doubled and nothing
+    // says so. It is easy to arrive at: start the service, then run `sudo flowlightd` to look at something.
+    // That is exactly how it was found.
+    //
+    // The variable is named rather than dropped, because dropping it would release the lock immediately and
+    // leave the guard doing nothing at all.
+    let _watching = if args.no_store {
+        None
+    } else {
+        match flowlight_platform::watch_with(&args.database) {
+            Ok(held) => Some(held),
+            Err(taken) => {
+                bail!(
+                    "another flowlightd{} is already watching with {}. Two of them would each read every \
+                     request and write it down, which doubles every number this reports — so this one is \
+                     stopping instead. Stop that one, or name another database with --database.{}",
+                    taken
+                        .pid
+                        .map(|pid| format!(" (pid {pid})"))
+                        .unwrap_or_default(),
+                    args.database.display(),
+                    if taken.pid.is_none() {
+                        format!(" The lock is {}.", taken.path.display())
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+        }
+    };
+
+    // And who the interface socket will belong to. Refused here rather than warned about later: `--socket-owner`
+    // is an explicit instruction, and a misspelled user name is a machine that would watch everything and
+    // offer no way to look at it — which is worse than not starting.
+    let socket_owner = control::owner_from(args.socket_owner.as_deref())?;
+
     let format_text = tracefs::format_text(args.tracefs.as_deref(), CATEGORY, TRACEPOINT)?;
     let layout = Layout::from_format(&Format::new(&format_text))?;
 
@@ -870,41 +912,6 @@ fn main() -> anyhow::Result<()> {
     // die, rather than leaving the main loop waiting on threads that are not coming back.
     drop(sender);
 
-    // One watcher per database, and the refusal names who has it.
-    //
-    // Two daemons against one database is not a crash: both attach uprobes to the same libraries, both read
-    // every call, and both write it down — so every number this reports is doubled and nothing says so. It is
-    // easy to arrive at, too. Start the service, then run `sudo flowlightd` to look at something, and that is
-    // the state. It was found exactly that way, by a stray daemon from one test doubling the output of the
-    // next, and the arithmetic was right both times.
-    //
-    // Held for as long as this process lives. The variable is named rather than dropped, because dropping it
-    // would release the lock immediately and leave the guard doing nothing at all.
-    let _watching = if args.no_store {
-        None
-    } else {
-        match flowlight_platform::watch_with(&args.database) {
-            Ok(held) => Some(held),
-            Err(taken) => {
-                bail!(
-                    "another flowlightd{} is already watching with {}. Two of them would each read every \
-                     request and write it down, which doubles every number this reports — so this one is \
-                     stopping instead. Stop that one, or name another database with --database.{}",
-                    taken
-                        .pid
-                        .map(|pid| format!(" (pid {pid})"))
-                        .unwrap_or_default(),
-                    args.database.display(),
-                    if taken.pid.is_none() {
-                        format!(" The lock is {}.", taken.path.display())
-                    } else {
-                        String::new()
-                    }
-                );
-            }
-        }
-    };
-
     let mut store = if args.no_store {
         None
     } else {
@@ -966,7 +973,7 @@ fn main() -> anyhow::Result<()> {
                  there is not one."
             );
         } else {
-            let owner = control::intended_owner();
+            let owner = socket_owner;
             let hello = control::Hello {
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 enforcing: enforcing.is_some(),

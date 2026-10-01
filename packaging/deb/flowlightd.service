@@ -10,6 +10,15 @@ After=network.target
 [Service]
 Type=simple
 # Root, because loading an eBPF program needs it. There is no version of this that does not.
+#
+# **If you want the window**, say who it belongs to:
+#
+#     ExecStart=/usr/sbin/flowlightd --socket-owner your-name
+#
+# The window runs as a person and the daemon runs as root, and they meet at a socket with an owner and a
+# mode — which is the whole reason it is a socket and not a port with a token. Started by hand with `sudo`
+# the owner is obvious; started here there is nobody to infer, so the socket belongs to root with mode 0600
+# and a person's window is refused by the kernel. `systemctl edit flowlightd` is the place to add it.
 ExecStart=/usr/sbin/flowlightd
 Restart=on-failure
 RestartSec=5
