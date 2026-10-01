@@ -153,6 +153,27 @@ jobs:
             docker run --rm -v "$PWD:/work" -w /work "$image" ./scripts/install-an-rpm.sh "$package"
           done
 
+      # The tarball, for a distribution nobody has packaged — and the thing the Arch package is built from.
+      - name: Build the tarball
+        run: |
+          set -euo pipefail
+          version=${{ steps.build.outputs.version }}
+          case "${{ matrix.architecture }}" in
+              amd64) tarball_architecture=x86_64 ;;
+              arm64) tarball_architecture=aarch64 ;;
+              *) echo "no tarball architecture for ${{ matrix.architecture }}"; exit 1 ;;
+          esac
+          ./packaging/tarball/build.sh "$version" "$tarball_architecture" target/packaged target/tarball
+
+      - name: Check the tarball installs where there is no package manager to do it
+        run: |
+          set -euo pipefail
+          tarball=$(ls target/tarball/*.tar.gz | head -1)
+          # Alpine: no systemd, no glibc, and nothing of ours packaged for it — which makes it the honest test
+          # of "needs a kernel of 4.18 and nothing else".
+          docker run --rm -v "$PWD:/work" -w /work alpine:3.20 \
+            sh -c "apk add --quiet bash; exec bash ./scripts/install-a-tarball.sh '$tarball'"
+
       # Into one flat directory before uploading. Two globs under different parents make an artifact that
       # keeps those parents, and the job that attaches them would then be looking in the wrong place — which
       # is a thing to notice here rather than on a release page with half its files.
@@ -160,7 +181,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p target/assets
-          install -m 644 target/deb/*.deb target/rpm/*.rpm target/assets/
+          install -m 644 target/deb/*.deb target/rpm/*.rpm target/tarball/*.tar.gz target/assets/
           ls -l target/assets
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -182,6 +203,23 @@ jobs:
           merge-multiple: true
           path: packages
 
+      # Written here rather than in the per-architecture job, because a PKGBUILD names both tarballs and
+      # their checksums, and this is the first place both exist.
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          path: source
+
+      - name: Write the PKGBUILD for this release
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version=${TAG#v}
+          first=$(ls packages/flowlight-"$version"-x86_64-linux.tar.gz)
+          second=$(ls packages/flowlight-"$version"-aarch64-linux.tar.gz)
+          ./source/packaging/arch/render.sh release "$version" "$first" "$second" >packages/PKGBUILD
+          cat packages/PKGBUILD
+
       - name: Attach them to the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -191,5 +229,6 @@ jobs:
           ls -l packages
           # `--clobber` so that re-running this for a tag replaces what is there rather than failing, which is
           # what somebody wants when a release had to be built twice.
-          gh release upload "$TAG" packages/*.deb packages/*.rpm --clobber --repo "$GITHUB_REPOSITORY"
+          gh release upload "$TAG" packages/*.deb packages/*.rpm packages/*.tar.gz packages/PKGBUILD \
+            --clobber --repo "$GITHUB_REPOSITORY"
           echo "attached to $TAG"

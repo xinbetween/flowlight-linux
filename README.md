@@ -48,9 +48,19 @@ request made by that distribution's own `curl`.
 sudo rpm -i flowlight-0.5.2-1.x86_64.rpm
 ```
 
-The `.rpm` carries the daemon alone. The window links against the system's GTK *and* the system's glibc, so one
+```sh
+# Arch: the PKGBUILD from the release page, or `flowlight-bin` once it is in the AUR.
+makepkg -si
+
+# Anything else: the tarball, which installs two files and says what it did.
+tar -xzf flowlight-0.5.3-x86_64-linux.tar.gz
+cd flowlight-0.5.3-x86_64-linux && sudo ./install.sh
+```
+
+The `.rpm`, the Arch package and the tarball carry the daemon alone. The window links against the system's GTK *and* the system's glibc, so one
 built anywhere does not run everywhere — building it inside each distribution is on the
-[roadmap](ROADMAP.md) rather than pretended at here. Arch and a plain tarball are the next items.
+[roadmap](ROADMAP.md) rather than pretended at here. The tarball is checked by installing it in
+Alpine, which has no systemd and no glibc at all — the honest test of "a kernel of 4.18 and nothing else".
 
 One thing the static link costs, said here rather than discovered: a hostname in a rule is resolved by musl's
 resolver, which reads DNS and `/etc/hosts` and does not consult NSS. On a machine that resolves names through

@@ -1,0 +1,47 @@
+# A PKGBUILD for Arch, rendered from this template by `packaging/arch/render.sh`.
+#
+# `-bin`, because what it installs is the released binary rather than a build from source: the daemon is
+# statically linked, so building it again on Arch would prove that Arch has a Rust compiler and nothing else.
+# The template exists so that the file CI tests and the file somebody uploads to the AUR are the same file
+# with a different source — one pointing at a tarball on disk, the other at a release.
+#
+# The daemon only. The window links against the system's GTK and the system's glibc, which is a package that
+# has to be built on Arch rather than carried to it.
+
+pkgname=flowlight-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="Watch what every process says on the network, before encryption"
+arch=(@ARCHES@)
+url="https://github.com/xinbetween/flowlight-linux"
+license=('GPL-3.0-only')
+provides=('flowlight')
+conflicts=('flowlight')
+# None. A statically linked binary needs the kernel, and the kernel is not a package.
+depends=()
+# The unit is a file somebody may have edited, so an upgrade does not overwrite it.
+backup=('usr/lib/systemd/system/flowlightd.service')
+options=(!strip)
+@SOURCES@
+
+package() {
+    local name="flowlight-${pkgver}-$(_tarball_architecture)-linux"
+    install -Dm755 "${srcdir}/${name}/flowlightd" "${pkgdir}/usr/bin/flowlightd"
+    install -Dm644 "${srcdir}/${name}/flowlightd.service" \
+        "${pkgdir}/usr/lib/systemd/system/flowlightd.service"
+    install -Dm644 "${srcdir}/${name}/LICENSE" \
+        "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}
+
+# Arch's own name for the architecture is the one in the tarball's name, except that this project calls
+# aarch64 what Debian calls arm64 — so the mapping is written down rather than assumed.
+_tarball_architecture() {
+    case "$CARCH" in
+        x86_64) echo x86_64 ;;
+        aarch64) echo aarch64 ;;
+        *) echo "$CARCH" ;;
+    esac
+}
+
+# `/usr/bin` rather than `/usr/sbin`: on Arch the second is a symlink to the first, and installing into a
+# symlinked directory is how a package ends up owning a path that moves underneath it.
