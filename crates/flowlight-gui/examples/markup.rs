@@ -35,7 +35,13 @@ fn main() {
         glib::LogWriterOutput::Handled
     });
 
-    adw::init().expect("libadwaita starts");
+    // Without a display there is nothing to ask, and saying so beats a panic with a backtrace in it.
+    if let Err(err) = adw::init() {
+        println!(
+            "libadwaita will not start here: {err}. This needs a display — `xvfb-run` is one."
+        );
+        std::process::exit(1);
+    }
 
     // The rows the window makes, made the way the window makes them. Any markup complaint from here is fatal
     // because of `G_DEBUG`, so reaching the end is the assertion.
