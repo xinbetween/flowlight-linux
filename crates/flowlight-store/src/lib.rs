@@ -467,6 +467,13 @@ pub struct SeriesRow {
     pub requests: i64,
     /// Bytes they carried.
     pub bytes: i64,
+    /// Of those bytes, the ones that came back.
+    pub received: i64,
+    /// And the ones that went out.
+    ///
+    /// Split because a chart that draws one line for both answers neither "is something uploading" nor "is
+    /// something downloading", which are the two questions somebody watching traffic actually has.
+    pub sent: i64,
 }
 
 /// One day's traffic between one process and one host.
@@ -1488,7 +1495,10 @@ impl Store {
         self.flush()?;
         let bucket = bucket.max(1);
         let mut statement = self.connection.prepare(
-            "SELECT (at / ?4) * ?4 AS bucket, count(*), coalesce(sum(bytes), 0) FROM requests
+            "SELECT (at / ?4) * ?4 AS bucket, count(*), coalesce(sum(bytes), 0),
+                    coalesce(sum(CASE WHEN direction = 'in' THEN bytes ELSE 0 END), 0),
+                    coalesce(sum(CASE WHEN direction = 'out' THEN bytes ELSE 0 END), 0)
+             FROM requests
              WHERE at >= ?1 AND at < ?2 AND (?3 IS NULL OR process = ?3)
              GROUP BY bucket ORDER BY bucket",
         )?;
@@ -1497,6 +1507,8 @@ impl Store {
                 at: row.get(0)?,
                 requests: row.get(1)?,
                 bytes: row.get(2)?,
+                received: row.get(3)?,
+                sent: row.get(4)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -3859,6 +3871,25 @@ mod tests {
         // Asked again from a different start, the buckets are the same buckets.
         let again = store.series(None, 1_000, 10_000, 3_600).unwrap();
         assert_eq!(again[0].at, 3_600);
+    }
+
+    #[test]
+    fn a_bucket_says_which_way_its_bytes_went() {
+        // A chart draws two directions. One summed column cannot say which way anything went, and a window
+        // that answers "300 bytes" to "is something uploading" has answered a different question.
+        let mut store = Store::in_memory().unwrap();
+        store
+            .record_request(request(3_600, "curl", "example.com", 100))
+            .unwrap();
+        let mut back = request(3_650, "curl", "example.com", 900);
+        back.direction = "in".to_owned();
+        store.record_request(back).unwrap();
+
+        let series = store.series(None, 0, 10_000, 3_600).unwrap();
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].bytes, 1_000);
+        assert_eq!(series[0].sent, 100);
+        assert_eq!(series[0].received, 900);
     }
 
     // Export

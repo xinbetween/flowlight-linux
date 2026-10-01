@@ -76,6 +76,15 @@ pub enum Request {
         #[serde(default = "a_day")]
         since: i64,
     },
+    /// Traffic over time, in buckets, for drawing.
+    Series {
+        /// How far back, in seconds.
+        #[serde(default = "an_hour")]
+        since: i64,
+        /// About how many buckets to divide it into.
+        #[serde(default = "sixty")]
+        buckets: i64,
+    },
     /// Every rule.
     Rules,
     /// What Flowlight is allowed to read, and for how long.
@@ -266,6 +275,11 @@ pub enum Request {
         /// Its identifier.
         id: i64,
     },
+}
+
+/// The default number of buckets: one a minute across an hour, which is what the window asks for.
+fn sixty() -> i64 {
+    60
 }
 
 fn an_hour() -> i64 {
@@ -578,6 +592,12 @@ fn handle(
         Request::Coverage { since } => serde_json::to_string(&crate::views::coverage(
             &mut store,
             crate::views::window(now, since),
+        )?)?,
+        Request::Series { since, buckets } => serde_json::to_string(&crate::views::series(
+            &mut store,
+            crate::views::window(now, since),
+            now,
+            buckets,
         )?)?,
         Request::Rules => serde_json::to_string(&crate::views::rules(&mut store)?)?,
         Request::Budget => serde_json::to_string(&crate::views::budget(&mut store, now)?)?,
