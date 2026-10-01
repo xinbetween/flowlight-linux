@@ -113,6 +113,36 @@ pub struct Domain {
     pub servers: Vec<String>,
 }
 
+/// Traffic over time, in buckets, for drawing.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Series {
+    /// How many seconds each bucket covers.
+    pub width: i64,
+    /// The most bytes in any one bucket.
+    pub busiest: i64,
+    /// Bytes across the window.
+    pub total: i64,
+    /// Requests across the window.
+    pub requests: i64,
+    /// Every bucket, including the empty ones — which is what makes it a series rather than a list.
+    pub points: Vec<SeriesPoint>,
+}
+
+/// One bucket.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct SeriesPoint {
+    /// Its start, in seconds since the epoch.
+    pub at: i64,
+    /// Requests in it.
+    pub requests: i64,
+    /// Bytes they carried.
+    pub bytes: i64,
+    /// Of those, what came back.
+    pub received: i64,
+    /// And what went out.
+    pub sent: i64,
+}
+
 /// What Flowlight is allowed to read, and for how long.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Budget {
@@ -484,6 +514,11 @@ pub fn set_model(field: &str, value: &str) -> String {
 }
 
 /// Builds the request that asks a question.
+/// Traffic over a window, in about this many buckets.
+pub fn series(seconds: i64, buckets: i64) -> String {
+    format!(r#"{{"op":"series","since":{seconds},"buckets":{buckets}}}"#)
+}
+
 pub fn question(asked: &str) -> String {
     let asked = serde_json::to_string(asked).unwrap_or_else(|_| "\"\"".to_owned());
     format!(r#"{{"op":"question","question":{asked}}}"#)

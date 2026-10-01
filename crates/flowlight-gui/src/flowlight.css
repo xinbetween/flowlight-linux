@@ -1,0 +1,66 @@
+/* Flowlight's rules. The colours they refer to are generated from `tokens.rs` and prepended to this file,
+ * one appearance at a time, because GTK has no media query for the colour scheme.
+ *
+ * Nothing here may contain a hexadecimal colour. The palette is the palette.
+ */
+
+/* A card: the one raised surface, a faint top-to-bottom gradient for depth without a shadow, one hairline
+ * border. Three slightly different rounded rectangles is how a window stops looking like one thing. */
+.fl-card {
+  background-image: linear-gradient(to bottom, @fl_surface, @fl_surface_deep);
+  border: 1px solid @fl_line;
+  border-radius: 12px;
+}
+
+/* A tile of one number. The figure is the content; the label explains it and the trend sits under it. */
+.fl-tile-label {
+  font-size: 0.82rem;
+  color: @fl_muted;
+}
+
+.fl-tile-value {
+  font-size: 1.6rem;
+  font-weight: 600;
+  font-feature-settings: "tnum";
+}
+
+/* The direction tokens, as text and as fills. */
+.fl-received { color: @fl_received; }
+.fl-sent     { color: @fl_sent; }
+.fl-accent   { color: @fl_accent; }
+.fl-good     { color: @fl_good; }
+.fl-warning  { color: @fl_warning; }
+.fl-critical { color: @fl_critical; }
+.fl-tool     { color: @fl_tool; }
+.fl-muted    { color: @fl_muted; }
+.fl-faint    { color: @fl_faint; }
+
+/* A pill: a status marked by a tinted capsule with a border, never by colour alone — which is also why
+ * every pill in this window carries a word. */
+.fl-pill {
+  font-size: 0.78rem;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid alpha(currentColor, 0.32);
+  background-color: alpha(currentColor, 0.14);
+}
+
+/* The chart surface. The drawing is done in Cairo; this is the frame around it. */
+.fl-chart {
+  background-color: @fl_surface;
+  border: 1px solid @fl_line;
+  border-radius: 12px;
+}
+
+.fl-chart-legend {
+  font-size: 0.82rem;
+  color: @fl_muted;
+}
+
+/* A section heading above a group of cards. */
+.fl-section {
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: @fl_muted;
+}

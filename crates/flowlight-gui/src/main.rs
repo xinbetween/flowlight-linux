@@ -11,7 +11,7 @@
 
 mod protocol;
 
-use flowlight_gui::{literal_row, literal_row_with};
+use flowlight_gui::{literal_row, literal_row_with, size};
 
 use adw::prelude::*;
 use gtk::glib;
@@ -22,6 +22,12 @@ use std::rc::Rc;
 
 /// How often the window asks the daemon what has happened.
 const REFRESH_SECONDS: u32 = 2;
+
+/// How many buckets the live chart asks for.
+///
+/// Sixty across whatever window is chosen: enough that a minute of an hour is a column of its own, few
+/// enough that each one is still wide enough to see on a laptop.
+const BUCKETS: i64 = 60;
 
 /// How many recent requests to show.
 const RECENT: usize = 300;
@@ -150,6 +156,11 @@ impl Reading {
 }
 
 fn build(application: &adw::Application, socket: PathBuf) {
+    // The palette, before any of it is referred to. Nothing below says a colour; everything says a name.
+    if let Some(display) = gtk::gdk::Display::default() {
+        flowlight_gui::dress(&display);
+    }
+
     let state = Rc::new(State {
         socket,
         window: WINDOWS.get(1).map_or(3_600, |(_, seconds)| *seconds),
@@ -400,14 +411,27 @@ async fn refresh(
                 Err(err) => say(status, &err),
             }
         }
-        _ => match fetch::<Vec<Request>>(socket, protocol::recent(seconds, RECENT)).await {
+        _ => match fetch::<Vec<Request>>(socket.clone(), protocol::recent(seconds, RECENT)).await {
             Ok(rows) => {
+                // The chart above the list is the same window as the list, bucketed. Asked for separately
+                // because it is a different question — "when" rather than "what" — and the daemon answers
+                // it from the same rows either way.
+                let series = fetch::<protocol::Series>(socket, protocol::series(seconds, BUCKETS))
+                    .await
+                    .ok();
                 // Why the page is empty is part of what the page says, so it is part of what decides
                 // whether the page is redrawn.
                 let reading = state.reading.get();
-                draw(state, 0, &(&rows, reading), &pages.live, |column| {
-                    render_live(column, &rows, reading)
-                });
+                let dark = adw::StyleManager::default().is_dark();
+                draw(
+                    state,
+                    0,
+                    &(&rows, reading, &series, dark),
+                    &pages.live,
+                    |column| {
+                        render_live(column, &rows, reading, series.as_ref(), dark);
+                    },
+                );
                 say(status, "");
             }
             Err(err) => say(status, &err),
@@ -534,17 +558,6 @@ fn ago(at: i64) -> String {
     }
 }
 
-/// A size, in words.
-fn size(bytes: i64) -> String {
-    if bytes < 1_024 {
-        format!("{bytes} B")
-    } else if bytes < 1_048_576 {
-        format!("{:.1} kB", bytes as f64 / 1_024.0)
-    } else {
-        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
-    }
-}
-
 /// The agent and the process, when they are not the same thing.
 fn who(agent: Option<&str>, process: &str) -> String {
     match agent {
@@ -553,7 +566,54 @@ fn who(agent: Option<&str>, process: &str) -> String {
     }
 }
 
-fn render_live(column: &gtk::Box, rows: &[Request], reading: Reading) {
+fn render_live(
+    column: &gtk::Box,
+    rows: &[Request],
+    reading: Reading,
+    series: Option<&protocol::Series>,
+    dark: bool,
+) {
+    // The shape of the page: what the window is worth in four figures, then those figures over time, then
+    // the requests themselves. Somebody arriving wants to know whether anything is happening before they
+    // want to read what happened.
+    if let Some(series) = series
+        && !series.points.is_empty()
+    {
+        let received: i64 = series.points.iter().map(|point| point.received).sum();
+        let sent: i64 = series.points.iter().map(|point| point.sent).sum();
+        column.append(&flowlight_gui::tiles(&[
+            flowlight_gui::stat_tile("Received", &size(received), "received"),
+            flowlight_gui::stat_tile("Sent", &size(sent), "sent"),
+            flowlight_gui::stat_tile("Requests", &series.requests.to_string(), "accent"),
+            flowlight_gui::stat_tile("Busiest bucket", &size(series.busiest), "muted"),
+        ]));
+
+        let legend = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+        legend.add_css_class("fl-chart-legend");
+        let span = gtk::Label::new(Some(&format!("{} per bucket", duration(series.width))));
+        span.set_hexpand(true);
+        span.set_xalign(0.0);
+        legend.append(&span);
+        legend.append(&flowlight_gui::pill("Received", "received"));
+        legend.append(&flowlight_gui::pill("Sent", "sent"));
+        column.append(&legend);
+
+        let chart = flowlight_gui::chart::Chart::new(180);
+        chart.show(
+            series
+                .points
+                .iter()
+                .map(|point| flowlight_gui::chart::Bucket {
+                    at: point.at,
+                    received: point.received,
+                    sent: point.sent,
+                })
+                .collect(),
+            dark,
+        );
+        column.append(&chart.widget);
+    }
+
     if rows.is_empty() {
         // Four different silences. Telling somebody "nothing read" when the answer is "the session you
         // started eight hours ago ended" wastes their afternoon, which is how this was found.
