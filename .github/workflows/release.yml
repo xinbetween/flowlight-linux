@@ -23,7 +23,14 @@ env:
   BPF_LINKER_VERSION: 0.11.1
 
 jobs:
-  packages:
+  # The compiling, and nothing else. It was in the same job as the packaging until a runner was lost
+  # forty-seven minutes into an arm64 build — no failed step, no log, just a job that stopped — and taking the
+  # packaging and all the container checks down with it. They had already passed on the other architecture and
+  # had nothing to do with the loss.
+  #
+  # Separated, a lost runner costs the thing that was expensive and can be re-run on its own, which is what
+  # `gh run rerun --failed` is for.
+  binaries:
     strategy:
       fail-fast: false
       matrix:
@@ -43,6 +50,9 @@ jobs:
             daemon: aarch64-unknown-linux-musl
             linker_sha256: 341ec1c595496877cae2b073544c2226d78a922739632b5732dbaa48507f1380
     runs-on: ${{ matrix.runner }}
+    # A lost runner should cost a quarter of an hour of waiting rather than three quarters. The arm64 build
+    # takes about forty minutes with no cache, so this is generous and still finite.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -94,6 +104,44 @@ jobs:
           mkdir -p target/packaged
           install -m 755 "$static" target/packaged/flowlightd
           install -m 755 target/release/flowlight target/packaged/flowlight
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: binaries-${{ matrix.architecture }}
+          path: target/packaged/*
+          if-no-files-found: error
+
+  # The packaging, which needs no compiler: two binaries in, six files out, each installed where it is for.
+  # Minutes rather than most of an hour, and re-runnable without rebuilding anything.
+  packages:
+    needs: binaries
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            architecture: amd64
+          - runner: ubuntu-24.04-arm
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: binaries-${{ matrix.architecture }}
+          path: target/packaged
+
+      - name: Make them executable again
+        run: |
+          set -euo pipefail
+          # An artifact does not carry the executable bit, and a package built from a file that is not
+          # executable installs a file that is not executable.
+          chmod 755 target/packaged/flowlightd target/packaged/flowlight
+          ls -l target/packaged
 
       - name: Build the packages
         id: build
@@ -194,13 +242,6 @@ jobs:
           path: target/assets/*
           if-no-files-found: error
 
-      # The binary itself, for the job that builds the window inside other distributions: it needs the daemon's
-      # package to install beside what it builds, and that package is the same file everywhere.
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: static-daemon-${{ matrix.architecture }}
-          path: target/packaged/flowlightd
-          if-no-files-found: error
 
   # The window, compiled inside the distributions it is for. It links against the system's GTK, libadwaita and
   # glibc, so unlike the daemon it cannot be built once and carried — and unlike the daemon, its package says
@@ -209,8 +250,10 @@ jobs:
   # x86_64 only. An arm64 desktop exists, and the way to have one is to build from source until somebody asks
   # for the package; doubling this job to guess at demand would double the slowest thing in the release.
   window:
-    needs: packages
+    needs: binaries
     runs-on: ubuntu-24.04
+    # It compiles the window inside a container, with no cache, twice over. The same reason the build has one.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -220,7 +263,7 @@ jobs:
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: static-daemon-amd64
+          name: binaries-amd64
           path: built
 
       - name: Build and check it inside ${{ matrix.image }}
@@ -245,14 +288,29 @@ jobs:
           path: target/rpm-gui/*.rpm
           if-no-files-found: error
 
+  # Runs even when something above it failed, which is the whole point of it.
+  #
+  # It used to be skipped, and the result was worse than a red check: v0.5.7 was published, its amd64 packages
+  # were built and thrown away, the release page had nothing on it at all, and the `apt` workflow — which waits
+  # for a successful Release — never ran. A release that exists and offers nothing is a release somebody
+  # arrives at and leaves.
+  #
+  # So: upload whatever was built, say on the page itself what is missing, and then fail. The check stays red,
+  # which is correct, and the people who come to the page get the half that works with a sentence explaining
+  # the half that does not.
   attach:
     needs: [packages, window]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       # The one job that writes anything, and it writes only to the release for this tag.
       contents: write
     steps:
+      # `continue-on-error`, because a job that failed uploaded no artifact and a download that finds nothing
+      # must not be the reason this stops.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
         with:
           pattern: packages-*
           merge-multiple: true
@@ -260,6 +318,7 @@ jobs:
 
       # The windows, which are named for the distribution that built each one and therefore do not collide.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
         with:
           pattern: window-*
           merge-multiple: true
@@ -277,29 +336,94 @@ jobs:
         run: |
           set -euo pipefail
           version=${TAG#v}
-          first=$(ls packages/flowlight-"$version"-x86_64-linux.tar.gz)
-          second=$(ls packages/flowlight-"$version"-aarch64-linux.tar.gz)
-          ./source/packaging/arch/render.sh release "$version" "$first" "$second" >packages/PKGBUILD
-          cat packages/PKGBUILD
+          # Only when both tarballs are here: a PKGBUILD names both architectures, and one written from half
+          # of them would be a file that fails for whoever has the other machine.
+          first=packages/flowlight-$version-x86_64-linux.tar.gz
+          second=packages/flowlight-$version-aarch64-linux.tar.gz
+          if [ -f "$first" ] && [ -f "$second" ]; then
+            ./source/packaging/arch/render.sh release "$version" "$first" "$second" >packages/PKGBUILD
+            cat packages/PKGBUILD
+            # And the window's, which builds from source. The source is the archive GitHub makes for the tag,
+            # downloaded here so that what is in the PKGBUILD is the hash of the file somebody will actually
+            # fetch rather than one computed from a tree that happens to be checked out.
+            archive="https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/$TAG.tar.gz"
+            curl -fsSL -o /tmp/source.tar.gz "$archive"
+            ./source/packaging/arch/render.sh window-release "$version" /tmp/source.tar.gz \
+              "${GITHUB_REPOSITORY#*/}-$version" "$archive" >packages/PKGBUILD-gui
+            cat packages/PKGBUILD-gui
+          else
+            echo "one of the tarballs is missing, so neither PKGBUILD is written"
+          fi
 
-          # And the window's, which builds from source. The source is the archive GitHub makes for the tag,
-          # downloaded here so that what is in the PKGBUILD is the hash of the file somebody will actually
-          # fetch rather than one computed from a tree that happens to be checked out.
-          archive="https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/$TAG.tar.gz"
-          curl -fsSL -o /tmp/source.tar.gz "$archive"
-          ./source/packaging/arch/render.sh window-release "$version" /tmp/source.tar.gz \
-            "${GITHUB_REPOSITORY#*/}-$version" "$archive" >packages/PKGBUILD-gui
-          cat packages/PKGBUILD-gui
-
-      - name: Attach them to the release
+      - name: Attach what was built, and say what was not
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          ls -l packages
-          # `--clobber` so that re-running this for a tag replaces what is there rather than failing, which is
-          # what somebody wants when a release had to be built twice.
-          gh release upload "$TAG" packages/*.deb packages/*.rpm packages/*.tar.gz packages/*.sha256 \
-            packages/PKGBUILD packages/PKGBUILD-gui --clobber --repo "$GITHUB_REPOSITORY"
-          echo "attached to $TAG"
+          shopt -s nullglob
+          version=${TAG#v}
+          ls -l packages || true
+
+          # Everything a complete release has, by name. A list rather than a count, so that what is missing
+          # can be said rather than only noticed.
+          expected=(
+            "flowlight_${version}_amd64.deb"
+            "flowlight_${version}_arm64.deb"
+            "flowlight-gui_${version}_amd64.deb"
+            "flowlight-gui_${version}_arm64.deb"
+            "flowlight-${version}-1.x86_64.rpm"
+            "flowlight-${version}-1.aarch64.rpm"
+            "flowlight-${version}-x86_64-linux.tar.gz"
+            "flowlight-${version}-aarch64-linux.tar.gz"
+            "PKGBUILD"
+            "PKGBUILD-gui"
+          )
+          missing=()
+          for file in "${expected[@]}"; do
+            [ -f "packages/$file" ] || missing+=("$file")
+          done
+          # The window's packages are named for the distribution that built them, so they are counted rather
+          # than named: two of them, one per distribution.
+          windows=(packages/flowlight-gui-"$version"-1.*.rpm)
+          if [ "${#windows[@]}" -lt 2 ]; then
+            missing+=("the window's rpm for one or both of Fedora and openSUSE")
+          fi
+
+          found=(packages/*.deb packages/*.rpm packages/*.tar.gz packages/*.sha256 packages/PKGBUILD*)
+          if [ "${#found[@]}" -gt 0 ]; then
+            # `--clobber` so that re-running this for a tag replaces what is there rather than failing, which
+            # is what somebody wants when a release had to be built twice.
+            gh release upload "$TAG" "${found[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+            echo "attached ${#found[@]} file(s) to $TAG"
+          else
+            echo "nothing was built, so nothing was attached"
+          fi
+
+          # The release's own notes say what is not there, under a marker so that a later run can take the
+          # sentence away again. A page that quietly offers half of a release is the failure this is for.
+          marker='<!-- flowlight-incomplete -->'
+          gh release view "$TAG" --json body -q .body --repo "$GITHUB_REPOSITORY" \
+            | awk -v marker="$marker" '$0 == marker { exit } { print }' >/tmp/notes
+          if [ "${#missing[@]}" -gt 0 ]; then
+            {
+              echo "$marker"
+              echo
+              echo "---"
+              echo
+              echo "**This release is incomplete.** These were not built:"
+              echo
+              for file in "${missing[@]}"; do echo "- \`$file\`"; done
+              echo
+              echo "Nothing is wrong with what is here; what is missing was lost to a failed or lost build job."
+              echo "Re-running the Release workflow for this tag replaces the files and takes this notice away."
+            } >>/tmp/notes
+          fi
+          gh release edit "$TAG" --notes-file /tmp/notes --repo "$GITHUB_REPOSITORY" >/dev/null
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf 'missing: %s\n' "${missing[@]}"
+            echo "### This release is incomplete" >>"$GITHUB_STEP_SUMMARY"
+            printf -- '- `%s`\n' "${missing[@]}" >>"$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "every file a release should have is attached to $TAG"
