@@ -8,6 +8,10 @@ repository.workspace = true
 rust-version = "1.92"
 publish = false
 
+[lib]
+name = "flowlight_gui"
+path = "src/lib.rs"
+
 [[bin]]
 name = "flowlight"
 path = "src/main.rs"

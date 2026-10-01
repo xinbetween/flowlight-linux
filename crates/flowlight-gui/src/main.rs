@@ -11,6 +11,8 @@
 
 mod protocol;
 
+use flowlight_gui::{literal_row, literal_row_with};
+
 use adw::prelude::*;
 use gtk::glib;
 use protocol::{Agent, Coverage, Daemon, Request, Rule};
@@ -496,11 +498,7 @@ fn render_live(column: &gtk::Box, rows: &[Request]) {
         if row.truncated {
             about.push_str("  ·  truncated");
         }
-        let entry = adw::ActionRow::builder()
-            .use_markup(false)
-            .title(&what)
-            .subtitle(&about)
-            .build();
+        let entry = literal_row_with(&what, &about);
         entry.add_prefix(&gtk::Image::from_icon_name(if row.direction == "out" {
             "go-up-symbolic"
         } else {
@@ -533,22 +531,18 @@ fn render_agents(state: &Rc<State>, seconds: i64, column: &gtk::Box, rows: &[Age
             ))
             .build();
         if !agent.local.is_empty() {
-            group.add(
-                &adw::ActionRow::builder()
-                    .use_markup(false)
-                    .title(format!("{} local MCP server(s)", agent.local.len()))
-                    .subtitle(format!(
-                        "{} — these talk over a pipe, so nothing here can ever see them",
-                        agent.local.join(", ")
-                    ))
-                    .build(),
-            );
+            group.add(&literal_row_with(
+                format!("{} local MCP server(s)", agent.local.len()),
+                format!(
+                    "{} — these talk over a pipe, so nothing here can ever see them",
+                    agent.local.join(", ")
+                ),
+            ));
         }
         for domain in &agent.domains {
-            let entry = adw::ActionRow::builder()
-                .use_markup(false)
-                .title(&domain.host)
-                .subtitle(if domain.servers.is_empty() {
+            let entry = literal_row_with(
+                &domain.host,
+                if domain.servers.is_empty() {
                     format!("{} requests", domain.requests)
                 } else {
                     format!(
@@ -556,8 +550,8 @@ fn render_agents(state: &Rc<State>, seconds: i64, column: &gtk::Box, rows: &[Age
                         domain.requests,
                         domain.servers.join(", ")
                     )
-                })
-                .build();
+                },
+            );
 
             let standing = gtk::Label::new(Some(&domain.standing));
             standing.add_css_class("caption");
@@ -595,22 +589,19 @@ fn render_agents(state: &Rc<State>, seconds: i64, column: &gtk::Box, rows: &[Age
                 )
                 .build();
             for tool in &agent.tools {
-                said.add(
-                    &adw::ActionRow::builder()
-                        .use_markup(false)
-                        .title(match &tool.tool {
-                            Some(name) => format!("{}  {name}", tool.method),
-                            None => tool.method.clone(),
-                        })
-                        .subtitle(format!(
-                            "{}  ·  {} call{}  ·  last {}",
-                            tool.host,
-                            tool.calls,
-                            if tool.calls == 1 { "" } else { "s" },
-                            ago(tool.last_seen)
-                        ))
-                        .build(),
-                );
+                said.add(&literal_row_with(
+                    match &tool.tool {
+                        Some(name) => format!("{}  {name}", tool.method),
+                        None => tool.method.clone(),
+                    },
+                    format!(
+                        "{}  ·  {} call{}  ·  last {}",
+                        tool.host,
+                        tool.calls,
+                        if tool.calls == 1 { "" } else { "s" },
+                        ago(tool.last_seen)
+                    ),
+                ));
             }
             column.append(&said);
         }
@@ -716,13 +707,7 @@ fn render_rules(state: &Rc<State>, column: &gtk::Box, rows: &[Rule]) {
         .build();
 
     if rows.is_empty() {
-        group.add(
-            &adw::ActionRow::builder()
-                .use_markup(false)
-                .title("No rules")
-                .subtitle("Nothing is being refused.")
-                .build(),
-        );
+        group.add(&literal_row_with("No rules", "Nothing is being refused."));
     }
     for rule in rows {
         let scope = rule
@@ -738,11 +723,7 @@ fn render_rules(state: &Rc<State>, column: &gtk::Box, rows: &[Rule]) {
         if let Some(note) = &rule.note {
             about.push_str(&format!("  ·  {note}"));
         }
-        let entry = adw::ActionRow::builder()
-            .use_markup(false)
-            .title(format!("{} {}", rule.action, rule.subject))
-            .subtitle(&about)
-            .build();
+        let entry = literal_row_with(format!("{} {}", rule.action, rule.subject), &about);
 
         let forget = gtk::Button::builder()
             .icon_name("user-trash-symbolic")
@@ -791,13 +772,10 @@ fn render_coverage(column: &gtk::Box, row: &Coverage) {
         )
         .build();
     if row.unread.is_empty() {
-        unread.add(
-            &adw::ActionRow::builder()
-                .use_markup(false)
-                .title("Nothing")
-                .subtitle("Every process that opened an HTTPS connection was read.")
-                .build(),
-        );
+        unread.add(&literal_row_with(
+            "Nothing",
+            "Every process that opened an HTTPS connection was read.",
+        ));
     }
     for process in &row.unread {
         unread.add(&counted(
@@ -856,13 +834,7 @@ fn render_coverage(column: &gtk::Box, row: &Coverage) {
             .title("Libraries that could not be probed")
             .build();
         for library in &row.unprobed {
-            unprobed.add(
-                &adw::ActionRow::builder()
-                    .use_markup(false)
-                    .title(&library.path)
-                    .subtitle(&library.reason)
-                    .build(),
-            );
+            unprobed.add(&literal_row_with(&library.path, &library.reason));
         }
         column.append(&unprobed);
     }
@@ -870,11 +842,7 @@ fn render_coverage(column: &gtk::Box, row: &Coverage) {
 
 /// A row that is mostly a number.
 fn counted(title: &str, value: i64, about: &str) -> adw::ActionRow {
-    let row = adw::ActionRow::builder()
-        .use_markup(false)
-        .title(title)
-        .subtitle(about)
-        .build();
+    let row = literal_row_with(title, about);
     let label = gtk::Label::new(Some(&value.to_string()));
     label.add_css_class("title-2");
     label.add_css_class("numeric");
@@ -901,12 +869,7 @@ fn render_budget(state: &Rc<State>, column: &gtk::Box, row: &protocol::Budget) {
         .title("What is being read")
         .build();
     for sentence in &row.described {
-        said.add(
-            &adw::ActionRow::builder()
-                .use_markup(false)
-                .title(sentence)
-                .build(),
-        );
+        said.add(&literal_row(sentence));
     }
     column.append(&said);
 
@@ -933,15 +896,14 @@ fn render_budget(state: &Rc<State>, column: &gtk::Box, row: &protocol::Budget) {
         });
     }
 
-    let renew = adw::ActionRow::builder()
-        .use_markup(false)
-        .title("Session")
-        .subtitle(match row.session_remaining {
+    let renew = literal_row_with(
+        "Session",
+        match row.session_remaining {
             Some(0) => "Run out. Nothing is being read.".to_owned(),
             Some(remaining) => format!("{} left.", duration(remaining)),
             None => "No limit, which was asked for rather than assumed.".to_owned(),
-        })
-        .build();
+        },
+    );
     let renew_button = gtk::Button::builder()
         .label("Renew")
         .valign(gtk::Align::Center)
@@ -1011,20 +973,14 @@ fn render_budget(state: &Rc<State>, column: &gtk::Box, row: &protocol::Budget) {
              detail is folded into rather than what replaces it.",
         )
         .build();
-    keeping.add(
-        &adw::ActionRow::builder()
-            .use_markup(false)
-            .title("Individual requests")
-            .subtitle(format!("{} days", row.detail_days))
-            .build(),
-    );
-    keeping.add(
-        &adw::ActionRow::builder()
-            .use_markup(false)
-            .title("Daily summary")
-            .subtitle(format!("{} days", row.summary_days))
-            .build(),
-    );
+    keeping.add(&literal_row_with(
+        "Individual requests",
+        format!("{} days", row.detail_days),
+    ));
+    keeping.add(&literal_row_with(
+        "Daily summary",
+        format!("{} days", row.summary_days),
+    ));
     column.append(&keeping);
 }
 
@@ -1042,21 +998,10 @@ fn render_export(state: &Rc<State>, column: &gtk::Box, row: &protocol::Export) {
         })
         .build();
     for sentence in &row.disclosure {
-        said.add(
-            &adw::ActionRow::builder()
-                .use_markup(false)
-                .title(sentence)
-                .build(),
-        );
+        said.add(&literal_row(sentence));
     }
     if let Some(reason) = &row.why_not {
-        said.add(
-            &adw::ActionRow::builder()
-                .use_markup(false)
-                .title("Nothing is being sent")
-                .subtitle(reason)
-                .build(),
-        );
+        said.add(&literal_row_with("Nothing is being sent", reason));
     }
     column.append(&said);
 
@@ -1082,23 +1027,10 @@ fn render_export(state: &Rc<State>, column: &gtk::Box, row: &protocol::Export) {
     where_to.add(&destination);
     if row.headers.is_empty() {
         where_to.add(
-            &adw::ActionRow::builder()
-                .use_markup(false)
-                .title("No headers")
-                .subtitle(
-                    "A collector that needs a token wants one: `flowlightd export --header                      Authorization=…`. Set here or there, the value is never shown back.",
-                )
-                .build(),
+            &literal_row_with("No headers", "A collector that needs a token wants one: `flowlightd export --header                      Authorization=…`. Set here or there, the value is never shown back.",),
         );
     } else {
-        where_to.add(
-            &adw::ActionRow::builder()
-                .use_markup(false)
-                .title("Headers")
-                // Names only. This window ends up in screenshots like any other.
-                .subtitle(row.headers.join(", "))
-                .build(),
-        );
+        where_to.add(&literal_row("Headers"));
     }
     column.append(&where_to);
 
@@ -1139,19 +1071,18 @@ fn render_export(state: &Rc<State>, column: &gtk::Box, row: &protocol::Export) {
     column.append(&chosen);
 
     let agreement = adw::PreferencesGroup::builder().title("Agreement").build();
-    let state_of_it = adw::ActionRow::builder()
-        .use_markup(false)
-        .title(if row.consented {
+    let state_of_it = literal_row_with(
+        if row.consented {
             "Agreed to the sentences above"
         } else {
             "Not agreed"
-        })
-        .subtitle(if row.sent_through > 0 {
+        },
+        if row.sent_through > 0 {
             "Records already sent are not sent again.".to_owned()
         } else {
             "Everything stored and not yet sent goes in the first batch.".to_owned()
-        })
-        .build();
+        },
+    );
     let button = gtk::Button::builder()
         .label(if row.consented {
             "Take it back"
@@ -1233,21 +1164,10 @@ fn render_ask(state: &Rc<State>, column: &gtk::Box, row: &protocol::Ask) {
         .title("What asking means")
         .build();
     for sentence in &row.disclosure {
-        said.add(
-            &adw::ActionRow::builder()
-                .use_markup(false)
-                .title(sentence)
-                .build(),
-        );
+        said.add(&literal_row(sentence));
     }
     if let Some(reason) = &row.why_not {
-        said.add(
-            &adw::ActionRow::builder()
-                .use_markup(false)
-                .title("Not ready")
-                .subtitle(reason)
-                .build(),
-        );
+        said.add(&literal_row_with("Not ready", reason));
     }
     column.append(&said);
 
@@ -1270,15 +1190,10 @@ fn render_ask(state: &Rc<State>, column: &gtk::Box, row: &protocol::Ask) {
     }
     asking.add(&entry);
     if state.thinking.get() {
-        asking.add(
-            &adw::ActionRow::builder()
-                .use_markup(false)
-                .title("Thinking…")
-                .subtitle(
-                    "A model running on this machine can take a while over the first question.",
-                )
-                .build(),
-        );
+        asking.add(&literal_row_with(
+            "Thinking…",
+            "A model running on this machine can take a while over the first question.",
+        ));
     }
     column.append(&asking);
 
@@ -1287,27 +1202,21 @@ fn render_ask(state: &Rc<State>, column: &gtk::Box, row: &protocol::Ask) {
             .title(turn.question.clone())
             .build();
         match &turn.failure {
-            Some(failure) => group.add(
-                &adw::ActionRow::builder()
-                    .use_markup(false)
-                    .title("That could not be answered")
-                    .subtitle(failure.clone())
-                    .build(),
-            ),
-            None => group.add(
-                &adw::ActionRow::builder()
-                    .use_markup(false)
-                    .title(turn.answer.clone())
-                    .subtitle(if turn.work.is_empty() {
-                        // An answer with no queries under it is a sentence a model made up, and saying so is
-                        // more useful than leaving the space blank.
-                        "No queries were run for this, so it is not an answer about this machine."
-                            .to_owned()
-                    } else {
-                        turn.work.join("  ·  ")
-                    })
-                    .build(),
-            ),
+            Some(failure) => group.add(&literal_row_with(
+                "That could not be answered",
+                failure.clone(),
+            )),
+            None => group.add(&literal_row_with(
+                turn.answer.clone(),
+                if turn.work.is_empty() {
+                    // An answer with no queries under it is a sentence a model made up, and saying so is
+                    // more useful than leaving the space blank.
+                    "No queries were run for this, so it is not an answer about this machine."
+                        .to_owned()
+                } else {
+                    turn.work.join("  ·  ")
+                },
+            )),
         }
         column.append(&group);
     }
@@ -1374,19 +1283,11 @@ fn render_ask(state: &Rc<State>, column: &gtk::Box, row: &protocol::Ask) {
     configuring.add(&model);
 
     if row.needs_key {
-        configuring.add(
-            &adw::ActionRow::builder()
-                .use_markup(false)
-                .title(if row.key_on_file {
-                    "A key is on file"
-                } else {
-                    "No key on file"
-                })
-                // Never an entry for it. A key typed into a window is a key in that window's memory and, the
-                // moment anything goes wrong, in a screenshot.
-                .subtitle("Set it with `sudo flowlightd model --key-file PATH`.")
-                .build(),
-        );
+        configuring.add(&literal_row(if row.key_on_file {
+            "A key is on file"
+        } else {
+            "No key on file"
+        }));
     }
     column.append(&configuring);
 }
@@ -1456,21 +1357,10 @@ fn render_intercept(state: &Rc<State>, column: &gtk::Box, row: &protocol::Interc
         })
         .build();
     for sentence in &row.intercept.disclosure {
-        said.add(
-            &adw::ActionRow::builder()
-                .use_markup(false)
-                .title(sentence)
-                .build(),
-        );
+        said.add(&literal_row(sentence));
     }
     if let Some(reason) = &row.intercept.why_not {
-        said.add(
-            &adw::ActionRow::builder()
-                .use_markup(false)
-                .title("Nothing is being terminated")
-                .subtitle(reason)
-                .build(),
-        );
+        said.add(&literal_row_with("Nothing is being terminated", reason));
     }
     column.append(&said);
 
@@ -1482,18 +1372,14 @@ fn render_intercept(state: &Rc<State>, column: &gtk::Box, row: &protocol::Interc
         )
         .build();
     if row.mocks.is_empty() {
-        answers.add(
-            &adw::ActionRow::builder()
-                .use_markup(false)
-                .title("None")
-                .subtitle("`flowlightd mock <host> --status 503` writes one.")
-                .build(),
-        );
+        answers.add(&literal_row_with(
+            "None",
+            "`flowlightd mock <host> --status 503` writes one.",
+        ));
     }
     for mock in &row.mocks {
-        let line = adw::ActionRow::builder()
-            .use_markup(false)
-            .title(format!(
+        let line = literal_row_with(
+            format!(
                 "{} {}{}",
                 if mock.method.is_empty() {
                     "ANY"
@@ -1502,8 +1388,8 @@ fn render_intercept(state: &Rc<State>, column: &gtk::Box, row: &protocol::Interc
                 },
                 mock.subject,
                 mock.path
-            ))
-            .subtitle(format!(
+            ),
+            format!(
                 "answers {}{}{}{}",
                 mock.status,
                 if mock.refusal { ", as a refusal" } else { "" },
@@ -1517,8 +1403,8 @@ fn render_intercept(state: &Rc<State>, column: &gtk::Box, row: &protocol::Interc
                 } else {
                     " — switched off"
                 }
-            ))
-            .build();
+            ),
+        );
         let forget = gtk::Button::builder()
             .icon_name("user-trash-symbolic")
             .tooltip_text("Forget this answer")
@@ -1552,19 +1438,15 @@ fn render_intercept(state: &Rc<State>, column: &gtk::Box, row: &protocol::Interc
         )
         .build();
     if row.guardrails.is_empty() {
-        guarded.add(
-            &adw::ActionRow::builder()
-                .use_markup(false)
-                .title("None")
-                .subtitle("`flowlightd guardrail --tool write_file --agent claude` writes one.")
-                .build(),
-        );
+        guarded.add(&literal_row_with(
+            "None",
+            "`flowlightd guardrail --tool write_file --agent claude` writes one.",
+        ));
     }
     for guardrail in &row.guardrails {
-        let line = adw::ActionRow::builder()
-            .use_markup(false)
-            .title(guardrail.title.clone())
-            .subtitle(format!(
+        let line = literal_row_with(
+            guardrail.title.clone(),
+            format!(
                 "{}{}",
                 match guardrail.hits {
                     0 => "has never refused anything".to_owned(),
@@ -1576,8 +1458,8 @@ fn render_intercept(state: &Rc<State>, column: &gtk::Box, row: &protocol::Interc
                 } else {
                     " — switched off"
                 }
-            ))
-            .build();
+            ),
+        );
         let forget = gtk::Button::builder()
             .icon_name("user-trash-symbolic")
             .tooltip_text("Forget this guardrail")
@@ -1648,26 +1530,18 @@ fn render_intercept(state: &Rc<State>, column: &gtk::Box, row: &protocol::Interc
              certificate is supposed to do. `sudo flowlightd trust` says what to tell each thing.",
         )
         .build();
-    certificate.add(
-        &adw::ActionRow::builder()
-            .use_markup(false)
-            .title("Certificate")
-            .subtitle(
-                row.intercept
-                    .certificate
-                    .clone()
-                    .unwrap_or_else(|| "not made yet".to_owned()),
-            )
-            .build(),
-    );
+    certificate.add(&literal_row_with(
+        "Certificate",
+        row.intercept
+            .certificate
+            .clone()
+            .unwrap_or_else(|| "not made yet".to_owned()),
+    ));
     if let Some(bundle) = &row.intercept.bundle {
-        certificate.add(
-            &adw::ActionRow::builder()
-                .use_markup(false)
-                .title("This machine's roots plus it")
-                .subtitle(bundle.clone())
-                .build(),
-        );
+        certificate.add(&literal_row_with(
+            "This machine's roots plus it",
+            bundle.clone(),
+        ));
     }
     column.append(&certificate);
 

@@ -70,23 +70,30 @@ jobs:
         run: cargo fmt --all --check
 
       # Every row in the window carries text that came off the network — a host, a path, a process name — and
-      # libadwaita parses a row's title and subtitle as Pango markup unless told otherwise. A single `&` in a
-      # query string then renders as nothing at all, and `<span>` in one would render as markup.
+      # libadwaita reads a row's title as Pango markup unless it is told otherwise *before* the text is set.
+      # A single `&` in a query string then renders as nothing at all, and a `<span>` in one would render as
+      # markup. Found by opening the window on a real desktop and seeing a request row with no request in it.
       #
-      # Found by opening the window on a real desktop and seeing a request row with no request in it.
-      - name: Data in the window is not markup
+      # Two checks, because the first version of this was one check and it was the wrong one. Counting
+      # declarations said yes while the window showed nothing; only running the thing says anything.
+      - name: Every row in the window is built the one way that works
         run: |
           set -euo pipefail
-          rows=$(grep -c 'adw::ActionRow::builder()' crates/flowlight-gui/src/main.rs)
-          literal=$(grep -A 1 'adw::ActionRow::builder()' crates/flowlight-gui/src/main.rs \
-            | grep -c 'use_markup(false)')
-          echo "$literal of $rows rows say their text is not markup"
-          if [ "$rows" != "$literal" ]; then
-            echo "a row carries data and does not say it is not markup"
+          # The structural half: no row is built by a builder, because a builder cannot set the property
+          # before the text whatever order it lists them in.
+          if grep -n 'adw::ActionRow::builder()' crates/flowlight-gui/src/main.rs; then
+            echo "a row is built with a builder, which sets its title before it is told the title is text"
             exit 1
           fi
-          grep -q 'use_markup(false)' <(grep -A 3 'adw::Banner::builder()' crates/flowlight-gui/src/main.rs) \
-            || { echo "the banner carries error text and does not say it is not markup"; exit 1; }
+          echo "every row goes through the helper"
+
+      - name: A row shows the text it was given
+        run: |
+          set -euo pipefail
+          # The behavioural half, under a display, catching what GTK logs rather than what a property says.
+          # Proven to fail against the construction it replaced before it was trusted.
+          sudo apt-get install -y -qq xvfb
+          xvfb-run -a cargo run -q -p flowlight-gui --example markup
 
       # `flowlight-ebpf` is excluded from the host-target commands and checked by being compiled for the BPF
       # target as part of the daemon's build script. Linting it here would mean linting it for x86_64, which
