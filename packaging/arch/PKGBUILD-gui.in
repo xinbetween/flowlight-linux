@@ -1,0 +1,38 @@
+# The window for Arch, built from source — which is what the AUR is for, and the opposite of `flowlight-bin`
+# next door.
+#
+# The daemon is statically linked, so its package carries a binary built elsewhere. The window links against
+# the system's GTK, libadwaita and glibc, so a binary built elsewhere is a binary that may not start here:
+# building it on the machine that will run it is not a preference, it is the only thing that works.
+#
+# Rendered from this template by `packaging/arch/render.sh`, so that the file CI builds and the file somebody
+# uploads to the AUR differ only in where the source comes from.
+
+pkgname=flowlight-gui
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="The window for Flowlight: what every process on this machine says on the network"
+arch=(@ARCHES@)
+url="https://github.com/xinbetween/flowlight-linux"
+license=('GPL-3.0-only')
+# `flowlight` is what the daemon's package provides, whichever of the two it is.
+depends=('gtk4' 'libadwaita' 'flowlight')
+makedepends=('rust' 'cargo' 'pkgconf')
+@SOURCES@
+
+build() {
+    cd "${srcdir}/@DIRECTORY@"
+    # `--locked`, so the dependency versions are the ones this repository resolved rather than whatever is
+    # newest today: a window built here and a window built on Fedora should be the same program.
+    cargo build --release --locked --package flowlight-gui
+}
+
+package() {
+    cd "${srcdir}/@DIRECTORY@"
+    install -Dm755 target/release/flowlight "${pkgdir}/usr/bin/flowlight"
+    install -Dm644 packaging/desktop/com.xinbetween.Flowlight.desktop \
+        "${pkgdir}/usr/share/applications/com.xinbetween.Flowlight.desktop"
+    install -Dm644 packaging/desktop/com.xinbetween.Flowlight.svg \
+        "${pkgdir}/usr/share/icons/hicolor/scalable/apps/com.xinbetween.Flowlight.svg"
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

@@ -297,6 +297,20 @@ jobs:
           docker run --rm -v "$PWD:/work" -w /work archlinux:base \
             ./scripts/install-on-arch.sh "$tarball" 0.0.0.ci
 
+      # And the window, which on Arch is built from source — the only shape that works for something linking
+      # against a rolling distribution's own GTK and glibc. The source is this working tree rather than a
+      # release, so what is built is the code in front of you.
+      - name: Build the window on Arch, from source
+        run: |
+          set -euo pipefail
+          tarball=$(ls target/tarball/*.tar.gz | head -1)
+          mkdir -p target/source
+          git archive --format=tar.gz --prefix=flowlight-linux-0.0.0.ci/ \
+            -o target/source/flowlight-linux-0.0.0.ci.tar.gz HEAD
+          docker run --rm -v "$PWD:/work" -w /work archlinux:base \
+            ./scripts/the-window-on-arch.sh "$tarball" \
+              target/source/flowlight-linux-0.0.0.ci.tar.gz flowlight-linux-0.0.0.ci 0.0.0.ci
+
   # The window, compiled inside the distributions it is for. Slow — a Rust build per container, with no cache —
   # and worth it: this is the one package that cannot be built anywhere and carried, because it links against
   # the system's GTK, libadwaita and glibc.

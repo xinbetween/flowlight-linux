@@ -53,6 +53,18 @@ CONTROL
         sed -i "/^Installed-Size:/a Depends: $depends" "$root/DEBIAN/control"
     fi
 
+    # The window brings a desktop entry and an icon, or it is a program nothing in a launcher knows about.
+    #
+    # No maintainer script to rebuild the caches, unlike the `.rpm`: Debian does it with dpkg triggers that
+    # `desktop-file-utils` and `hicolor-icon-theme` already own, so a package that called the tools itself
+    # would be doing the work twice. RPM has no equivalent, which is why the spec does call them.
+    if [ "$name" = flowlight-gui ]; then
+        install -D -m 644 packaging/desktop/com.xinbetween.Flowlight.desktop \
+            "$root/usr/share/applications/com.xinbetween.Flowlight.desktop"
+        install -D -m 644 packaging/desktop/com.xinbetween.Flowlight.svg \
+            "$root/usr/share/icons/hicolor/scalable/apps/com.xinbetween.Flowlight.svg"
+    fi
+
     # The daemon brings a unit file, shipped disabled.
     if [ "$name" = flowlight ]; then
         mkdir -p "$root/lib/systemd/system"

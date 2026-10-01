@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Flowlight
+GenericName=Network Monitor
+Comment=What every process on this machine says on the network
+# No arguments. The window finds the daemon's socket where the daemon puts it, and `--socket` is for somebody
+# who has moved it — which is a thing to type rather than a thing to put in a launcher.
+Exec=flowlight
+# The same name as the file and as the application id GTK registers, which is what a desktop environment
+# matches a window to its entry by. Three names that have to agree, and this is the one that is written twice.
+Icon=com.xinbetween.Flowlight
+StartupWMClass=com.xinbetween.Flowlight
+Terminal=false
+Categories=System;Monitor;Network;Security;
+Keywords=network;monitor;agent;traffic;https;ebpf;
+# It needs the daemon running to show anything, and says so in the window rather than here.
