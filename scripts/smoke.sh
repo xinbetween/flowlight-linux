@@ -451,6 +451,40 @@ sudo "$binary" --database "$database" --certificates "$certificates" --json devi
     | jq -e '.watching == false' >/dev/null || fail "turning it off did not take."
 echo "OK: turning it off stops the watching and keeps what was seen"
 
+# What this machine can do, asked before anything is loaded. On this runner everything essential is present,
+# so `check` has to say so and exit zero — and it has to be runnable by somebody who is not root, because that
+# is who reads it when something is wrong.
+checked=$(sudo "$binary" --database "$database" --certificates "$certificates" --json check)
+printf '%s' "$checked" | jq -e '.ready == true' >/dev/null \
+    || fail "check says this machine cannot be watched, on the machine the rest of this just passed on."
+printf '%s' "$checked" | jq -e '[.findings[] | select(.about == "kernel" and .answer == "yes")] | length == 1' \
+    >/dev/null || fail "check does not say whether the kernel is new enough."
+printf '%s' "$checked" | jq -e '[.findings[] | select(.about == "tracefs" and .answer == "yes")] | length == 1' \
+    >/dev/null || fail "check does not say whether the tracepoint layout could be read."
+printf '%s' "$checked" | jq -e '[.findings[] | select(.about == "TLS libraries" and .answer == "yes")] | length == 1' \
+    >/dev/null || fail "check found no TLS libraries on a machine where the probes attached."
+# Every finding says something, because a report of bare yeses is a report nobody can act on.
+printf '%s' "$checked" | jq -e '[.findings[] | select((.said | length) < 20)] | length == 0' >/dev/null \
+    || fail "a finding says nothing about what it found."
+# Refusing connections is reported, and it is not essential: a machine that cannot refuse can still watch.
+printf '%s' "$checked" \
+    | jq -e '[.findings[] | select(.about == "refusing connections" and .essential == false)] | length == 1' \
+    >/dev/null || fail "check treats refusing connections as essential, which would make watching conditional on it."
+
+# As a person, where two things cannot be answered and both say so rather than being guessed at: whether a
+# program could be loaded, and whether the tracepoint's layout can be read — that file is root's alone, and a
+# report telling somebody their machine cannot be watched because they are not root would be worse than silent.
+as_a_person=$("$binary" --database "$database" --certificates "$certificates" --json check)
+printf '%s' "$as_a_person" \
+    | jq -e '[.findings[] | select(.about == "permission to load" and .answer == "unknown")] | length == 1' \
+    >/dev/null || fail "run as a person, check claims to know whether a program could be loaded."
+printf '%s' "$as_a_person" \
+    | jq -e '[.findings[] | select(.about == "tracefs" and .answer == "unknown")] | length == 1' \
+    >/dev/null || fail "run as a person, check does not tell being root apart from tracefs being absent."
+printf '%s' "$as_a_person" | jq -e '.ready == true' >/dev/null \
+    || fail "run as a person, check says this machine cannot be watched, which is not a thing it can know."
+echo "OK: a machine can be asked what it can do before anything is loaded into it"
+
 # Focus: one thing to look at, and every count below it a count of that. What matters is not that the filter
 # works — that is a unit test — but that a narrowed screen says it is narrowed, and that the one slice which
 # cannot be narrowed returns nothing rather than the whole machine.

@@ -61,6 +61,7 @@ pub fn run(
             | Command::Focus { .. }
             | Command::Starters { .. }
             | Command::Demo { .. }
+            | Command::Check
     );
     if !writes && !database.exists() {
         bail!(
@@ -68,6 +69,24 @@ pub fn run(
              — `flowlightd --database PATH` names it.",
             database.display()
         );
+    }
+
+    // Answered before the real database is opened, because `Store::open` creates what is not there and a
+    // report about this machine is no reason to leave an empty database behind on it.
+    if matches!(command, Command::Check) {
+        let mut out = std::io::stdout().lock();
+        let report = crate::checking::report(
+            Path::new("/proc"),
+            Path::new("/sys"),
+            None,
+            // `geteuid` rather than `getuid`: what matters is what the kernel will let this process do now.
+            unsafe { libc::geteuid() } == 0,
+        );
+        crate::checking::print(&mut out, &report, json)?;
+        if !report.ready {
+            bail!("this machine cannot be watched; the report above says why");
+        }
+        return Ok(());
     }
 
     // Answered before the real database is opened, because `Store::open` creates what is not there and
@@ -599,6 +618,7 @@ pub fn run(
                 }
             }
         }
+        Command::Check => unreachable!("answered before the database was opened"),
         Command::Focus {
             process,
             host,

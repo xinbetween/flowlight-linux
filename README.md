@@ -1115,6 +1115,24 @@ marked as a demonstration for as long as it exists. Every command reading one sa
 refuses to watch into one: real traffic mixed into a demonstration would leave two things nobody can tell
 apart, and the one people would believe is the wrong one.
 
+## Asking a machine what it can do
+
+```console
+$ flowlightd check
+ok  kernel                 6.8.0-45-generic — new enough for the probes
+?   permission to load     not running as root. The daemon needs root or CAP_BPF to load anything; whether
+                           this machine would allow it cannot be answered from here.
+ok  tracefs                the tracepoint's layout was read, which is how the offsets are worked out
+ok  refusing connections   cgroup v2 at /sys/fs/cgroup
+ok  TLS libraries          /usr/lib/x86_64-linux-gnu/libssl.so.3 (openssl), …
+ok  SELinux                SELinux is not enforcing anything here
+ok  BPF in this kernel     present
+```
+
+Read-only: it loads nothing, attaches nothing and writes nothing, so anybody can run it before Flowlight has
+ever been started here. It exits non-zero when something essential is missing, and says what each missing thing
+costs — a machine with no cgroup v2 hierarchy can still watch, and the line says so rather than failing.
+
 ## Nine languages, for the sentences that matter
 
 ```console

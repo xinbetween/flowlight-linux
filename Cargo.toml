@@ -9,6 +9,7 @@ members = [
     "crates/flowlight-devices",
     "crates/flowlight-ebpf",
     "crates/flowlight-owners",
+    "crates/flowlight-platform",
     "crates/flowlight-proxy",
     "crates/flowlight-gui",
     "crates/flowlight-rules",
@@ -27,6 +28,7 @@ default-members = [
     "crates/flowlight-common",
     "crates/flowlight-devices",
     "crates/flowlight-owners",
+    "crates/flowlight-platform",
     "crates/flowlight-proxy",
     "crates/flowlight-rules",
     "crates/flowlight-store",
@@ -34,7 +36,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.5.3"
+version = "0.5.4"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/xinbetween/flowlight-linux"
@@ -46,6 +48,7 @@ flowlight-alerts = { path = "crates/flowlight-alerts" }
 flowlight-ask = { path = "crates/flowlight-ask" }
 flowlight-devices = { path = "crates/flowlight-devices" }
 flowlight-owners = { path = "crates/flowlight-owners" }
+flowlight-platform = { path = "crates/flowlight-platform" }
 flowlight-proxy = { path = "crates/flowlight-proxy" }
 flowlight-common = { path = "crates/flowlight-common", default-features = false }
 flowlight-agents = { path = "crates/flowlight-agents" }

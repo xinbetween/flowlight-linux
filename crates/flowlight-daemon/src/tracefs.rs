@@ -10,6 +10,20 @@ use std::path::{Path, PathBuf};
 /// The two places a distribution mounts tracefs, newest first.
 const CANDIDATES: [&str; 2] = ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"];
 
+/// Where tracefs is mounted, if it is, without reading anything out of it.
+///
+/// Separate from [`format_text`] because the two questions have different permissions: the directory's
+/// existence is visible to anybody, and the file inside it is readable only by root. Asking the first is how
+/// `check` can tell "there is no tracefs here" from "you are not root", which are a mount command and a
+/// `sudo` and should not be the same sentence.
+pub fn mounted(root: Option<&Path>) -> Option<PathBuf> {
+    let roots: Vec<PathBuf> = match root {
+        Some(path) => vec![path.to_path_buf()],
+        None => CANDIDATES.iter().map(PathBuf::from).collect(),
+    };
+    roots.into_iter().find(|root| root.join("events").is_dir())
+}
+
 /// Reads the `format` file for one tracepoint.
 ///
 /// `root` overrides the search, for the case where tracefs is mounted somewhere unusual — and for tests,
