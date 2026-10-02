@@ -51,13 +51,20 @@ impl Agents {
     }
 }
 
-/// Every task belonging to a process Flowlight recognises as an agent.
+/// Every task belonging to a process Flowlight treats as an agent.
 ///
 /// Tasks rather than processes: an agent's children are marked in the kernel by the fork tracepoint, which
 /// copies the mark from the *forking thread*. A multithreaded agent — which every agent written in Node is
 /// — forks from whichever thread happened to be running, so marking only the main one would leave most of
 /// its children unmarked.
-pub fn running_agents() -> Vec<(u32, String)> {
+///
+/// `named` is every process somebody has named themselves — in interception's scope, or in a rule scoped to
+/// an agent. They are marked as well as the catalogue's names, and this is not a detail: without it,
+/// `intercept --agent curl` is accepted, stored, reported back as "connections from curl are redirected",
+/// and then nothing ever happens, because no process named `curl` is ever marked and the kernel matches on
+/// marks. The catalogue is for *attribution* — working out which agent a process belongs to when nobody
+/// said. Somebody who names a process has already said.
+pub fn running_agents(named: &std::collections::BTreeSet<String>) -> Vec<(u32, String)> {
     let mut found = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return found;
@@ -73,7 +80,7 @@ pub fn running_agents() -> Vec<(u32, String)> {
         let Some(process) = read_process(pid) else {
             continue;
         };
-        if !is_agent(&process.name) {
+        if !is_agent(&process.name) && !named.contains(&process.name.trim().to_ascii_lowercase()) {
             continue;
         }
         let tasks = std::fs::read_dir(entry.path().join("task"));
@@ -170,8 +177,37 @@ mod tests {
     /// This process is not an agent, and the scan must complete on a real `/proc` without complaining.
     #[test]
     fn the_scan_for_agents_completes_on_this_machine() {
-        let running = running_agents();
+        let running = running_agents(&std::collections::BTreeSet::new());
         assert!(running.iter().all(|(_, name)| is_agent(name)));
+    }
+
+    /// A process nobody put in the catalogue is still marked when somebody names it.
+    ///
+    /// This test is this machine's own process, named by its own name: if naming a process did not reach
+    /// the scan, `intercept --agent <anything not on the list>` would be accepted, stored, reported back as
+    /// working, and do nothing at all. That is what it did.
+    #[test]
+    fn naming_a_process_is_enough_to_have_it_marked() {
+        let mine = std::process::id() as i32;
+        let Some(me) = read_process(mine) else {
+            return;
+        };
+        assert!(
+            !is_agent(&me.name),
+            "this test needs a name not in the catalogue, got {}",
+            me.name
+        );
+
+        let unnamed = running_agents(&std::collections::BTreeSet::new());
+        assert!(!unnamed.iter().any(|(_, name)| *name == me.name));
+
+        let named = std::collections::BTreeSet::from([me.name.trim().to_ascii_lowercase()]);
+        let found = running_agents(&named);
+        assert!(
+            found.iter().any(|(_, name)| *name == me.name),
+            "naming {} did not get it marked",
+            me.name
+        );
     }
 
     /// Two answers in a row for the same process must be the same answer, and must not require two walks.

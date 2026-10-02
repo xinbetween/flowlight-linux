@@ -731,6 +731,27 @@ struct Marking {
     answer: std::sync::mpsc::Sender<Result<bool, String>>,
 }
 
+/// Every process name somebody has named: interception's scope, and every rule scoped to an agent.
+///
+/// Lower-cased, because an executable is `Cursor` on one machine and `cursor` on another and somebody
+/// typing a name should not have to know which.
+fn named_agents(store: &mut flowlight_store::Store) -> std::collections::BTreeSet<String> {
+    let mut named = std::collections::BTreeSet::new();
+    if let Ok(intercept) = store.intercept() {
+        for agent in intercept.agents {
+            named.insert(agent.trim().to_ascii_lowercase());
+        }
+    }
+    if let Ok(rules) = store.rules() {
+        for rule in rules {
+            if let Some(agent) = rule.scope.strip_prefix("agent:") {
+                named.insert(agent.trim().to_ascii_lowercase());
+            }
+        }
+    }
+    named
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
@@ -1292,10 +1313,15 @@ fn run(
         if let Some(enforcing) = enforcing.as_deref_mut()
             && Instant::now() >= next_agent_scan
         {
-            // Printed when it moves, not on a timer: the numbers answer a question that only comes up
-            // when a rule scoped to an agent does not appear to bite, and the answer has to already be in
-            // the log by the time anybody asks.
-            for (pid, agent) in enforcing.mark_all(&agent::running_agents()) {
+            // Everything somebody has named themselves, as well as the catalogue. Interception's scope and
+            // every agent-scoped rule: naming a process is the whole of asking for it to be treated as an
+            // agent, and a scope that matched nothing because the name was not on a list of sixteen is a
+            // feature that silently does nothing.
+            let named = store
+                .as_deref_mut()
+                .map(|store| named_agents(store))
+                .unwrap_or_default();
+            for (pid, agent) in enforcing.mark_all(&agent::running_agents(&named)) {
                 // Which processes are treated as agents decides which rules reach them, and a rule that
                 // appears to do nothing is usually a process nobody recognised as the thing it names.
                 eprintln!(
